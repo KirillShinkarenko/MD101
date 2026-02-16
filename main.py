@@ -1,5 +1,7 @@
 import os
 from pathlib import Path
+import threading
+import time
 from openai import OpenAI
 
 
@@ -18,6 +20,16 @@ def load_env_file() -> None:
         value = value.strip().strip("'").strip('"')
         if key:
             os.environ.setdefault(key, value)
+
+
+def show_loading(stop_event: threading.Event) -> None:
+    frames = ["|", "/", "-", "\\"]
+    i = 0
+    while not stop_event.is_set():
+        print(f"\rLLM думает... {frames[i % len(frames)]}", end="", flush=True)
+        i += 1
+        time.sleep(0.1)
+    print("\r" + " " * 40 + "\r", end="", flush=True)
 
 
 def main() -> None:
@@ -43,10 +55,20 @@ def main() -> None:
             print("Выход.")
             break
 
-        response = client.responses.create(
-            model="gpt-4.1-mini",
-            input=prompt,
-        )
+        stop_event = threading.Event()
+        loader = threading.Thread(target=show_loading, args=(stop_event,), daemon=True)
+        loader.start()
+
+        response = None
+        try:
+            response = client.responses.create(
+                model="gpt-4.1-mini",
+                input=prompt,
+            )
+        finally:
+            stop_event.set()
+            loader.join()
+
         print(f"LLM: {response.output_text}")
 
 
