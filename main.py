@@ -62,7 +62,7 @@ def main() -> None:
         response = None
         try:
             response = client.responses.create(
-                model="gpt-4.1-mini",
+                model="gpt-5-mini",
                 input=prompt,
             )
         finally:
