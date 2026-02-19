@@ -9,6 +9,12 @@ type ChatMessage = {
   text: string;
 };
 
+type RecentAnswer = {
+  id: string;
+  text: string;
+  createdAt: number;
+};
+
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "";
 
 const createId = (): string => {
@@ -21,7 +27,11 @@ const createId = (): string => {
 function App() {
   const [systemPrompt, setSystemPrompt] = useState("You are a concise assistant.");
   const [userPrompt, setUserPrompt] = useState("");
+  const [temperature, setTemperature] = useState("0.7");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [recentAnswers, setRecentAnswers] = useState<RecentAnswer[]>([]);
+  const [lastUserMessage, setLastUserMessage] = useState("");
+  const [isRecentAnswersOpen, setIsRecentAnswersOpen] = useState(false);
   const [status, setStatus] = useState<Status>("idle");
   const [errorText, setErrorText] = useState("");
   const [openaiRequestRaw, setOpenaiRequestRaw] = useState("");
@@ -74,9 +84,31 @@ function App() {
     );
   };
 
-  const startStreaming = async () => {
-    const trimmedPrompt = userPrompt.trim();
+  const parseTemperature = (value: string): { value?: number; error?: string } => {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return {};
+    }
+    const parsed = Number(trimmed);
+    if (!Number.isFinite(parsed)) {
+      return { error: "Temperature must be a valid number." };
+    }
+    if (parsed < 0 || parsed > 2) {
+      return { error: "Temperature must be between 0 and 2." };
+    }
+    return { value: parsed };
+  };
+
+  const startStreaming = async (promptOverride?: string) => {
+    const trimmedPrompt = (promptOverride ?? userPrompt).trim();
     if (!trimmedPrompt || isStreaming) {
+      return;
+    }
+
+    const parsedTemperature = parseTemperature(temperature);
+    if (parsedTemperature.error) {
+      setErrorText(parsedTemperature.error);
+      setStatus("error");
       return;
     }
 
@@ -86,8 +118,21 @@ function App() {
     const userMessage: ChatMessage = { id: createId(), role: "user", text: trimmedPrompt };
     const assistantMessageId = createId();
     const assistantMessage: ChatMessage = { id: assistantMessageId, role: "assistant", text: "" };
+    let assistantTextBuffer = "";
+    let isRecentAnswerStored = false;
+
+    const storeRecentAnswer = () => {
+      if (isRecentAnswerStored || !assistantTextBuffer.trim()) {
+        return;
+      }
+      setRecentAnswers((prev) =>
+        [{ id: createId(), text: assistantTextBuffer, createdAt: Date.now() }, ...prev].slice(0, 20)
+      );
+      isRecentAnswerStored = true;
+    };
 
     setMessages((prev) => [...prev, userMessage, assistantMessage]);
+    setLastUserMessage(trimmedPrompt);
     setUserPrompt("");
 
     const controller = new AbortController();
@@ -96,6 +141,7 @@ function App() {
       sessionId: sessionIdRef.current,
       systemPrompt,
       userPrompt: trimmedPrompt,
+      temperature: parsedTemperature.value,
     };
     setOpenaiRequestRaw("");
     setOpenaiResponseRaw("");
@@ -155,17 +201,23 @@ function App() {
           }
 
           if (eventName === "delta") {
-            appendDelta(assistantMessageId, payload.text ?? "");
+            const delta = payload.text ?? "";
+            assistantTextBuffer += delta;
+            appendDelta(assistantMessageId, delta);
           }
 
           if (eventName === "error") {
             setStatus("error");
             setErrorText(payload.message ?? "Unknown error");
-            appendDelta(assistantMessageId, payload.message ? `[Error] ${payload.message}` : "");
+            const errorMessage = payload.message ? `[Error] ${payload.message}` : "";
+            assistantTextBuffer += errorMessage;
+            appendDelta(assistantMessageId, errorMessage);
+            storeRecentAnswer();
           }
 
           if (eventName === "done") {
             setStatus((prev) => (prev === "streaming" ? "done" : prev));
+            storeRecentAnswer();
           }
 
           if (eventName === "debug_request") {
@@ -181,6 +233,7 @@ function App() {
       }
 
       setStatus((prev) => (prev === "streaming" ? "done" : prev));
+      storeRecentAnswer();
     } catch (error: unknown) {
       if (controller.signal.aborted) {
         setStatus("stopped");
@@ -190,7 +243,10 @@ function App() {
       const message = error instanceof Error ? error.message : "Unexpected client error";
       setStatus("error");
       setErrorText(message);
-      appendDelta(assistantMessageId, `[Error] ${message}`);
+      const errorMessage = `[Error] ${message}`;
+      assistantTextBuffer += errorMessage;
+      appendDelta(assistantMessageId, errorMessage);
+      storeRecentAnswer();
     } finally {
       controllerRef.current = null;
     }
@@ -246,10 +302,18 @@ function App() {
     }
   };
 
+  const clearSessionAndRepeatMessage = async () => {
+    if (!lastUserMessage || isStreaming) {
+      return;
+    }
+    await clearSession();
+    await startStreaming(lastUserMessage);
+  };
+
   return (
     <main className="page">
       <section className="panel controls controls-panel">
-        <h1>MD102 UI</h1>
+        <h1>MD104 UI</h1>
 
         <label htmlFor="system-prompt">System Prompt</label>
         <textarea
@@ -259,6 +323,17 @@ function App() {
           rows={4}
           placeholder="System prompt"
         />
+        <label htmlFor="temperature">Temperature</label>
+        <input
+          id="temperature"
+          type="number"
+          min={0}
+          max={2}
+          step={0.1}
+          value={temperature}
+          onChange={(event) => setTemperature(event.target.value)}
+          placeholder="0.7"
+        />
 
         {errorText ? <p className="error">{errorText}</p> : null}
       </section>
@@ -266,6 +341,7 @@ function App() {
       <section className="panel output chat-panel">
         <div className="chat-header">
           <h2>Chat</h2>
+          <button onClick={() => setIsRecentAnswersOpen(true)}>Recent answers</button>
           <button className="danger clear-top" onClick={clearSession} disabled={isStreaming}>
             Clear Session
           </button>
@@ -296,6 +372,11 @@ function App() {
         </div>
         <div className="composer">
           <label htmlFor="user-prompt">Message</label>
+          <div className="message-tools">
+            <button onClick={() => void clearSessionAndRepeatMessage()} disabled={!lastUserMessage || isStreaming}>
+              Clear Session and Repeat Message
+            </button>
+          </div>
           <textarea
             id="user-prompt"
             value={userPrompt}
@@ -328,6 +409,42 @@ function App() {
           <pre>{openaiResponseRaw || "Will appear after stream completion..."}</pre>
         </div>
       </section>
+
+      {isRecentAnswersOpen ? (
+        <div className="modal-overlay" role="presentation" onClick={() => setIsRecentAnswersOpen(false)}>
+          <section className="modal-panel" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-header">
+              <h2>Recent Answers</h2>
+              <div className="modal-actions">
+                <button
+                  onClick={() => {
+                    setRecentAnswers([]);
+                    setIsRecentAnswersOpen(false);
+                  }}
+                  disabled={recentAnswers.length === 0}
+                >
+                  Clear
+                </button>
+                <button onClick={() => setIsRecentAnswersOpen(false)}>Close</button>
+              </div>
+            </div>
+            <div className="recent-list">
+              {recentAnswers.length === 0 ? (
+                <p className="chat-empty">No answers yet.</p>
+              ) : (
+                recentAnswers.map((answer, index) => (
+                  <article key={answer.id} className="recent-item">
+                    <p className="recent-title">
+                      #{recentAnswers.length - index} • {new Date(answer.createdAt).toLocaleTimeString()}
+                    </p>
+                    <p className="bubble-text">{answer.text}</p>
+                  </article>
+                ))
+              )}
+            </div>
+          </section>
+        </div>
+      ) : null}
     </main>
   );
 }

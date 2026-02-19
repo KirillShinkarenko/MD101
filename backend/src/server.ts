@@ -15,7 +15,7 @@ type ChatBody = {
   sessionId?: string;
   systemPrompt?: string;
   userPrompt?: string;
-  model?: string;
+  temperature?: number | string;
 };
 
 type ResetSessionBody = {
@@ -26,6 +26,69 @@ type SessionState = {
   systemPrompt: string;
   history: Array<{ role: "user" | "assistant"; content: string }>;
   updatedAt: number;
+};
+
+const TEMPERATURE_MODEL = "gpt-5.1";
+const NETWORK_ERROR_HINTS: Record<string, string> = {
+  ENOTFOUND: "DNS lookup failed. Check internet connection or DNS settings.",
+  ECONNRESET: "Network connection was reset while calling OpenAI.",
+  ETIMEDOUT: "Request to OpenAI timed out.",
+  ECONNREFUSED: "Connection was refused before reaching OpenAI.",
+};
+
+const parseTemperature = (value: unknown): number | undefined => {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : undefined;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    const parsed = Number(trimmed);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+};
+
+const normalizeErrorCode = (value: unknown): string | undefined => {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const code = value.trim().toUpperCase();
+  return code || undefined;
+};
+
+const formatUpstreamError = (
+  error: unknown
+): { message: string; code?: string; cause?: string; hint?: string } => {
+  const baseMessage =
+    error instanceof Error && error.message ? error.message : "Unexpected server error";
+  const errorWithCode = error as { code?: unknown; cause?: unknown };
+  const code =
+    normalizeErrorCode(errorWithCode?.code) ??
+    normalizeErrorCode((errorWithCode?.cause as { code?: unknown } | undefined)?.code);
+  const cause =
+    errorWithCode?.cause instanceof Error
+      ? errorWithCode.cause.message
+      : typeof errorWithCode?.cause === "string"
+      ? errorWithCode.cause
+      : undefined;
+  const hint = code ? NETWORK_ERROR_HINTS[code] : undefined;
+
+  const details = [code ? `code=${code}` : undefined, cause ? `cause=${cause}` : undefined]
+    .filter(Boolean)
+    .join(", ");
+
+  return {
+    message: details ? `${baseMessage} (${details})` : baseMessage,
+    code,
+    cause,
+    hint,
+  };
 };
 
 const extractCompletedText = (response: any): string => {
@@ -58,7 +121,6 @@ const extractFinalDebug = (response: any): Record<string, unknown> => {
 };
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const DEFAULT_MODEL = process.env.OPENAI_MODEL ?? "gpt-5-mini";
 const sessions = new Map<string, SessionState>();
 
 if (!OPENAI_API_KEY) {
@@ -87,7 +149,7 @@ app.post<{ Body: ChatBody }>("/api/chat/stream", async (request, reply) => {
   const sessionId = request.body?.sessionId?.trim() ?? "";
   const systemPrompt = request.body?.systemPrompt?.trim() ?? "";
   const userPrompt = request.body?.userPrompt?.trim() ?? "";
-  const model = request.body?.model?.trim() || DEFAULT_MODEL;
+  const temperature = parseTemperature(request.body?.temperature);
 
   if (!userPrompt) {
     reply.code(400);
@@ -97,6 +159,16 @@ app.post<{ Body: ChatBody }>("/api/chat/stream", async (request, reply) => {
   if (!sessionId) {
     reply.code(400);
     return { error: "sessionId is required" };
+  }
+
+  if (request.body?.temperature !== undefined && temperature === undefined) {
+    reply.code(400);
+    return { error: "temperature must be a valid number" };
+  }
+
+  if (temperature !== undefined && (temperature < 0 || temperature > 2)) {
+    reply.code(400);
+    return { error: "temperature must be between 0 and 2" };
   }
 
   const existingSession = sessions.get(sessionId);
@@ -133,10 +205,12 @@ app.post<{ Body: ChatBody }>("/api/chat/stream", async (request, reply) => {
 
   try {
     const openaiRequestBody: Record<string, unknown> = {
-      model,
+      model: TEMPERATURE_MODEL,
       stream: true,
       instructions: systemPrompt || undefined,
       input: inputTranscript,
+      temperature,
+      reasoning: { effort: "none" },
     };
 
     sendSse("debug_request", {
@@ -266,7 +340,9 @@ app.post<{ Body: ChatBody }>("/api/chat/stream", async (request, reply) => {
       return;
     }
 
-    sendSse("error", { message: error?.message ?? "Unexpected server error" });
+    const formattedError = formatUpstreamError(error);
+    app.log.error({ err: error, ...formattedError }, "OpenAI upstream request failed");
+    sendSse("error", formattedError);
     reply.raw.end();
   } finally {
     if (sessions.size > 500) {

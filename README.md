@@ -1,4 +1,4 @@
-# MD102
+# MD104
 
 Веб-приложение для общения с OpenAI через backend-proxy со streaming-ответами.
 
