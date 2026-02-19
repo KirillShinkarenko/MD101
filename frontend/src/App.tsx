@@ -54,6 +54,15 @@ function App() {
     }
   }, [status]);
 
+  const latestAssistantMessageId = useMemo(() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index].role === "assistant") {
+        return messages[index].id;
+      }
+    }
+    return null;
+  }, [messages]);
+
   const appendDelta = (assistantMessageId: string, text: string): void => {
     if (!text) {
       return;
@@ -152,7 +161,7 @@ function App() {
           if (eventName === "error") {
             setStatus("error");
             setErrorText(payload.message ?? "Unknown error");
-            appendDelta(assistantMessageId, payload.message ? `\n[Error] ${payload.message}` : "");
+            appendDelta(assistantMessageId, payload.message ? `[Error] ${payload.message}` : "");
           }
 
           if (eventName === "done") {
@@ -181,7 +190,7 @@ function App() {
       const message = error instanceof Error ? error.message : "Unexpected client error";
       setStatus("error");
       setErrorText(message);
-      appendDelta(assistantMessageId, `\n[Error] ${message}`);
+      appendDelta(assistantMessageId, `[Error] ${message}`);
     } finally {
       controllerRef.current = null;
     }
@@ -266,7 +275,21 @@ function App() {
           {messages.map((message) => (
             <article key={message.id} className={`bubble ${message.role}`}>
               <p className="bubble-role">{message.role === "user" ? "You" : "Assistant"}</p>
-              <p className="bubble-text">{message.text || "..."}</p>
+              <p className="bubble-text">
+                {message.text ? (
+                  message.text
+                ) : message.role === "assistant" &&
+                  isStreaming &&
+                  message.id === latestAssistantMessageId ? (
+                  <span className="typing-indicator" aria-label="Assistant is typing" role="status">
+                    <span className="typing-dot" />
+                    <span className="typing-dot" />
+                    <span className="typing-dot" />
+                  </span>
+                ) : (
+                  "..."
+                )}
+              </p>
             </article>
           ))}
           <div ref={chatEndRef} />
