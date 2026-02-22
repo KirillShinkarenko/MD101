@@ -16,6 +16,8 @@ type ChatBody = {
   systemPrompt?: string;
   userPrompt?: string;
   temperature?: number | string;
+  model?: string;
+  reasoningEffort?: string;
 };
 
 type ResetSessionBody = {
@@ -28,12 +30,59 @@ type SessionState = {
   updatedAt: number;
 };
 
-const TEMPERATURE_MODEL = "gpt-5.1";
+const DEFAULT_MODEL = process.env.OPENAI_MODEL?.trim() || "gpt-5-mini";
 const NETWORK_ERROR_HINTS: Record<string, string> = {
   ENOTFOUND: "DNS lookup failed. Check internet connection or DNS settings.",
   ECONNRESET: "Network connection was reset while calling OpenAI.",
   ETIMEDOUT: "Request to OpenAI timed out.",
   ECONNREFUSED: "Connection was refused before reaching OpenAI.",
+};
+
+const MODEL_PRICING_PER_1M: Record<string, { input: number; output: number }> = {
+  "gpt-4.1-nano": { input: 0.1, output: 0.4 },
+  "gpt-5-mini": { input: 0.25, output: 2 },
+  "gpt-5.1": { input: 1.25, output: 10 },
+  "gpt-5.2": { input: 1.75, output: 14 },
+};
+const MODEL_PRICING_KEYS = Object.keys(MODEL_PRICING_PER_1M).sort((a, b) => b.length - a.length);
+
+type ModelApiProfile = {
+  temperaturePolicy: "never" | "always" | "reasoning_none_only";
+  reasoningEfforts: Array<"none" | "minimal" | "low" | "medium" | "high" | "xhigh">;
+};
+
+const MODEL_API_PROFILES: Record<string, ModelApiProfile> = {
+  "gpt-4.1-nano": {
+    temperaturePolicy: "always",
+    reasoningEfforts: [],
+  },
+  "gpt-5-mini": {
+    temperaturePolicy: "never",
+    reasoningEfforts: ["minimal", "low", "medium", "high"],
+  },
+  "gpt-5.1": {
+    temperaturePolicy: "reasoning_none_only",
+    reasoningEfforts: ["none", "low", "medium", "high"],
+  },
+  "gpt-5.2": {
+    temperaturePolicy: "reasoning_none_only",
+    reasoningEfforts: ["none", "low", "medium", "high", "xhigh"],
+  },
+};
+
+const ALLOWED_MODELS = new Set(Object.keys(MODEL_API_PROFILES));
+const EFFECTIVE_DEFAULT_MODEL = ALLOWED_MODELS.has(DEFAULT_MODEL) ? DEFAULT_MODEL : "gpt-5-mini";
+
+type UsageSummary = {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+};
+
+type CostBreakdownUsd = {
+  inputCostUsd: number;
+  outputCostUsd: number;
+  totalCostUsd: number;
 };
 
 const parseTemperature = (value: unknown): number | undefined => {
@@ -50,6 +99,34 @@ const parseTemperature = (value: unknown): number | undefined => {
     }
     const parsed = Number(trimmed);
     return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+};
+
+const parseModel = (value: unknown): string | undefined => {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed || undefined;
+};
+
+const parseReasoningEffort = (
+  value: unknown
+): "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | undefined => {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim().toLowerCase();
+  if (
+    trimmed === "none" ||
+    trimmed === "minimal" ||
+    trimmed === "low" ||
+    trimmed === "medium" ||
+    trimmed === "high" ||
+    trimmed === "xhigh"
+  ) {
+    return trimmed;
   }
   return undefined;
 };
@@ -115,9 +192,107 @@ const extractFinalDebug = (response: any): Record<string, unknown> => {
   return {
     id: typeof response?.id === "string" ? response.id : undefined,
     status: typeof response?.status === "string" ? response.status : undefined,
+    model: typeof response?.model === "string" ? response.model : undefined,
     output_text: extractCompletedText(response),
     usage: response?.usage,
   };
+};
+
+const toFiniteNumber = (value: unknown): number => {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  return 0;
+};
+
+const extractUsageSummary = (usage: unknown): UsageSummary => {
+  const candidate = usage as
+    | {
+        input_tokens?: unknown;
+        output_tokens?: unknown;
+        total_tokens?: unknown;
+      }
+    | undefined;
+  const inputTokens = toFiniteNumber(candidate?.input_tokens);
+  const outputTokens = toFiniteNumber(candidate?.output_tokens);
+  const totalTokens = toFiniteNumber(candidate?.total_tokens) || inputTokens + outputTokens;
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens,
+  };
+};
+
+const normalizeModelId = (model: string): string => model.trim().toLowerCase();
+
+const matchesModelAlias = (modelId: string, alias: string): boolean => {
+  if (!modelId.startsWith(alias)) {
+    return false;
+  }
+  const nextChar = modelId.slice(alias.length, alias.length + 1);
+  return !nextChar || !/[a-z0-9]/i.test(nextChar);
+};
+
+const resolveModelPricing = (model: string): { input: number; output: number } | undefined => {
+  const normalizedModel = normalizeModelId(model);
+  const direct = MODEL_PRICING_PER_1M[normalizedModel];
+  if (direct) {
+    return direct;
+  }
+
+  for (const alias of MODEL_PRICING_KEYS) {
+    if (matchesModelAlias(normalizedModel, alias)) {
+      return MODEL_PRICING_PER_1M[alias];
+    }
+  }
+  return undefined;
+};
+
+const estimateCostBreakdownUsd = (model: string, usageSummary: UsageSummary): CostBreakdownUsd | null => {
+  const pricing = resolveModelPricing(model);
+  if (!pricing) {
+    return null;
+  }
+
+  const inputCostUsd = Number(((usageSummary.inputTokens / 1_000_000) * pricing.input).toFixed(8));
+  const outputCostUsd = Number(((usageSummary.outputTokens / 1_000_000) * pricing.output).toFixed(8));
+  const totalCostUsd = Number((inputCostUsd + outputCostUsd).toFixed(8));
+  return {
+    inputCostUsd,
+    outputCostUsd,
+    totalCostUsd,
+  };
+};
+
+const buildOpenAiRequestBody = (params: {
+  model: string;
+  systemPrompt: string;
+  inputTranscript: string;
+  profile: ModelApiProfile;
+  reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  temperature?: number;
+}): Record<string, unknown> => {
+  const { model, systemPrompt, inputTranscript, temperature, profile, reasoningEffort } = params;
+  const body: Record<string, unknown> = {
+    model,
+    stream: true,
+    instructions: systemPrompt || undefined,
+    input: inputTranscript,
+  };
+
+  const canUseTemperature =
+    profile.temperaturePolicy === "always" ||
+    (profile.temperaturePolicy === "reasoning_none_only" && reasoningEffort === "none");
+
+  if (canUseTemperature && temperature !== undefined) {
+    body.temperature = temperature;
+  }
+
+  if (reasoningEffort !== undefined) {
+    body.reasoning = { effort: reasoningEffort };
+  }
+
+  return body;
 };
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -150,6 +325,10 @@ app.post<{ Body: ChatBody }>("/api/chat/stream", async (request, reply) => {
   const systemPrompt = request.body?.systemPrompt?.trim() ?? "";
   const userPrompt = request.body?.userPrompt?.trim() ?? "";
   const temperature = parseTemperature(request.body?.temperature);
+  const model = parseModel(request.body?.model) ?? EFFECTIVE_DEFAULT_MODEL;
+  const requestedReasoningEffortRaw = request.body?.reasoningEffort;
+  const reasoningEffort = parseReasoningEffort(requestedReasoningEffortRaw);
+  const startedAt = Date.now();
 
   if (!userPrompt) {
     reply.code(400);
@@ -161,6 +340,13 @@ app.post<{ Body: ChatBody }>("/api/chat/stream", async (request, reply) => {
     return { error: "sessionId is required" };
   }
 
+  if (!ALLOWED_MODELS.has(model)) {
+    reply.code(400);
+    return { error: `model must be one of: ${Array.from(ALLOWED_MODELS).join(", ")}` };
+  }
+
+  const modelProfile = MODEL_API_PROFILES[model];
+
   if (request.body?.temperature !== undefined && temperature === undefined) {
     reply.code(400);
     return { error: "temperature must be a valid number" };
@@ -169,6 +355,35 @@ app.post<{ Body: ChatBody }>("/api/chat/stream", async (request, reply) => {
   if (temperature !== undefined && (temperature < 0 || temperature > 2)) {
     reply.code(400);
     return { error: "temperature must be between 0 and 2" };
+  }
+
+  if (
+    modelProfile.temperaturePolicy === "never" &&
+    request.body?.temperature !== undefined
+  ) {
+    reply.code(400);
+    return { error: `temperature is not supported for model ${model}` };
+  }
+
+  if (
+    modelProfile.temperaturePolicy === "reasoning_none_only" &&
+    request.body?.temperature !== undefined &&
+    reasoningEffort !== "none"
+  ) {
+    reply.code(400);
+    return { error: `temperature for model ${model} is only supported when reasoningEffort=none` };
+  }
+
+  if (requestedReasoningEffortRaw !== undefined && reasoningEffort === undefined) {
+    reply.code(400);
+    return { error: "reasoningEffort must be one of: none, minimal, low, medium, high, xhigh" };
+  }
+
+  if (reasoningEffort !== undefined && !modelProfile.reasoningEfforts.includes(reasoningEffort)) {
+    reply.code(400);
+    return {
+      error: `reasoningEffort for ${model} must be one of: ${modelProfile.reasoningEfforts.join(", ")}`,
+    };
   }
 
   const existingSession = sessions.get(sessionId);
@@ -204,17 +419,18 @@ app.post<{ Body: ChatBody }>("/api/chat/stream", async (request, reply) => {
   };
 
   try {
-    const openaiRequestBody: Record<string, unknown> = {
-      model: TEMPERATURE_MODEL,
-      stream: true,
-      instructions: systemPrompt || undefined,
-      input: inputTranscript,
+    let openaiRequestBody = buildOpenAiRequestBody({
+      model,
+      systemPrompt,
+      inputTranscript,
+      profile: modelProfile,
+      reasoningEffort,
       temperature,
-      reasoning: { effort: "none" },
-    };
+    });
 
     sendSse("debug_request", {
       target: "openai.responses.create",
+      modelProfile,
       body: openaiRequestBody,
     });
 
@@ -227,6 +443,15 @@ app.post<{ Body: ChatBody }>("/api/chat/stream", async (request, reply) => {
       signal: abortController.signal,
       body: JSON.stringify(openaiRequestBody),
     });
+
+    if (!upstream.ok) {
+      const payloadText = await upstream.text();
+      sendSse("error", {
+        message: `OpenAI error (${upstream.status}): ${payloadText}`,
+      });
+      reply.raw.end();
+      return;
+    }
 
     if (!upstream.ok || !upstream.body) {
       const message = await upstream.text();
@@ -274,7 +499,17 @@ app.post<{ Body: ChatBody }>("/api/chat/stream", async (request, reply) => {
 
         const data = dataLines.join("\n");
         if (data === "[DONE]") {
-          sendSse("done", { reason: "completed" });
+          sendSse("done", {
+            reason: "completed",
+            metrics: {
+              model,
+              latencyMs: Date.now() - startedAt,
+              usage: null,
+              costUsd: null,
+              inputCostUsd: null,
+              outputCostUsd: null,
+            },
+          });
           reply.raw.end();
           return;
         }
@@ -303,6 +538,12 @@ app.post<{ Body: ChatBody }>("/api/chat/stream", async (request, reply) => {
 
         if (eventType === "response.completed") {
           const finalText = extractCompletedText(payload.response);
+          const responseModel =
+            typeof payload.response?.model === "string" ? payload.response.model : model;
+          const usageSummary = extractUsageSummary(payload.response?.usage);
+          const responseCostBreakdown =
+            estimateCostBreakdownUsd(responseModel, usageSummary) ??
+            estimateCostBreakdownUsd(model, usageSummary);
           if (typeof payload.response?.id === "string") {
             completedResponseId = payload.response.id;
           }
@@ -318,7 +559,17 @@ app.post<{ Body: ChatBody }>("/api/chat/stream", async (request, reply) => {
           sendSse("debug_response_final", {
             body: extractFinalDebug(payload.response),
           });
-          sendSse("done", { reason: payload.response?.status ?? "completed" });
+          sendSse("done", {
+            reason: payload.response?.status ?? "completed",
+            metrics: {
+              model: responseModel,
+              latencyMs: Date.now() - startedAt,
+              usage: usageSummary,
+              costUsd: responseCostBreakdown?.totalCostUsd ?? null,
+              inputCostUsd: responseCostBreakdown?.inputCostUsd ?? null,
+              outputCostUsd: responseCostBreakdown?.outputCostUsd ?? null,
+            },
+          });
           reply.raw.end();
           return;
         }
@@ -330,12 +581,32 @@ app.post<{ Body: ChatBody }>("/api/chat/stream", async (request, reply) => {
       history: [...requestHistory, { role: "assistant", content: assistantText }],
       updatedAt: Date.now(),
     });
-    sendSse("done", { reason: "stream_closed" });
+    sendSse("done", {
+      reason: "stream_closed",
+      metrics: {
+        model,
+        latencyMs: Date.now() - startedAt,
+        usage: null,
+        costUsd: null,
+        inputCostUsd: null,
+        outputCostUsd: null,
+      },
+    });
     reply.raw.end();
   } catch (error: any) {
     const isAborted = abortController.signal.aborted;
     if (isAborted) {
-      sendSse("done", { reason: "aborted" });
+      sendSse("done", {
+        reason: "aborted",
+        metrics: {
+          model,
+          latencyMs: Date.now() - startedAt,
+          usage: null,
+          costUsd: null,
+          inputCostUsd: null,
+          outputCostUsd: null,
+        },
+      });
       reply.raw.end();
       return;
     }

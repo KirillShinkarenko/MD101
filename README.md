@@ -1,14 +1,19 @@
-# MD104
+# MD105
 
 Веб-приложение для общения с OpenAI через backend-proxy со streaming-ответами.
 
 ## Что есть в UI
 
 - `System Prompt`
+- выбор `Model` (dropdown)
 - чат с историей сообщений (`You` / `Assistant`)
 - поле `Message` под чатом
 - одна action-кнопка `Send` / `Stop`
 - `Clear Session` в правом верхнем углу чата
+- блок `Run metrics` с:
+  - `Latency` (ms)
+  - `Input/Output/Total tokens`
+  - `Estimated cost (USD)` по известным pricing-профилям моделей
 - блок `Raw` с:
   - `Backend -> OpenAI body`
   - `OpenAI -> Backend final useful body`
