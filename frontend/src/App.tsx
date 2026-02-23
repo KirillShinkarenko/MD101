@@ -466,7 +466,7 @@ function App() {
     <main className="page">
       <section className="panel controls controls-panel">
         <div className="controls-header">
-          <h1>MD105 UI</h1>
+          <h1>MD201 UI</h1>
         </div>
 
         <label htmlFor="system-prompt">System Prompt</label>
