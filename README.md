@@ -1,54 +1,54 @@
-# MD
+# MD107
 
-Веб-приложение для общения с OpenAI через backend-proxy со streaming-ответами.
+Веб-приложение для чата с OpenAI через backend-proxy со streaming-ответами.
 
 ## Что есть в UI
 
-- `System Prompt`
-- выбор `Model` (dropdown)
-- чат с историей сообщений (`You` / `Assistant`)
-- поле `Message` под чатом
-- одна action-кнопка `Send` / `Stop`
-- `Clear Session` в правом верхнем углу чата
-- блок `Run metrics` с:
-  - `Latency` (ms)
-  - `Input/Output/Total tokens`
-  - `Estimated cost (USD)` по известным pricing-профилям моделей
-- блок `Raw` с:
-  - `Backend -> OpenAI body`
-  - `OpenAI -> Backend final useful body`
+- мультичат (список чатов слева)
+- создание и удаление чатов
+- автогенерация названия нового чата по первому сообщению
+- выбор активного чата с подгрузкой истории
+- глобальный `System prompt` (модалка)
+- `Model settings`:
+  - выбор модели
+  - `reasoning effort`
+  - `temperature` (с ограничениями по модели)
+- центральный чат с историей `You` / `Assistant`
+- поле ввода + кнопка `Send` / `Stop`
+- правая панель инспектора:
+  - `Metrics` (latency, tokens, cost)
+  - `Request` (тело запроса в OpenAI)
+  - `Response` (финальный полезный ответ от OpenAI)
+  - полноэкранный просмотр JSON
 
 ## Архитектура
 
 - `frontend/`: React + TypeScript + Vite
 - `backend/`: Fastify + TypeScript
-- Streaming через SSE: `POST /api/chat/stream`
-- Сброс серверной сессии: `POST /api/chat/session/reset`
-- Backend uses OpenAI `v1/responses` (streaming)
+- Frontend организован по слоям:
+  - `src/domain`
+  - `src/application`
+  - `src/infrastructure`
+  - `src/presentation`
+  - `src/shared`
+- Streaming между frontend и backend: SSE (`/api/chats/:id/stream`)
+- Backend вызывает OpenAI `v1/responses`
 
-## Контекст диалога
+## Хранение данных
 
-- Frontend отправляет постоянный `sessionId` для вкладки.
-- Backend хранит историю сообщений по `sessionId`.
-- В каждый запрос к Responses API backend отправляет весь предыдущий диалог целиком.
-- При смене `System Prompt` цепочка контекста для этой сессии сбрасывается.
-- `Clear Session` очищает чат в UI и сбрасывает сессию на backend.
+- История чатов и сообщений хранится в SQLite.
+- Файл БД: `backend/data/md.sqlite`
+- После перезапуска backend данные сохраняются (в отличие от in-memory хранения).
 
-## Хранение сессий
+## Переменные окружения
 
-- История хранится в памяти backend (`Map`), не в БД.
-- После перезапуска backend история очищается.
-- Если количество сессий становится слишком большим, старые сессии удаляются автоматически (ограничение по количеству в коде).
-
-## Быстрый старт
-
-1. Создайте `.env`:
+Создайте файл `.env` в корне:
 
 ```bash
 cp .env.example .env
 ```
 
-2. Заполните `.env`:
+Минимальные переменные:
 
 ```bash
 OPENAI_API_KEY=your_api_key_here
@@ -56,35 +56,70 @@ OPENAI_MODEL=gpt-5-mini
 PORT=8787
 ```
 
-3. Установите зависимости:
+Дополнительно:
+
+- `HOST` (опционально, по умолчанию `0.0.0.0`)
+- `VITE_API_BASE_URL` (опционально, для frontend; по умолчанию пусто, используется vite proxy)
+
+## Быстрый старт
+
+1. Установите зависимости:
 
 ```bash
 cd backend && npm install
 cd ../frontend && npm install
 ```
 
-4. Запустите backend:
+2. Запустите backend:
 
 ```bash
 cd backend
 npm run dev
 ```
 
-5. В другом терминале запустите frontend:
+3. В другом терминале запустите frontend:
 
 ```bash
 cd frontend
 npm run dev
 ```
 
-6. Откройте:
+4. Откройте `http://localhost:5173`
 
-- `http://localhost:5173`
+## Доступные модели (сейчас)
+
+- `gpt-4.1-nano`
+- `gpt-5-mini`
+- `gpt-5.1`
+- `gpt-5.2`
+
+Важно:
+
+- Для `gpt-5-mini` `temperature` не поддерживается.
+- Для `gpt-5.1` и `gpt-5.2` `temperature` доступен только при `reasoningEffort=none`.
+
+## API backend
+
+- `GET /health`
+- `GET /api/chats` - список чатов
+- `POST /api/chats` - создать чат
+- `GET /api/chats/:id/messages` - история сообщений чата
+- `PATCH /api/chats/:id` - обновить чат (`title`, `model`, `systemPrompt`)
+- `DELETE /api/chats/:id` - удалить чат
+- `POST /api/chats/:id/stream` - отправить сообщение и получить streaming-ответ (SSE)
+
+SSE-события на stream endpoint:
+
+- `delta`
+- `debug_request`
+- `debug_response_final`
+- `done`
+- `error`
 
 ## Управление вводом
 
-- `Enter` отправляет сообщение
-- `Shift + Enter` добавляет перенос строки
+- `Enter` - отправить сообщение
+- `Shift + Enter` - новая строка
 
 ## Безопасность
 
