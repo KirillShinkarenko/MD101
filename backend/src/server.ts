@@ -1,6 +1,9 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import dotenv from "dotenv";
+import { DatabaseSync } from "node:sqlite";
+import { mkdirSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 
 dotenv.config({ path: "../.env" });
 dotenv.config();
@@ -11,23 +14,43 @@ await app.register(cors, {
   origin: true,
 });
 
+type Role = "user" | "assistant";
+
 type ChatBody = {
-  sessionId?: string;
-  systemPrompt?: string;
   userPrompt?: string;
   temperature?: number | string;
   model?: string;
   reasoningEffort?: string;
+  systemPrompt?: string;
 };
 
-type ResetSessionBody = {
-  sessionId?: string;
+type CreateChatBody = {
+  title?: string;
+  model?: string;
+  systemPrompt?: string;
 };
 
-type SessionState = {
-  systemPrompt: string;
-  history: Array<{ role: "user" | "assistant"; content: string }>;
-  updatedAt: number;
+type PatchChatBody = {
+  title?: string;
+  model?: string;
+  systemPrompt?: string;
+};
+
+type UsageSummary = {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+};
+
+type CostBreakdownUsd = {
+  inputCostUsd: number;
+  outputCostUsd: number;
+  totalCostUsd: number;
+};
+
+type ModelApiProfile = {
+  temperaturePolicy: "never" | "always" | "reasoning_none_only";
+  reasoningEfforts: Array<"none" | "minimal" | "low" | "medium" | "high" | "xhigh">;
 };
 
 const DEFAULT_MODEL = process.env.OPENAI_MODEL?.trim() || "gpt-5-mini";
@@ -45,11 +68,6 @@ const MODEL_PRICING_PER_1M: Record<string, { input: number; output: number }> = 
   "gpt-5.2": { input: 1.75, output: 14 },
 };
 const MODEL_PRICING_KEYS = Object.keys(MODEL_PRICING_PER_1M).sort((a, b) => b.length - a.length);
-
-type ModelApiProfile = {
-  temperaturePolicy: "never" | "always" | "reasoning_none_only";
-  reasoningEfforts: Array<"none" | "minimal" | "low" | "medium" | "high" | "xhigh">;
-};
 
 const MODEL_API_PROFILES: Record<string, ModelApiProfile> = {
   "gpt-4.1-nano": {
@@ -72,18 +90,54 @@ const MODEL_API_PROFILES: Record<string, ModelApiProfile> = {
 
 const ALLOWED_MODELS = new Set(Object.keys(MODEL_API_PROFILES));
 const EFFECTIVE_DEFAULT_MODEL = ALLOWED_MODELS.has(DEFAULT_MODEL) ? DEFAULT_MODEL : "gpt-5-mini";
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-type UsageSummary = {
-  inputTokens: number;
-  outputTokens: number;
-  totalTokens: number;
+if (!OPENAI_API_KEY) {
+  app.log.warn("OPENAI_API_KEY is not set. Requests will fail until it is configured.");
+}
+
+const createId = (): string => {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 };
 
-type CostBreakdownUsd = {
-  inputCostUsd: number;
-  outputCostUsd: number;
-  totalCostUsd: number;
-};
+const dbPath = resolve(process.cwd(), "data", "md.sqlite");
+mkdirSync(dirname(dbPath), { recursive: true });
+const db = new DatabaseSync(dbPath);
+db.exec("PRAGMA journal_mode = WAL;");
+db.exec("PRAGMA foreign_keys = ON;");
+db.exec(`
+CREATE TABLE IF NOT EXISTS chats (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  model TEXT NOT NULL,
+  system_prompt TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+  id TEXT PRIMARY KEY,
+  chat_id TEXT NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+  content TEXT NOT NULL,
+  request_json TEXT,
+  response_json TEXT,
+  latency_ms INTEGER,
+  input_tokens INTEGER,
+  output_tokens INTEGER,
+  total_tokens INTEGER,
+  cost_usd REAL,
+  input_cost_usd REAL,
+  output_cost_usd REAL,
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (chat_id) REFERENCES chats (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_chat_id_created_at ON messages (chat_id, created_at);
+`);
 
 const parseTemperature = (value: unknown): number | undefined => {
   if (value === undefined || value === null) {
@@ -267,17 +321,17 @@ const estimateCostBreakdownUsd = (model: string, usageSummary: UsageSummary): Co
 const buildOpenAiRequestBody = (params: {
   model: string;
   systemPrompt: string;
-  inputTranscript: string;
+  inputMessages: Array<{ role: Role; content: string }>;
   profile: ModelApiProfile;
   reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
   temperature?: number;
 }): Record<string, unknown> => {
-  const { model, systemPrompt, inputTranscript, temperature, profile, reasoningEffort } = params;
+  const { model, systemPrompt, inputMessages, temperature, profile, reasoningEffort } = params;
   const body: Record<string, unknown> = {
     model,
     stream: true,
     instructions: systemPrompt || undefined,
-    input: inputTranscript,
+    input: inputMessages,
   };
 
   const canUseTemperature =
@@ -295,49 +349,185 @@ const buildOpenAiRequestBody = (params: {
   return body;
 };
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const sessions = new Map<string, SessionState>();
+const getChatStmt = db.prepare(`
+  SELECT id, title, model, system_prompt AS systemPrompt, created_at AS createdAt, updated_at AS updatedAt
+  FROM chats
+  WHERE id = ?
+`);
 
-if (!OPENAI_API_KEY) {
-  app.log.warn("OPENAI_API_KEY is not set. Requests will fail until it is configured.");
-}
+const listChatsStmt = db.prepare(`
+  SELECT
+    c.id,
+    c.title,
+    c.model,
+    c.system_prompt AS systemPrompt,
+    c.created_at AS createdAt,
+    c.updated_at AS updatedAt,
+    (
+      SELECT m.content
+      FROM messages m
+      WHERE m.chat_id = c.id
+      ORDER BY m.created_at DESC
+      LIMIT 1
+    ) AS lastMessagePreview
+  FROM chats c
+  ORDER BY c.updated_at DESC
+`);
+
+const listMessagesStmt = db.prepare(`
+  SELECT
+    id,
+    chat_id AS chatId,
+    role,
+    content,
+    request_json AS requestJson,
+    response_json AS responseJson,
+    latency_ms AS latencyMs,
+    input_tokens AS inputTokens,
+    output_tokens AS outputTokens,
+    total_tokens AS totalTokens,
+    cost_usd AS costUsd,
+    input_cost_usd AS inputCostUsd,
+    output_cost_usd AS outputCostUsd,
+    created_at AS createdAt
+  FROM messages
+  WHERE chat_id = ?
+  ORDER BY created_at ASC
+`);
+
+const insertChatStmt = db.prepare(`
+  INSERT INTO chats (id, title, model, system_prompt, created_at, updated_at)
+  VALUES (?, ?, ?, ?, ?, ?)
+`);
+
+const updateChatStmt = db.prepare(`
+  UPDATE chats
+  SET title = ?, model = ?, system_prompt = ?, updated_at = ?
+  WHERE id = ?
+`);
+
+const deleteChatStmt = db.prepare(`DELETE FROM chats WHERE id = ?`);
+
+const insertMessageStmt = db.prepare(`
+  INSERT INTO messages (
+    id, chat_id, role, content, request_json, response_json,
+    latency_ms, input_tokens, output_tokens, total_tokens,
+    cost_usd, input_cost_usd, output_cost_usd, created_at
+  )
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+
+const updateChatUpdatedAtStmt = db.prepare(`UPDATE chats SET updated_at = ? WHERE id = ?`);
+
+const createChat = (params?: { title?: string; model?: string; systemPrompt?: string }) => {
+  const now = Date.now();
+  const id = createId();
+  const title = params?.title?.trim() || "New chat";
+  const model = parseModel(params?.model) ?? EFFECTIVE_DEFAULT_MODEL;
+  const systemPrompt = params?.systemPrompt?.trim() ?? "You are a concise assistant.";
+  insertChatStmt.run(id, title, model, systemPrompt, now, now);
+  return getChatStmt.get(id);
+};
 
 app.get("/health", async () => ({ ok: true }));
 
-app.post<{ Body: ResetSessionBody }>("/api/chat/session/reset", async (request, reply) => {
-  const sessionId = request.body?.sessionId?.trim() ?? "";
-  if (!sessionId) {
-    reply.code(400);
-    return { error: "sessionId is required" };
+app.get("/api/chats", async () => {
+  const chats = listChatsStmt.all();
+  return { chats };
+});
+
+app.post<{ Body: CreateChatBody }>("/api/chats", async (request) => {
+  const chat = createChat(request.body);
+  return { chat };
+});
+
+app.get<{ Params: { id: string } }>("/api/chats/:id/messages", async (request, reply) => {
+  const chatId = request.params.id;
+  const chat = getChatStmt.get(chatId);
+  if (!chat) {
+    reply.code(404);
+    return { error: "chat not found" };
+  }
+  const messages = listMessagesStmt.all(chatId);
+  return { messages };
+});
+
+app.patch<{ Params: { id: string }; Body: PatchChatBody }>("/api/chats/:id", async (request, reply) => {
+  const chatId = request.params.id;
+  const chat = getChatStmt.get(chatId) as
+    | {
+        id: string;
+        title: string;
+        model: string;
+        systemPrompt: string;
+      }
+    | undefined;
+
+  if (!chat) {
+    reply.code(404);
+    return { error: "chat not found" };
   }
 
-  sessions.delete(sessionId);
+  const title = typeof request.body?.title === "string" ? request.body.title.trim() : chat.title;
+  const model = parseModel(request.body?.model) ?? chat.model;
+  const systemPrompt =
+    typeof request.body?.systemPrompt === "string" ? request.body.systemPrompt : chat.systemPrompt;
+
+  if (!ALLOWED_MODELS.has(model)) {
+    reply.code(400);
+    return { error: `model must be one of: ${Array.from(ALLOWED_MODELS).join(", ")}` };
+  }
+
+  const nextTitle = title || "New chat";
+  updateChatStmt.run(nextTitle, model, systemPrompt, Date.now(), chatId);
+  return { chat: getChatStmt.get(chatId) };
+});
+
+app.delete<{ Params: { id: string } }>("/api/chats/:id", async (request, reply) => {
+  const chatId = request.params.id;
+  const chat = getChatStmt.get(chatId);
+  if (!chat) {
+    reply.code(404);
+    return { error: "chat not found" };
+  }
+  deleteChatStmt.run(chatId);
   return { ok: true };
 });
 
-app.post<{ Body: ChatBody }>("/api/chat/stream", async (request, reply) => {
+app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", async (request, reply) => {
   if (!OPENAI_API_KEY) {
     reply.code(500);
     return { error: "OPENAI_API_KEY is not configured" };
   }
 
-  const sessionId = request.body?.sessionId?.trim() ?? "";
-  const systemPrompt = request.body?.systemPrompt?.trim() ?? "";
+  const chatId = request.params.id;
+  const existingChat = getChatStmt.get(chatId) as
+    | {
+        id: string;
+        title: string;
+        model: string;
+        systemPrompt: string;
+      }
+    | undefined;
+
+  if (!existingChat) {
+    reply.code(404);
+    return { error: "chat not found" };
+  }
+
   const userPrompt = request.body?.userPrompt?.trim() ?? "";
   const temperature = parseTemperature(request.body?.temperature);
-  const model = parseModel(request.body?.model) ?? EFFECTIVE_DEFAULT_MODEL;
+  const requestedModel = parseModel(request.body?.model);
+  const model = requestedModel ?? existingChat.model;
   const requestedReasoningEffortRaw = request.body?.reasoningEffort;
   const reasoningEffort = parseReasoningEffort(requestedReasoningEffortRaw);
+  const systemPrompt =
+    typeof request.body?.systemPrompt === "string" ? request.body.systemPrompt : existingChat.systemPrompt;
   const startedAt = Date.now();
 
   if (!userPrompt) {
     reply.code(400);
     return { error: "userPrompt is required" };
-  }
-
-  if (!sessionId) {
-    reply.code(400);
-    return { error: "sessionId is required" };
   }
 
   if (!ALLOWED_MODELS.has(model)) {
@@ -357,10 +547,7 @@ app.post<{ Body: ChatBody }>("/api/chat/stream", async (request, reply) => {
     return { error: "temperature must be between 0 and 2" };
   }
 
-  if (
-    modelProfile.temperaturePolicy === "never" &&
-    request.body?.temperature !== undefined
-  ) {
+  if (modelProfile.temperaturePolicy === "never" && request.body?.temperature !== undefined) {
     reply.code(400);
     return { error: `temperature is not supported for model ${model}` };
   }
@@ -386,13 +573,39 @@ app.post<{ Body: ChatBody }>("/api/chat/stream", async (request, reply) => {
     };
   }
 
-  const existingSession = sessions.get(sessionId);
-  const shouldResetHistory = !existingSession || existingSession.systemPrompt !== systemPrompt;
-  const baseHistory = shouldResetHistory ? [] : existingSession.history;
-  const requestHistory = [...baseHistory, { role: "user" as const, content: userPrompt }];
-  const inputTranscript = requestHistory
-    .map((item) => `${item.role === "user" ? "User" : "Assistant"}: ${item.content}`)
-    .join("\n\n");
+  const persistedMessagesRaw = listMessagesStmt.all(chatId) as Array<{ role: Role; content: string }>;
+  const persistedMessages = persistedMessagesRaw.map((item) => ({
+    role: item.role,
+    content: item.content,
+  }));
+  const inputMessages = [...persistedMessages, { role: "user" as const, content: userPrompt }];
+
+  const now = Date.now();
+  updateChatStmt.run(existingChat.title, model, systemPrompt, now, chatId);
+
+  if (existingChat.title === "New chat") {
+    const nextTitle = userPrompt.slice(0, 42).trim() || "New chat";
+    updateChatStmt.run(nextTitle, model, systemPrompt, now, chatId);
+  }
+
+  const userMessageId = createId();
+  insertMessageStmt.run(
+    userMessageId,
+    chatId,
+    "user",
+    userPrompt,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    now
+  );
+  updateChatUpdatedAtStmt.run(now, chatId);
 
   reply.raw.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -419,10 +632,10 @@ app.post<{ Body: ChatBody }>("/api/chat/stream", async (request, reply) => {
   };
 
   try {
-    let openaiRequestBody = buildOpenAiRequestBody({
+    const openaiRequestBody = buildOpenAiRequestBody({
       model,
       systemPrompt,
-      inputTranscript,
+      inputMessages,
       profile: modelProfile,
       reasoningEffort,
       temperature,
@@ -444,19 +657,10 @@ app.post<{ Body: ChatBody }>("/api/chat/stream", async (request, reply) => {
       body: JSON.stringify(openaiRequestBody),
     });
 
-    if (!upstream.ok) {
+    if (!upstream.ok || !upstream.body) {
       const payloadText = await upstream.text();
       sendSse("error", {
         message: `OpenAI error (${upstream.status}): ${payloadText}`,
-      });
-      reply.raw.end();
-      return;
-    }
-
-    if (!upstream.ok || !upstream.body) {
-      const message = await upstream.text();
-      sendSse("error", {
-        message: `OpenAI error (${upstream.status}): ${message}`,
       });
       reply.raw.end();
       return;
@@ -467,7 +671,10 @@ app.post<{ Body: ChatBody }>("/api/chat/stream", async (request, reply) => {
     let buffer = "";
     let hasSentDelta = false;
     let assistantText = "";
-    let completedResponseId: string | undefined;
+    let finalDebugResponse: Record<string, unknown> | null = null;
+    let finalUsage: UsageSummary | null = null;
+    let finalModel = model;
+    let finalCost: CostBreakdownUsd | null = null;
 
     while (true) {
       const { done, value } = await reader.read();
@@ -499,19 +706,7 @@ app.post<{ Body: ChatBody }>("/api/chat/stream", async (request, reply) => {
 
         const data = dataLines.join("\n");
         if (data === "[DONE]") {
-          sendSse("done", {
-            reason: "completed",
-            metrics: {
-              model,
-              latencyMs: Date.now() - startedAt,
-              usage: null,
-              costUsd: null,
-              inputCostUsd: null,
-              outputCostUsd: null,
-            },
-          });
-          reply.raw.end();
-          return;
+          continue;
         }
 
         let payload: any;
@@ -538,36 +733,51 @@ app.post<{ Body: ChatBody }>("/api/chat/stream", async (request, reply) => {
 
         if (eventType === "response.completed") {
           const finalText = extractCompletedText(payload.response);
-          const responseModel =
-            typeof payload.response?.model === "string" ? payload.response.model : model;
-          const usageSummary = extractUsageSummary(payload.response?.usage);
-          const responseCostBreakdown =
-            estimateCostBreakdownUsd(responseModel, usageSummary) ??
-            estimateCostBreakdownUsd(model, usageSummary);
-          if (typeof payload.response?.id === "string") {
-            completedResponseId = payload.response.id;
-          }
+          finalModel = typeof payload.response?.model === "string" ? payload.response.model : model;
+          finalUsage = extractUsageSummary(payload.response?.usage);
+          finalCost =
+            estimateCostBreakdownUsd(finalModel, finalUsage) ??
+            estimateCostBreakdownUsd(model, finalUsage);
+
           if (!hasSentDelta && finalText) {
             assistantText = finalText;
             sendSse("delta", { text: finalText });
           }
-          sessions.set(sessionId, {
-            systemPrompt,
-            history: [...requestHistory, { role: "assistant", content: assistantText }],
-            updatedAt: Date.now(),
-          });
+
+          finalDebugResponse = extractFinalDebug(payload.response);
           sendSse("debug_response_final", {
-            body: extractFinalDebug(payload.response),
+            body: finalDebugResponse,
           });
+
+          const assistantMessageId = createId();
+          const finishedAt = Date.now();
+          insertMessageStmt.run(
+            assistantMessageId,
+            chatId,
+            "assistant",
+            assistantText,
+            JSON.stringify(openaiRequestBody),
+            JSON.stringify(finalDebugResponse),
+            finishedAt - startedAt,
+            finalUsage?.inputTokens ?? null,
+            finalUsage?.outputTokens ?? null,
+            finalUsage?.totalTokens ?? null,
+            finalCost?.totalCostUsd ?? null,
+            finalCost?.inputCostUsd ?? null,
+            finalCost?.outputCostUsd ?? null,
+            finishedAt
+          );
+          updateChatUpdatedAtStmt.run(finishedAt, chatId);
+
           sendSse("done", {
             reason: payload.response?.status ?? "completed",
             metrics: {
-              model: responseModel,
-              latencyMs: Date.now() - startedAt,
-              usage: usageSummary,
-              costUsd: responseCostBreakdown?.totalCostUsd ?? null,
-              inputCostUsd: responseCostBreakdown?.inputCostUsd ?? null,
-              outputCostUsd: responseCostBreakdown?.outputCostUsd ?? null,
+              model: finalModel,
+              latencyMs: finishedAt - startedAt,
+              usage: finalUsage,
+              costUsd: finalCost?.totalCostUsd ?? null,
+              inputCostUsd: finalCost?.inputCostUsd ?? null,
+              outputCostUsd: finalCost?.outputCostUsd ?? null,
             },
           });
           reply.raw.end();
@@ -576,26 +786,48 @@ app.post<{ Body: ChatBody }>("/api/chat/stream", async (request, reply) => {
       }
     }
 
-    sessions.set(sessionId, {
-      systemPrompt,
-      history: [...requestHistory, { role: "assistant", content: assistantText }],
-      updatedAt: Date.now(),
-    });
+    const fallbackInputTokens = null;
+    const fallbackOutputTokens = null;
+    const fallbackTotalTokens = null;
+    const fallbackTotalCostUsd = null;
+    const fallbackInputCostUsd = null;
+    const fallbackOutputCostUsd = null;
+
+    if (assistantText) {
+      const finishedAt = Date.now();
+      insertMessageStmt.run(
+        createId(),
+        chatId,
+        "assistant",
+        assistantText,
+        null,
+        finalDebugResponse ? JSON.stringify(finalDebugResponse) : null,
+        finishedAt - startedAt,
+        fallbackInputTokens,
+        fallbackOutputTokens,
+        fallbackTotalTokens,
+        fallbackTotalCostUsd,
+        fallbackInputCostUsd,
+        fallbackOutputCostUsd,
+        finishedAt
+      );
+      updateChatUpdatedAtStmt.run(finishedAt, chatId);
+    }
+
     sendSse("done", {
       reason: "stream_closed",
       metrics: {
         model,
         latencyMs: Date.now() - startedAt,
-        usage: null,
-        costUsd: null,
-        inputCostUsd: null,
-        outputCostUsd: null,
+        usage: finalUsage,
+        costUsd: fallbackTotalCostUsd,
+        inputCostUsd: fallbackInputCostUsd,
+        outputCostUsd: fallbackOutputCostUsd,
       },
     });
     reply.raw.end();
-  } catch (error: any) {
-    const isAborted = abortController.signal.aborted;
-    if (isAborted) {
+  } catch (error) {
+    if (abortController.signal.aborted) {
       sendSse("done", {
         reason: "aborted",
         metrics: {
@@ -615,14 +847,6 @@ app.post<{ Body: ChatBody }>("/api/chat/stream", async (request, reply) => {
     app.log.error({ err: error, ...formattedError }, "OpenAI upstream request failed");
     sendSse("error", formattedError);
     reply.raw.end();
-  } finally {
-    if (sessions.size > 500) {
-      const sortedSessions = Array.from(sessions.entries()).sort((a, b) => a[1].updatedAt - b[1].updatedAt);
-      const staleCount = Math.max(0, sessions.size - 300);
-      for (let i = 0; i < staleCount; i += 1) {
-        sessions.delete(sortedSessions[i][0]);
-      }
-    }
   }
 });
 
