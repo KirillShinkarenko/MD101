@@ -15,9 +15,23 @@ const readJson = async <T>(response: Response): Promise<T | null> => {
 const extractError = (payload: unknown, fallback: string): Error => {
   const candidate = payload as { error?: unknown } | null;
   if (candidate && typeof candidate.error === "string") {
-    return new Error(candidate.error);
+    const err = new Error(candidate.error);
+    (err as Error & { payload?: unknown }).payload = payload;
+    return err;
   }
-  return new Error(fallback);
+  if (
+    candidate &&
+    typeof candidate.error === "object" &&
+    candidate.error !== null &&
+    typeof (candidate.error as { message?: unknown }).message === "string"
+  ) {
+    const err = new Error((candidate.error as { message: string }).message);
+    (err as Error & { payload?: unknown }).payload = payload;
+    return err;
+  }
+  const err = new Error(fallback);
+  (err as Error & { payload?: unknown }).payload = payload;
+  return err;
 };
 
 export const chatApi = {
@@ -30,11 +44,11 @@ export const chatApi = {
     return payload?.chats ?? [];
   },
 
-  async createChat(): Promise<ChatSummary> {
+  async createChat(body?: Partial<{ title: string; model: string; systemPrompt: string }>): Promise<ChatSummary> {
     const response = await fetch(`${API_BASE}/api/chats`, {
       method: "POST",
       headers: jsonHeaders,
-      body: "{}",
+      body: JSON.stringify(body ?? {}),
     });
     const payload = await readJson<{ chat?: ChatSummary; error?: string }>(response);
     if (!response.ok || !payload?.chat) {

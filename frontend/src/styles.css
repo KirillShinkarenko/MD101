@@ -73,6 +73,21 @@ textarea {
   font-size: 18px;
 }
 
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.copy-dialog-button {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  padding: 0;
+  font-size: 16px;
+  line-height: 1;
+}
+
 button {
   border: 1px solid #3a3a3a;
   background: #2b2b2b;
@@ -250,9 +265,29 @@ textarea {
 
 .composer-bottom {
   display: grid;
-  grid-template-columns: auto;
-  justify-content: end;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
   gap: 8px;
+}
+
+.composer-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.secondary-action {
+  font-size: 12px;
+  padding: 6px 9px;
+}
+
+.context-indicator {
+  margin: 0;
+  font-size: 12px;
+  color: #b8c1cc;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .status {
@@ -303,6 +338,12 @@ textarea {
   border-radius: 8px;
 }
 
+.section-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .metrics-section .side-section-header h3 {
   font-size: 13px;
 }
@@ -319,7 +360,7 @@ textarea {
 
 .metrics-compact {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1fr;
   gap: 4px 10px;
 }
 
@@ -333,6 +374,62 @@ textarea {
 .metrics-section {
   padding: 6px 10px;
   gap: 4px;
+}
+
+.metrics-blocks {
+  display: grid;
+  gap: 8px;
+}
+
+.metrics-card {
+  border: 1px solid #3a3a3a;
+  border-radius: 10px;
+  background: #202020;
+  padding: 8px;
+  display: grid;
+  gap: 8px;
+}
+
+.metrics-card h4 {
+  margin: 0;
+  font-size: 12px;
+  color: #b8c1cc;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.metrics-table-wrap {
+  overflow: auto;
+  border: 1px solid #3a3a3a;
+  border-radius: 8px;
+}
+
+.metrics-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+  min-width: 220px;
+}
+
+.metrics-table th,
+.metrics-table td {
+  padding: 4px 6px;
+  border-bottom: 1px solid #343434;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.metrics-table th:first-child,
+.metrics-table td:first-child {
+  text-align: left;
+}
+
+.metrics-table tr:last-child td {
+  border-bottom: none;
+}
+
+.metrics-table-wrap-growth {
+  max-height: 155px;
 }
 
 .raw-section {
@@ -471,5 +568,13 @@ textarea {
   .center-col {
     order: 2;
     min-height: 60vh;
+  }
+
+  .composer-bottom {
+    grid-template-columns: 1fr;
+  }
+
+  .composer-actions {
+    justify-content: flex-end;
   }
 }

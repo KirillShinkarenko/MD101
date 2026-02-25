@@ -29,23 +29,30 @@ function App() {
         status={view.status}
         userPrompt={view.userPrompt}
         isStreaming={view.isStreaming}
+        currentContextTokens={view.currentContextTokens}
+        maxContextTokens={view.maxContextTokens}
+        formatNumber={view.formatNumber}
         messages={view.messages}
         chatEndRef={view.chatEndRef}
         onUserPromptChange={actions.setUserPrompt}
         onPromptKeyDown={actions.handlePromptKeyDown}
         onMainAction={actions.handleMainAction}
+        onCopyConversationText={() => void actions.copyConversationText()}
+        onGenerateLongPrompt={actions.generateLongPrompt}
+        onGenerateOverflowPrompt={actions.generateOverflowPrompt}
       />
 
       <InspectorPanel
         model={view.model}
         metrics={view.metrics}
-        isMetricsOpen={view.isMetricsOpen}
+        historyTotals={view.historyTotals}
+        turnRows={view.turnRows}
         requestRaw={view.requestRaw}
         responseRaw={view.responseRaw}
+        overflowErrorRaw={view.overflowErrorRaw}
         errorText={view.errorText}
         formatNumber={view.formatNumber}
         formatUsd={view.formatUsd}
-        onToggleMetrics={() => actions.setIsMetricsOpen((prev) => !prev)}
         onOpenFullScreenRequest={() => actions.setFullScreenView("request")}
         onOpenFullScreenResponse={() => actions.setFullScreenView("response")}
       />

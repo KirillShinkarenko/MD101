@@ -3,6 +3,7 @@ import {
   ACTIVE_CHAT_STORAGE_KEY,
   DEFAULT_MODEL,
   DEFAULT_SYSTEM_PROMPT,
+  MODEL_CONTEXT_WINDOW,
   MODEL_OPTIONS,
   MODEL_REASONING_OPTIONS,
   MODEL_TEMPERATURE_POLICY,
@@ -10,9 +11,11 @@ import {
   type ChatMessage,
   type ChatSummary,
   type FullScreenView,
+  type HistoryTotals,
   type ReasoningEffort,
   type RunMetrics,
   type Status,
+  type TurnGrowthRow,
 } from "../domain/chat";
 import { chatApi } from "../infrastructure/chatApi";
 import { formatNumber, formatUsd } from "../shared/format";
@@ -44,6 +47,49 @@ const parseTemperature = (value: string): { value?: number; error?: string } => 
   return { value: parsed };
 };
 
+const generateApprox5000TokenText = (): string => {
+  const seed =
+    "This is a generated long context block for stress testing token limits in the chat application. ";
+  const targetChars = 20_000;
+  let result = "";
+  while (result.length < targetChars) {
+    result += seed;
+  }
+  return result.slice(0, targetChars);
+};
+
+const generateOverflowPromptText = (): string => {
+  const seed =
+    "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega ";
+  const targetChars = 150_000;
+  let result = "";
+  while (result.length < targetChars) {
+    result += seed;
+  }
+  return result.slice(0, targetChars);
+};
+
+const extractRawApiPayload = (payload: unknown): unknown => {
+  const candidate =
+    payload && typeof payload === "object"
+      ? (payload as {
+          upstreamLastPayload?: unknown;
+          raw?: unknown;
+          error?: unknown;
+        })
+      : undefined;
+  if (candidate?.upstreamLastPayload) {
+    return candidate.upstreamLastPayload;
+  }
+  if (candidate?.raw) {
+    return candidate.raw;
+  }
+  if (candidate?.error && typeof candidate.error === "object") {
+    return candidate.error;
+  }
+  return payload;
+};
+
 export type ChatController = ReturnType<typeof useChatController>;
 
 export function useChatController() {
@@ -62,6 +108,7 @@ export function useChatController() {
   const [metrics, setMetrics] = useState<RunMetrics | null>(null);
   const [requestRaw, setRequestRaw] = useState("");
   const [responseRaw, setResponseRaw] = useState("");
+  const [overflowErrorRaw, setOverflowErrorRaw] = useState("");
 
   const [isModelSettingsOpen, setIsModelSettingsOpen] = useState(false);
   const [isSystemPromptOpen, setIsSystemPromptOpen] = useState(false);
@@ -88,6 +135,67 @@ export function useChatController() {
   const isTemperatureSupported =
     temperaturePolicy === "always" ||
     (temperaturePolicy === "reasoning_none_only" && reasoningEffort === "none");
+  const historyTotals = useMemo<HistoryTotals>(() => {
+    return messages.reduce<HistoryTotals>(
+      (acc, message) => {
+        if (message.role !== "assistant") {
+          return acc;
+        }
+        return {
+          inputTokens: acc.inputTokens + (message.inputTokens ?? 0),
+          outputTokens: acc.outputTokens + (message.outputTokens ?? 0),
+          totalTokens: acc.totalTokens + (message.totalTokens ?? 0),
+          costUsd: Number((acc.costUsd + (message.costUsd ?? 0)).toFixed(8)),
+        };
+      },
+      {
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        costUsd: 0,
+      }
+    );
+  }, [messages]);
+
+  const turnRows = useMemo<TurnGrowthRow[]>(() => {
+    const rows: TurnGrowthRow[] = [];
+    let cumulativeTotalTokens = 0;
+    let cumulativeCostUsd = 0;
+
+    for (const message of messages) {
+      if (message.role !== "assistant") {
+        continue;
+      }
+
+      cumulativeTotalTokens += message.totalTokens ?? 0;
+      cumulativeCostUsd = Number((cumulativeCostUsd + (message.costUsd ?? 0)).toFixed(8));
+
+      rows.push({
+        turnIndex: rows.length + 1,
+        inputTokens: message.inputTokens,
+        outputTokens: message.outputTokens,
+        totalTokens: message.totalTokens,
+        costUsd: message.costUsd,
+        cumulativeTotalTokens,
+        cumulativeCostUsd,
+        latencyMs: message.latencyMs,
+      });
+    }
+
+    return rows;
+  }, [messages]);
+
+  const currentContextTokens = useMemo<number | null>(() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role === "assistant" && typeof message.totalTokens === "number") {
+        return message.totalTokens;
+      }
+    }
+    return null;
+  }, [messages]);
+
+  const maxContextTokens = MODEL_CONTEXT_WINDOW[model] ?? null;
 
   const selectChat = useCallback((chatId: string) => {
     setActiveChatId(chatId);
@@ -104,6 +212,7 @@ export function useChatController() {
 
       setRequestRaw(prettyJsonText(latestWithDebug?.requestJson));
       setResponseRaw(prettyJsonText(latestWithDebug?.responseJson));
+      setOverflowErrorRaw("");
 
       const latestAssistant = [...nextMessages].reverse().find((item) => item.role === "assistant");
       if (!latestAssistant) {
@@ -132,6 +241,7 @@ export function useChatController() {
         setMessages([]);
         setRequestRaw("");
         setResponseRaw("");
+        setOverflowErrorRaw("");
         setMetrics(null);
         return;
       }
@@ -144,7 +254,7 @@ export function useChatController() {
     const listed = await chatApi.listChats();
 
     if (listed.length === 0) {
-      const created = await chatApi.createChat();
+      const created = await chatApi.createChat({ model });
       setChats([created]);
       selectChat(created.id);
       setModel(created.model);
@@ -164,18 +274,19 @@ export function useChatController() {
     const selected = listed.find((chat) => chat.id === nextActiveId) ?? listed[0];
     setModel(selected.model);
     await loadMessages(selected.id);
-  }, [activeChatId, loadMessages, selectChat]);
+  }, [activeChatId, loadMessages, model, selectChat]);
 
   const createChat = useCallback(async () => {
-    const chat = await chatApi.createChat();
+    const chat = await chatApi.createChat({ model });
     setChats((prev) => [chat, ...prev]);
     selectChat(chat.id);
     setMessages([]);
     setMetrics(null);
     setRequestRaw("");
     setResponseRaw("");
+    setOverflowErrorRaw("");
     setModel(chat.model);
-  }, [selectChat]);
+  }, [model, selectChat]);
 
   const deleteChat = useCallback(
     async (chatId: string) => {
@@ -265,9 +376,6 @@ export function useChatController() {
 
     setMessages((prev) => [...prev, userMessage, assistantMessage]);
     setUserPrompt("");
-    setMetrics(null);
-    setRequestRaw("");
-    setResponseRaw("");
 
     const controller = new AbortController();
     controllerRef.current = controller;
@@ -293,6 +401,8 @@ export function useChatController() {
       const decoder = new TextDecoder();
       let buffer = "";
       let eventName = "message";
+      let hasStreamError = false;
+      let hasApiResponsePayload = false;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -346,14 +456,63 @@ export function useChatController() {
 
           if (eventName === "debug_response_final") {
             setResponseRaw(JSON.stringify(payload.body ?? {}, null, 2));
+            hasApiResponsePayload = true;
           }
 
           if (eventName === "error") {
+            hasStreamError = true;
             setStatus("error");
-            setErrorText(payload.message ?? "Unknown error");
+            setResponseRaw(JSON.stringify(payload, null, 2));
+            hasApiResponsePayload = true;
+            const code = typeof payload.code === "string" ? payload.code : "";
+            const nestedCode =
+              typeof payload?.upstreamLastPayload?.response?.error?.code === "string"
+                ? payload.upstreamLastPayload.response.error.code
+                : "";
+            const nestedMessage =
+              typeof payload?.upstreamLastPayload?.response?.error?.message === "string"
+                ? payload.upstreamLastPayload.response.error.message
+                : "";
+            const isContextOverflow =
+              payload.isContextOverflow === true ||
+              code.toLowerCase() === "context_length_exceeded" ||
+              nestedCode.toLowerCase() === "context_length_exceeded";
+            const apiMessage =
+              nestedMessage || (typeof payload.message === "string" ? payload.message : "Unknown error");
+            if (isContextOverflow) {
+              setOverflowErrorRaw(JSON.stringify(extractRawApiPayload(payload), null, 2));
+              setErrorText("");
+              setMessages((prev) =>
+                prev.map((message) =>
+                  message.id === assistantMessageId
+                    ? {
+                        ...message,
+                        content: message.content || `[Context limit reached] ${apiMessage}`,
+                      }
+                    : message
+                )
+              );
+            } else {
+              setOverflowErrorRaw("");
+              setErrorText("");
+              setMessages((prev) =>
+                prev.map((message) =>
+                  message.id === assistantMessageId
+                    ? {
+                        ...message,
+                        content: message.content || `[API error] ${apiMessage}`,
+                      }
+                    : message
+                )
+              );
+            }
           }
 
           if (eventName === "done") {
+            if (!hasApiResponsePayload) {
+              setResponseRaw(JSON.stringify(payload, null, 2));
+              hasApiResponsePayload = true;
+            }
             const usage = payload?.metrics?.usage;
             const nextMetrics: RunMetrics = {
               model: payload?.metrics?.model ?? model,
@@ -376,6 +535,10 @@ export function useChatController() {
         }
       }
 
+      if (hasStreamError) {
+        return;
+      }
+
       setStatus((prev) => (prev === "streaming" ? "done" : prev));
       await loadChats();
       await loadMessages(activeChatId);
@@ -384,7 +547,61 @@ export function useChatController() {
         setStatus("stopped");
       } else {
         setStatus("error");
-        setErrorText(error instanceof Error ? error.message : "Unexpected error");
+        const fallbackMessage = error instanceof Error ? error.message : "Unexpected error";
+        const payload = (error as { payload?: unknown } | null)?.payload;
+        const payloadText = payload
+          ? JSON.stringify(payload, null, 2)
+          : JSON.stringify({ message: fallbackMessage }, null, 2);
+        setResponseRaw(payloadText);
+
+        const payloadCandidate =
+          payload && typeof payload === "object"
+            ? (payload as { error?: unknown; code?: unknown; message?: unknown })
+            : undefined;
+        const nestedError =
+          payloadCandidate &&
+          typeof payloadCandidate.error === "object" &&
+          payloadCandidate.error !== null
+            ? (payloadCandidate.error as { code?: unknown; message?: unknown })
+            : undefined;
+
+        const code =
+          typeof nestedError?.code === "string"
+            ? nestedError.code
+            : typeof payloadCandidate?.code === "string"
+            ? payloadCandidate.code
+            : "";
+        const message =
+          typeof nestedError?.message === "string"
+            ? nestedError.message
+            : typeof payloadCandidate?.message === "string"
+            ? payloadCandidate.message
+            : fallbackMessage;
+        const messageLower = message.toLowerCase();
+        const isContextOverflow =
+          code.toLowerCase() === "context_length_exceeded" ||
+          messageLower.includes("context_length_exceeded") ||
+          messageLower.includes("maximum context length") ||
+          messageLower.includes("too many tokens");
+
+        if (isContextOverflow) {
+          setOverflowErrorRaw(JSON.stringify(extractRawApiPayload(payload), null, 2));
+          setErrorText("");
+        } else {
+          setOverflowErrorRaw("");
+          setErrorText("");
+        }
+
+        setMessages((prev) =>
+          prev.map((chatMessage) =>
+            chatMessage.id === assistantMessageId
+              ? {
+                  ...chatMessage,
+                  content: chatMessage.content || `[API error] ${message}`,
+                }
+              : chatMessage
+          )
+        );
       }
     } finally {
       controllerRef.current = null;
@@ -421,6 +638,34 @@ export function useChatController() {
     },
     [sendMessage]
   );
+
+  const copyConversationText = useCallback(async () => {
+    const transcript = messages
+      .map((message) => `${message.role === "user" ? "You" : "Assistant"}:\n${message.content}`)
+      .join("\n\n");
+
+    if (!transcript.trim()) {
+      setErrorText("No messages to copy.");
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(transcript);
+    } catch {
+      setErrorText("Failed to copy conversation text.");
+      setStatus("error");
+    }
+  }, [messages]);
+
+  const generateLongPrompt = useCallback(() => {
+    setUserPrompt(generateApprox5000TokenText());
+    setErrorText("");
+  }, []);
+
+  const generateOverflowPrompt = useCallback(() => {
+    setUserPrompt(generateOverflowPromptText());
+    setErrorText("");
+  }, []);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -472,6 +717,7 @@ export function useChatController() {
       metrics,
       requestRaw,
       responseRaw,
+      overflowErrorRaw,
       isModelSettingsOpen,
       isSystemPromptOpen,
       isMetricsOpen,
@@ -482,6 +728,10 @@ export function useChatController() {
       reasoningOptions,
       isReasoningSupported,
       isTemperatureSupported,
+      historyTotals,
+      turnRows,
+      currentContextTokens,
+      maxContextTokens,
       chatEndRef,
       formatNumber,
       formatUsd,
@@ -501,6 +751,9 @@ export function useChatController() {
       handleModelChange,
       handleMainAction,
       handlePromptKeyDown,
+      copyConversationText,
+      generateLongPrompt,
+      generateOverflowPrompt,
     },
   };
 }

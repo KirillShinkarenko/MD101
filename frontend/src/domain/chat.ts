@@ -40,9 +40,28 @@ export type RunMetrics = {
   outputCostUsd: number | null;
 };
 
+export type HistoryTotals = {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  costUsd: number;
+};
+
+export type TurnGrowthRow = {
+  turnIndex: number;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  totalTokens: number | null;
+  costUsd: number | null;
+  cumulativeTotalTokens: number;
+  cumulativeCostUsd: number;
+  latencyMs: number | null;
+};
+
 export type FullScreenView = "request" | "response" | null;
 
 export const MODEL_OPTIONS = [
+  { value: "gpt-3.5-turbo", label: "GPT-3.5 Turbo" },
   { value: "gpt-4.1-nano", label: "GPT-4.1 Nano" },
   { value: "gpt-5-mini", label: "GPT-5 Mini" },
   { value: "gpt-5.1", label: "GPT-5.1" },
@@ -53,6 +72,7 @@ export const DEFAULT_MODEL = "gpt-5-mini";
 export const DEFAULT_SYSTEM_PROMPT = "You are a concise assistant.";
 
 export const MODEL_TEMPERATURE_POLICY: Record<string, "never" | "always" | "reasoning_none_only"> = {
+  "gpt-3.5-turbo": "always",
   "gpt-4.1-nano": "always",
   "gpt-5-mini": "never",
   "gpt-5.1": "reasoning_none_only",
@@ -60,10 +80,19 @@ export const MODEL_TEMPERATURE_POLICY: Record<string, "never" | "always" | "reas
 };
 
 export const MODEL_REASONING_OPTIONS: Record<string, ReasoningEffort[]> = {
+  "gpt-3.5-turbo": [],
   "gpt-4.1-nano": [],
   "gpt-5-mini": ["minimal", "low", "medium", "high"],
   "gpt-5.1": ["none", "low", "medium", "high"],
   "gpt-5.2": ["none", "low", "medium", "high", "xhigh"],
+};
+
+export const MODEL_CONTEXT_WINDOW: Record<string, number> = {
+  "gpt-3.5-turbo": 16385,
+  "gpt-4.1-nano": 1047576,
+  "gpt-5-mini": 400000,
+  "gpt-5.1": 400000,
+  "gpt-5.2": 400000,
 };
 
 export const ACTIVE_CHAT_STORAGE_KEY = "md.activeChatId";

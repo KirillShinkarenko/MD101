@@ -62,6 +62,7 @@ const NETWORK_ERROR_HINTS: Record<string, string> = {
 };
 
 const MODEL_PRICING_PER_1M: Record<string, { input: number; output: number }> = {
+  "gpt-3.5-turbo": { input: 0.5, output: 1.5 },
   "gpt-4.1-nano": { input: 0.1, output: 0.4 },
   "gpt-5-mini": { input: 0.25, output: 2 },
   "gpt-5.1": { input: 1.25, output: 10 },
@@ -70,6 +71,10 @@ const MODEL_PRICING_PER_1M: Record<string, { input: number; output: number }> = 
 const MODEL_PRICING_KEYS = Object.keys(MODEL_PRICING_PER_1M).sort((a, b) => b.length - a.length);
 
 const MODEL_API_PROFILES: Record<string, ModelApiProfile> = {
+  "gpt-3.5-turbo": {
+    temperaturePolicy: "always",
+    reasoningEfforts: [],
+  },
   "gpt-4.1-nano": {
     temperaturePolicy: "always",
     reasoningEfforts: [],
@@ -222,6 +227,76 @@ const formatUpstreamError = (
   };
 };
 
+const parseJsonSafe = (value: string): unknown => {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+};
+
+const isContextOverflowError = (params: { code?: string; type?: string; message?: string }): boolean => {
+  const code = params.code?.toLowerCase();
+  const type = params.type?.toLowerCase();
+  const message = params.message?.toLowerCase();
+  if (code === "context_length_exceeded") {
+    return true;
+  }
+  return Boolean(
+    type?.includes("context_length_exceeded") ||
+      message?.includes("context_length_exceeded") ||
+      message?.includes("maximum context length") ||
+      message?.includes("too many tokens")
+  );
+};
+
+const buildOpenAiErrorPayload = (
+  source: unknown,
+  fallbackMessage: string,
+  upstreamStatus?: number
+): {
+  message: string;
+  code?: string;
+  type?: string;
+  param?: string;
+  requestId?: string;
+  upstreamStatus?: number;
+  isContextOverflow?: boolean;
+  raw?: unknown;
+} => {
+  const candidate = source as
+    | {
+        message?: unknown;
+        code?: unknown;
+        type?: unknown;
+        param?: unknown;
+        request_id?: unknown;
+        requestId?: unknown;
+      }
+    | undefined;
+  const message = typeof candidate?.message === "string" ? candidate.message : fallbackMessage;
+  const code = typeof candidate?.code === "string" ? candidate.code : undefined;
+  const type = typeof candidate?.type === "string" ? candidate.type : undefined;
+  const param = typeof candidate?.param === "string" ? candidate.param : undefined;
+  const requestId =
+    typeof candidate?.request_id === "string"
+      ? candidate.request_id
+      : typeof candidate?.requestId === "string"
+      ? candidate.requestId
+      : undefined;
+  const isContextOverflow = isContextOverflowError({ code, type, message });
+  return {
+    message,
+    code,
+    type,
+    param,
+    requestId,
+    upstreamStatus,
+    isContextOverflow: isContextOverflow ? true : undefined,
+    raw: source,
+  };
+};
+
 const extractCompletedText = (response: any): string => {
   if (!response || typeof response !== "object") {
     return "";
@@ -330,6 +405,7 @@ const buildOpenAiRequestBody = (params: {
   const body: Record<string, unknown> = {
     model,
     stream: true,
+    truncation: "disabled",
     instructions: systemPrompt || undefined,
     input: inputMessages,
   };
@@ -659,9 +735,9 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
 
     if (!upstream.ok || !upstream.body) {
       const payloadText = await upstream.text();
-      sendSse("error", {
-        message: `OpenAI error (${upstream.status}): ${payloadText}`,
-      });
+      const payload = parseJsonSafe(payloadText) as { error?: unknown } | null;
+      const fallbackMessage = `OpenAI error (${upstream.status}): ${payloadText}`;
+      sendSse("error", buildOpenAiErrorPayload(payload?.error ?? payload, fallbackMessage, upstream.status));
       reply.raw.end();
       return;
     }
@@ -675,6 +751,8 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
     let finalUsage: UsageSummary | null = null;
     let finalModel = model;
     let finalCost: CostBreakdownUsd | null = null;
+    let lastUpstreamEventType: string | null = null;
+    let lastUpstreamPayload: Record<string, unknown> | null = null;
 
     while (true) {
       const { done, value } = await reader.read();
@@ -717,6 +795,10 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
         }
 
         const eventType = upstreamEvent || payload.type;
+        lastUpstreamEventType = typeof eventType === "string" ? eventType : null;
+        if (eventType !== "response.output_text.delta" && payload && typeof payload === "object") {
+          lastUpstreamPayload = payload as Record<string, unknown>;
+        }
 
         if (eventType === "response.output_text.delta" && typeof payload.delta === "string") {
           hasSentDelta = true;
@@ -726,7 +808,10 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
         }
 
         if (eventType === "response.error") {
-          sendSse("error", { message: payload.error?.message ?? "Unknown response error" });
+          sendSse(
+            "error",
+            buildOpenAiErrorPayload(payload.error, payload.error?.message ?? "Unknown response error")
+          );
           reply.raw.end();
           return;
         }
@@ -793,6 +878,15 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
     const fallbackInputCostUsd = null;
     const fallbackOutputCostUsd = null;
 
+    sendSse("error", {
+      message: "OpenAI stream closed before response.completed",
+      code: "upstream_stream_closed",
+      type: "upstream_stream_closed",
+      upstreamLastEventType: lastUpstreamEventType,
+      upstreamLastPayload: lastUpstreamPayload,
+      isContextOverflow: false,
+    });
+
     if (assistantText) {
       const finishedAt = Date.now();
       insertMessageStmt.run(
@@ -816,6 +910,10 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
 
     sendSse("done", {
       reason: "stream_closed",
+      diagnostics: {
+        upstreamLastEventType: lastUpstreamEventType,
+        upstreamLastPayload: lastUpstreamPayload,
+      },
       metrics: {
         model,
         latencyMs: Date.now() - startedAt,
