@@ -276,6 +276,11 @@ textarea {
   gap: 8px;
 }
 
+.secondary-action {
+  font-size: 12px;
+  padding: 6px 9px;
+}
+
 .context-indicator {
   margin: 0;
   font-size: 12px;

@@ -47,6 +47,17 @@ const parseTemperature = (value: string): { value?: number; error?: string } => 
   return { value: parsed };
 };
 
+const generateApprox5000TokenText = (): string => {
+  const seed =
+    "This is a generated long context block for stress testing token limits in the chat application. ";
+  const targetChars = 20_000;
+  let result = "";
+  while (result.length < targetChars) {
+    result += seed;
+  }
+  return result.slice(0, targetChars);
+};
+
 const extractRawApiPayload = (payload: unknown): unknown => {
   const candidate =
     payload && typeof payload === "object"
@@ -634,6 +645,11 @@ export function useChatController() {
     }
   }, [messages]);
 
+  const generateLongPrompt = useCallback(() => {
+    setUserPrompt(generateApprox5000TokenText());
+    setErrorText("");
+  }, []);
+
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages]);
@@ -717,6 +733,7 @@ export function useChatController() {
       handleMainAction,
       handlePromptKeyDown,
       copyConversationText,
+      generateLongPrompt,
     },
   };
 }
