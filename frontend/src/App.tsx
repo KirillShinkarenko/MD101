@@ -38,8 +38,6 @@ function App() {
         onPromptKeyDown={actions.handlePromptKeyDown}
         onMainAction={actions.handleMainAction}
         onCopyConversationText={() => void actions.copyConversationText()}
-        onGenerateLongPrompt={actions.generateLongPrompt}
-        onGenerateOverflowPrompt={actions.generateOverflowPrompt}
       />
 
       <InspectorPanel

@@ -14,8 +14,6 @@ type Props = {
   onPromptKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
   onMainAction: () => void;
   onCopyConversationText: () => void;
-  onGenerateLongPrompt: () => void;
-  onGenerateOverflowPrompt: () => void;
 };
 
 export function ChatMainPanel(props: Props) {
@@ -32,8 +30,6 @@ export function ChatMainPanel(props: Props) {
     onPromptKeyDown,
     onMainAction,
     onCopyConversationText,
-    onGenerateLongPrompt,
-    onGenerateOverflowPrompt,
   } = props;
 
   return (
@@ -79,17 +75,6 @@ export function ChatMainPanel(props: Props) {
             <strong>Context:</strong> {formatNumber(currentContextTokens)} / {formatNumber(maxContextTokens)} tokens
           </p>
           <div className="composer-actions">
-            <button type="button" className="secondary-action" onClick={onGenerateLongPrompt} disabled={isStreaming}>
-              Gen ~5k
-            </button>
-            <button
-              type="button"
-              className="secondary-action"
-              onClick={onGenerateOverflowPrompt}
-              disabled={isStreaming}
-            >
-              Gen overflow
-            </button>
             <button type="button" onClick={onMainAction} disabled={!isStreaming && !userPrompt.trim()}>
               {isStreaming ? "Stop" : "Send"}
             </button>
