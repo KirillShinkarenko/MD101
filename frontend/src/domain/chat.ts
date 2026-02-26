@@ -1,12 +1,16 @@
 export type Status = "idle" | "streaming" | "stopped" | "done" | "error";
 export type Role = "user" | "assistant";
 export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+export type HistoryMode = "summary" | "full";
 
 export type ChatSummary = {
   id: string;
   title: string;
   model: string;
   systemPrompt: string;
+  historyMode: HistoryMode;
+  summaryChunkSize: number;
+  summaryTailMessages: number;
   createdAt: number;
   updatedAt: number;
   lastMessagePreview: string | null;
@@ -26,7 +30,19 @@ export type ChatMessage = {
   costUsd: number | null;
   inputCostUsd: number | null;
   outputCostUsd: number | null;
+  actualInputTokens: number | null;
+  fullInputTokens: number | null;
+  savedInputTokens: number | null;
+  savedInputPercent: number | null;
   createdAt: number;
+};
+
+export type TokenSavingsMetrics = {
+  actualInputTokens: number | null;
+  fullInputTokens: number | null;
+  savedInputTokens: number;
+  savedInputPercent: number;
+  cumulativeSavedInputTokens: number;
 };
 
 export type RunMetrics = {
@@ -38,6 +54,7 @@ export type RunMetrics = {
   costUsd: number | null;
   inputCostUsd: number | null;
   outputCostUsd: number | null;
+  tokenSavings: TokenSavingsMetrics;
 };
 
 export type HistoryTotals = {
@@ -45,6 +62,7 @@ export type HistoryTotals = {
   outputTokens: number;
   totalTokens: number;
   costUsd: number;
+  savedInputTokens: number;
 };
 
 export type TurnGrowthRow = {
@@ -56,6 +74,8 @@ export type TurnGrowthRow = {
   cumulativeTotalTokens: number;
   cumulativeCostUsd: number;
   latencyMs: number | null;
+  savedInputTokens: number | null;
+  cumulativeSavedInputTokens: number;
 };
 
 export type FullScreenView = "request" | "response" | null;
@@ -69,7 +89,7 @@ export const MODEL_OPTIONS = [
 ] as const;
 
 export const DEFAULT_MODEL = "gpt-5-mini";
-export const DEFAULT_SYSTEM_PROMPT = "You are a concise assistant.";
+export const DEFAULT_SYSTEM_PROMPT = "";
 
 export const MODEL_TEMPERATURE_POLICY: Record<string, "never" | "always" | "reasoning_none_only"> = {
   "gpt-3.5-turbo": "always",
@@ -96,4 +116,3 @@ export const MODEL_CONTEXT_WINDOW: Record<string, number> = {
 };
 
 export const ACTIVE_CHAT_STORAGE_KEY = "md.activeChatId";
-export const SYSTEM_PROMPT_STORAGE_KEY = "md.globalSystemPrompt";

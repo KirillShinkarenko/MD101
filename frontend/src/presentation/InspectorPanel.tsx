@@ -1,3 +1,4 @@
+import type { HistoryMode } from "../domain/chat";
 import { useMemo, useState } from "react";
 import type { HistoryTotals, RunMetrics, TurnGrowthRow } from "../domain/chat";
 
@@ -10,6 +11,9 @@ type Props = {
   responseRaw: string;
   overflowErrorRaw: string;
   errorText: string;
+  historyMode: HistoryMode;
+  cumulativeSavedInputTokens: number;
+  averageSavedPercent: number;
   formatNumber: (value: number | null) => string;
   formatUsd: (value: number | null) => string;
   onOpenFullScreenRequest: () => void;
@@ -26,6 +30,9 @@ export function InspectorPanel(props: Props) {
     responseRaw,
     overflowErrorRaw,
     errorText,
+    historyMode,
+    cumulativeSavedInputTokens,
+    averageSavedPercent,
     formatNumber,
     formatUsd,
     onOpenFullScreenRequest,
@@ -65,6 +72,17 @@ export function InspectorPanel(props: Props) {
           </section>
 
           <section className="metrics-card">
+            <h4>Context savings</h4>
+            <div className="metrics-compact">
+              <p><strong>Mode:</strong> {historyMode}</p>
+              <p><strong>Saved this request:</strong> {formatNumber(metrics?.tokenSavings.savedInputTokens ?? 0)}</p>
+              <p><strong>Saved this request %:</strong> {(metrics?.tokenSavings.savedInputPercent ?? 0).toFixed(2)}%</p>
+              <p><strong>Cumulative saved:</strong> {formatNumber(cumulativeSavedInputTokens)}</p>
+              <p><strong>Avg saved %:</strong> {averageSavedPercent.toFixed(2)}%</p>
+            </div>
+          </section>
+
+          <section className="metrics-card">
             <h4>Growth by turns</h4>
             {growthRows.length === 0 ? (
               <p className="hint">No completed assistant responses yet.</p>
@@ -76,6 +94,8 @@ export function InspectorPanel(props: Props) {
                       <th>#</th>
                       <th>current</th>
                       <th>total</th>
+                      <th>saved</th>
+                      <th>saved total</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -84,6 +104,8 @@ export function InspectorPanel(props: Props) {
                         <td>{row.turnIndex}</td>
                         <td>{formatNumber(row.totalTokens)}</td>
                         <td>{formatNumber(row.cumulativeTotalTokens)}</td>
+                        <td>{formatNumber(row.savedInputTokens)}</td>
+                        <td>{formatNumber(row.cumulativeSavedInputTokens)}</td>
                       </tr>
                     ))}
                   </tbody>

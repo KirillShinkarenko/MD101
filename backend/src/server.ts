@@ -15,6 +15,12 @@ await app.register(cors, {
 });
 
 type Role = "user" | "assistant";
+type HistoryMode = "summary" | "full";
+type PersistedMessage = {
+  role: Role;
+  content: string;
+  createdAt: number;
+};
 
 type ChatBody = {
   userPrompt?: string;
@@ -22,18 +28,27 @@ type ChatBody = {
   model?: string;
   reasoningEffort?: string;
   systemPrompt?: string;
+  historyMode?: string;
+  summaryChunkSize?: number | string;
+  summaryTailMessages?: number | string;
 };
 
 type CreateChatBody = {
   title?: string;
   model?: string;
   systemPrompt?: string;
+  historyMode?: string;
+  summaryChunkSize?: number | string;
+  summaryTailMessages?: number | string;
 };
 
 type PatchChatBody = {
   title?: string;
   model?: string;
   systemPrompt?: string;
+  historyMode?: string;
+  summaryChunkSize?: number | string;
+  summaryTailMessages?: number | string;
 };
 
 type UsageSummary = {
@@ -51,6 +66,14 @@ type CostBreakdownUsd = {
 type ModelApiProfile = {
   temperaturePolicy: "never" | "always" | "reasoning_none_only";
   reasoningEfforts: Array<"none" | "minimal" | "low" | "medium" | "high" | "xhigh">;
+};
+
+type TokenSavings = {
+  actualInputTokens: number | null;
+  fullInputTokens: number | null;
+  savedInputTokens: number;
+  savedInputPercent: number;
+  cumulativeSavedInputTokens: number;
 };
 
 const DEFAULT_MODEL = process.env.OPENAI_MODEL?.trim() || "gpt-5-mini";
@@ -96,6 +119,8 @@ const MODEL_API_PROFILES: Record<string, ModelApiProfile> = {
 const ALLOWED_MODELS = new Set(Object.keys(MODEL_API_PROFILES));
 const EFFECTIVE_DEFAULT_MODEL = ALLOWED_MODELS.has(DEFAULT_MODEL) ? DEFAULT_MODEL : "gpt-5-mini";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const DEFAULT_SUMMARY_TAIL_MESSAGES = 10;
+const DEFAULT_SUMMARY_CHUNK_SIZE = 10;
 
 if (!OPENAI_API_KEY) {
   app.log.warn("OPENAI_API_KEY is not set. Requests will fail until it is configured.");
@@ -119,6 +144,9 @@ CREATE TABLE IF NOT EXISTS chats (
   title TEXT NOT NULL,
   model TEXT NOT NULL,
   system_prompt TEXT NOT NULL,
+  history_mode TEXT NOT NULL DEFAULT 'summary',
+  summary_chunk_size INTEGER NOT NULL DEFAULT 10,
+  summary_tail_messages INTEGER NOT NULL DEFAULT 10,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -137,12 +165,51 @@ CREATE TABLE IF NOT EXISTS messages (
   cost_usd REAL,
   input_cost_usd REAL,
   output_cost_usd REAL,
+  actual_input_tokens INTEGER,
+  full_input_tokens INTEGER,
+  saved_input_tokens INTEGER,
+  saved_input_percent REAL,
   created_at INTEGER NOT NULL,
   FOREIGN KEY (chat_id) REFERENCES chats (id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS chat_context_summary (
+  chat_id TEXT PRIMARY KEY,
+  summary_text TEXT NOT NULL,
+  summarized_through_created_at INTEGER,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY (chat_id) REFERENCES chats (id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS chat_context_summary_chunks (
+  chat_id TEXT NOT NULL,
+  chunk_index INTEGER NOT NULL,
+  summary_text TEXT NOT NULL,
+  summarized_through_created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (chat_id, chunk_index),
+  FOREIGN KEY (chat_id) REFERENCES chats (id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_chat_id_created_at ON messages (chat_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_summary_chunks_chat_id_chunk_index
+  ON chat_context_summary_chunks (chat_id, chunk_index);
 `);
+
+const ensureColumn = (table: string, column: string, ddl: string): void => {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (!columns.some((item) => item.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
+  }
+};
+
+ensureColumn("chats", "history_mode", "TEXT NOT NULL DEFAULT 'summary'");
+ensureColumn("chats", "summary_chunk_size", "INTEGER NOT NULL DEFAULT 10");
+ensureColumn("chats", "summary_tail_messages", "INTEGER NOT NULL DEFAULT 10");
+ensureColumn("messages", "actual_input_tokens", "INTEGER");
+ensureColumn("messages", "full_input_tokens", "INTEGER");
+ensureColumn("messages", "saved_input_tokens", "INTEGER");
+ensureColumn("messages", "saved_input_percent", "REAL");
 
 const parseTemperature = (value: unknown): number | undefined => {
   if (value === undefined || value === null) {
@@ -168,6 +235,33 @@ const parseModel = (value: unknown): string | undefined => {
   }
   const trimmed = value.trim();
   return trimmed || undefined;
+};
+
+const parsePositiveInteger = (value: unknown): number | undefined => {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  const numeric =
+    typeof value === "number"
+      ? value
+      : typeof value === "string"
+      ? Number(value.trim())
+      : Number.NaN;
+  if (!Number.isInteger(numeric) || numeric < 1 || numeric > 100) {
+    return undefined;
+  }
+  return numeric;
+};
+
+const parseHistoryMode = (value: unknown): HistoryMode | undefined => {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim().toLowerCase();
+  if (trimmed === "summary" || trimmed === "full") {
+    return trimmed;
+  }
+  return undefined;
 };
 
 const parseReasoningEffort = (
@@ -395,18 +489,19 @@ const estimateCostBreakdownUsd = (model: string, usageSummary: UsageSummary): Co
 
 const buildOpenAiRequestBody = (params: {
   model: string;
-  systemPrompt: string;
+  instructions: string;
   inputMessages: Array<{ role: Role; content: string }>;
   profile: ModelApiProfile;
   reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
   temperature?: number;
+  stream?: boolean;
 }): Record<string, unknown> => {
-  const { model, systemPrompt, inputMessages, temperature, profile, reasoningEffort } = params;
+  const { model, instructions, inputMessages, temperature, profile, reasoningEffort, stream = true } = params;
   const body: Record<string, unknown> = {
     model,
-    stream: true,
+    stream,
     truncation: "disabled",
-    instructions: systemPrompt || undefined,
+    instructions: instructions || undefined,
     input: inputMessages,
   };
 
@@ -425,8 +520,136 @@ const buildOpenAiRequestBody = (params: {
   return body;
 };
 
+const buildSummaryInstructions = (systemPrompt: string, summaryChunks: string[]): string => {
+  const normalizedChunks = summaryChunks.map((item) => item.trim()).filter(Boolean);
+  if (normalizedChunks.length === 0) {
+    return systemPrompt;
+  }
+  const prefix = systemPrompt.trim();
+  const summaryBlock = [
+    "Conversation summaries (older messages by chunk):",
+    ...normalizedChunks.map((item, index) => `Chunk ${index + 1}:\n${item}`),
+  ].join("\n\n");
+  return [prefix, summaryBlock].filter(Boolean).join("\n\n");
+};
+
+const extractOutputTextFromResponsePayload = (payload: unknown): string => {
+  const candidate =
+    payload && typeof payload === "object" ? (payload as { output?: unknown }) : undefined;
+  return extractCompletedText({ output: candidate?.output });
+};
+
+const callOpenAiResponse = async (params: {
+  body: Record<string, unknown>;
+  signal?: AbortSignal;
+}): Promise<{ payload: any; outputText: string; usage: UsageSummary | null }> => {
+  const upstream = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    signal: params.signal,
+    body: JSON.stringify(params.body),
+  });
+
+  const payloadText = await upstream.text();
+  const payload = parseJsonSafe(payloadText);
+  if (!upstream.ok) {
+    throw new Error(`OpenAI error (${upstream.status}): ${payloadText}`);
+  }
+
+  const outputText = extractOutputTextFromResponsePayload(payload);
+  const usageRaw =
+    payload && typeof payload === "object" ? (payload as { usage?: unknown }).usage : undefined;
+  const usage = usageRaw ? extractUsageSummary(usageRaw) : null;
+  return {
+    payload,
+    outputText,
+    usage,
+  };
+};
+
+const summarizeChunkWithOpenAi = async (params: {
+  model: string;
+  chunk: PersistedMessage[];
+  signal: AbortSignal;
+}): Promise<string> => {
+  const chunkText = params.chunk
+    .map((item, index) => `${index + 1}. ${item.role.toUpperCase()}: ${item.content}`)
+    .join("\n\n");
+
+  const prompt = [
+    "Summarize this conversation chunk.",
+    "Keep key user goals, constraints, facts, decisions, and unresolved questions from this chunk.",
+    "Be concise and factual. Do not invent details.",
+    "",
+    "Messages in this chunk:",
+    chunkText,
+    "",
+    "Return only the chunk summary as plain text.",
+  ].join("\n");
+
+  const summaryBody: Record<string, unknown> = {
+    model: params.model,
+    stream: false,
+    max_output_tokens: 500,
+    input: [
+      { role: "system", content: "You maintain concise, high-fidelity conversation summaries." },
+      { role: "user", content: prompt },
+    ],
+  };
+
+  const response = await callOpenAiResponse({ body: summaryBody, signal: params.signal });
+  const summaryText = response.outputText.trim();
+  if (!summaryText) {
+    throw new Error("Summary generation returned an empty response");
+  }
+  return summaryText;
+};
+
+const estimateFullInputTokens = async (params: {
+  model: string;
+  profile: ModelApiProfile;
+  systemPrompt: string;
+  reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  temperature?: number;
+  inputMessages: Array<{ role: Role; content: string }>;
+  signal: AbortSignal;
+}): Promise<number | null> => {
+  try {
+    const body = buildOpenAiRequestBody({
+      model: params.model,
+      instructions: params.systemPrompt,
+      inputMessages: params.inputMessages,
+      profile: params.profile,
+      reasoningEffort: params.reasoningEffort,
+      temperature: params.temperature,
+      stream: false,
+    });
+    body.max_output_tokens = 16;
+    const response = await callOpenAiResponse({
+      body,
+      signal: params.signal,
+    });
+    return response.usage?.inputTokens ?? null;
+  } catch (error) {
+    app.log.warn({ err: error }, "Failed to estimate full input tokens");
+    return null;
+  }
+};
+
 const getChatStmt = db.prepare(`
-  SELECT id, title, model, system_prompt AS systemPrompt, created_at AS createdAt, updated_at AS updatedAt
+  SELECT
+    id,
+    title,
+    model,
+    system_prompt AS systemPrompt,
+    history_mode AS historyMode,
+    summary_chunk_size AS summaryChunkSize,
+    summary_tail_messages AS summaryTailMessages,
+    created_at AS createdAt,
+    updated_at AS updatedAt
   FROM chats
   WHERE id = ?
 `);
@@ -437,6 +660,9 @@ const listChatsStmt = db.prepare(`
     c.title,
     c.model,
     c.system_prompt AS systemPrompt,
+    c.history_mode AS historyMode,
+    c.summary_chunk_size AS summaryChunkSize,
+    c.summary_tail_messages AS summaryTailMessages,
     c.created_at AS createdAt,
     c.updated_at AS updatedAt,
     (
@@ -465,20 +691,72 @@ const listMessagesStmt = db.prepare(`
     cost_usd AS costUsd,
     input_cost_usd AS inputCostUsd,
     output_cost_usd AS outputCostUsd,
+    actual_input_tokens AS actualInputTokens,
+    full_input_tokens AS fullInputTokens,
+    saved_input_tokens AS savedInputTokens,
+    saved_input_percent AS savedInputPercent,
     created_at AS createdAt
   FROM messages
   WHERE chat_id = ?
   ORDER BY created_at ASC
 `);
 
+const getContextSummaryStmt = db.prepare(`
+  SELECT
+    chat_id AS chatId,
+    summary_text AS summaryText,
+    summarized_through_created_at AS summarizedThroughCreatedAt,
+    updated_at AS updatedAt
+  FROM chat_context_summary
+  WHERE chat_id = ?
+`);
+
+const listContextSummaryChunksStmt = db.prepare(`
+  SELECT
+    chat_id AS chatId,
+    chunk_index AS chunkIndex,
+    summary_text AS summaryText,
+    summarized_through_created_at AS summarizedThroughCreatedAt
+  FROM chat_context_summary_chunks
+  WHERE chat_id = ?
+  ORDER BY chunk_index ASC
+`);
+
+const upsertContextSummaryStmt = db.prepare(`
+  INSERT INTO chat_context_summary (chat_id, summary_text, summarized_through_created_at, updated_at)
+  VALUES (?, ?, ?, ?)
+  ON CONFLICT(chat_id) DO UPDATE SET
+    summary_text = excluded.summary_text,
+    summarized_through_created_at = excluded.summarized_through_created_at,
+    updated_at = excluded.updated_at
+`);
+
+const upsertContextSummaryChunkStmt = db.prepare(`
+  INSERT INTO chat_context_summary_chunks (
+    chat_id, chunk_index, summary_text, summarized_through_created_at, updated_at
+  )
+  VALUES (?, ?, ?, ?, ?)
+  ON CONFLICT(chat_id, chunk_index) DO UPDATE SET
+    summary_text = excluded.summary_text,
+    summarized_through_created_at = excluded.summarized_through_created_at,
+    updated_at = excluded.updated_at
+`);
+
+const deleteContextSummaryChunksFromIndexStmt = db.prepare(`
+  DELETE FROM chat_context_summary_chunks
+  WHERE chat_id = ? AND chunk_index >= ?
+`);
+
 const insertChatStmt = db.prepare(`
-  INSERT INTO chats (id, title, model, system_prompt, created_at, updated_at)
-  VALUES (?, ?, ?, ?, ?, ?)
+  INSERT INTO chats (
+    id, title, model, system_prompt, history_mode, summary_chunk_size, summary_tail_messages, created_at, updated_at
+  )
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateChatStmt = db.prepare(`
   UPDATE chats
-  SET title = ?, model = ?, system_prompt = ?, updated_at = ?
+  SET title = ?, model = ?, system_prompt = ?, history_mode = ?, summary_chunk_size = ?, summary_tail_messages = ?, updated_at = ?
   WHERE id = ?
 `);
 
@@ -488,21 +766,103 @@ const insertMessageStmt = db.prepare(`
   INSERT INTO messages (
     id, chat_id, role, content, request_json, response_json,
     latency_ms, input_tokens, output_tokens, total_tokens,
-    cost_usd, input_cost_usd, output_cost_usd, created_at
+    cost_usd, input_cost_usd, output_cost_usd,
+    actual_input_tokens, full_input_tokens, saved_input_tokens, saved_input_percent,
+    created_at
   )
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateChatUpdatedAtStmt = db.prepare(`UPDATE chats SET updated_at = ? WHERE id = ?`);
 
-const createChat = (params?: { title?: string; model?: string; systemPrompt?: string }) => {
+const createChat = (params?: {
+  title?: string;
+  model?: string;
+  systemPrompt?: string;
+  historyMode?: string;
+  summaryChunkSize?: number | string;
+  summaryTailMessages?: number | string;
+}) => {
   const now = Date.now();
   const id = createId();
   const title = params?.title?.trim() || "New chat";
   const model = parseModel(params?.model) ?? EFFECTIVE_DEFAULT_MODEL;
-  const systemPrompt = params?.systemPrompt?.trim() ?? "You are a concise assistant.";
-  insertChatStmt.run(id, title, model, systemPrompt, now, now);
+  const systemPrompt = params?.systemPrompt?.trim() ?? "";
+  const historyMode = parseHistoryMode(params?.historyMode) ?? "summary";
+  const summaryChunkSize = parsePositiveInteger(params?.summaryChunkSize) ?? DEFAULT_SUMMARY_CHUNK_SIZE;
+  const summaryTailMessages = parsePositiveInteger(params?.summaryTailMessages) ?? DEFAULT_SUMMARY_TAIL_MESSAGES;
+  insertChatStmt.run(
+    id,
+    title,
+    model,
+    systemPrompt,
+    historyMode,
+    summaryChunkSize,
+    summaryTailMessages,
+    now,
+    now
+  );
   return getChatStmt.get(id);
+};
+
+const refreshChatSummary = async (params: {
+  chatId: string;
+  model: string;
+  headMessages: PersistedMessage[];
+  chunkSize: number;
+  signal: AbortSignal;
+}): Promise<{ summaryChunks: string[] }> => {
+  const completedChunkCount = Math.floor(params.headMessages.length / params.chunkSize);
+  if (completedChunkCount <= 0) {
+    deleteContextSummaryChunksFromIndexStmt.run(params.chatId, 0);
+    return { summaryChunks: [] };
+  }
+
+  const existingChunks = listContextSummaryChunksStmt.all(params.chatId) as Array<{
+    chunkIndex: number;
+    summaryText: string;
+    summarizedThroughCreatedAt: number;
+  }>;
+  const existingByChunkIndex = new Map(existingChunks.map((item) => [item.chunkIndex, item]));
+
+  const summaryChunks: string[] = [];
+  const now = Date.now();
+
+  for (let chunkIndex = 0; chunkIndex < completedChunkCount; chunkIndex += 1) {
+    const start = chunkIndex * params.chunkSize;
+    const chunk = params.headMessages.slice(start, start + params.chunkSize);
+    const summarizedThroughCreatedAt = chunk[chunk.length - 1]?.createdAt;
+    if (!summarizedThroughCreatedAt) {
+      continue;
+    }
+
+    const existingChunk = existingByChunkIndex.get(chunkIndex);
+    if (
+      existingChunk &&
+      existingChunk.summarizedThroughCreatedAt === summarizedThroughCreatedAt &&
+      existingChunk.summaryText.trim()
+    ) {
+      summaryChunks.push(existingChunk.summaryText.trim());
+      continue;
+    }
+
+    const summaryText = await summarizeChunkWithOpenAi({
+      model: params.model,
+      chunk,
+      signal: params.signal,
+    });
+    upsertContextSummaryChunkStmt.run(
+      params.chatId,
+      chunkIndex,
+      summaryText,
+      summarizedThroughCreatedAt,
+      now
+    );
+    summaryChunks.push(summaryText);
+  }
+
+  deleteContextSummaryChunksFromIndexStmt.run(params.chatId, completedChunkCount);
+  return { summaryChunks };
 };
 
 app.get("/health", async () => ({ ok: true }));
@@ -536,6 +896,9 @@ app.patch<{ Params: { id: string }; Body: PatchChatBody }>("/api/chats/:id", asy
         title: string;
         model: string;
         systemPrompt: string;
+        historyMode: HistoryMode;
+        summaryChunkSize: number;
+        summaryTailMessages: number;
       }
     | undefined;
 
@@ -548,14 +911,46 @@ app.patch<{ Params: { id: string }; Body: PatchChatBody }>("/api/chats/:id", asy
   const model = parseModel(request.body?.model) ?? chat.model;
   const systemPrompt =
     typeof request.body?.systemPrompt === "string" ? request.body.systemPrompt : chat.systemPrompt;
+  const historyMode = parseHistoryMode(request.body?.historyMode) ?? chat.historyMode;
+  const summaryChunkSize = parsePositiveInteger(request.body?.summaryChunkSize) ?? chat.summaryChunkSize;
+  const summaryTailMessages =
+    parsePositiveInteger(request.body?.summaryTailMessages) ?? chat.summaryTailMessages;
 
   if (!ALLOWED_MODELS.has(model)) {
     reply.code(400);
     return { error: `model must be one of: ${Array.from(ALLOWED_MODELS).join(", ")}` };
   }
 
+  if (request.body?.historyMode !== undefined && parseHistoryMode(request.body?.historyMode) === undefined) {
+    reply.code(400);
+    return { error: "historyMode must be one of: summary, full" };
+  }
+  if (
+    request.body?.summaryChunkSize !== undefined &&
+    parsePositiveInteger(request.body?.summaryChunkSize) === undefined
+  ) {
+    reply.code(400);
+    return { error: "summaryChunkSize must be an integer between 1 and 100" };
+  }
+  if (
+    request.body?.summaryTailMessages !== undefined &&
+    parsePositiveInteger(request.body?.summaryTailMessages) === undefined
+  ) {
+    reply.code(400);
+    return { error: "summaryTailMessages must be an integer between 1 and 100" };
+  }
+
   const nextTitle = title || "New chat";
-  updateChatStmt.run(nextTitle, model, systemPrompt, Date.now(), chatId);
+  updateChatStmt.run(
+    nextTitle,
+    model,
+    systemPrompt,
+    historyMode,
+    summaryChunkSize,
+    summaryTailMessages,
+    Date.now(),
+    chatId
+  );
   return { chat: getChatStmt.get(chatId) };
 });
 
@@ -583,6 +978,9 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
         title: string;
         model: string;
         systemPrompt: string;
+        historyMode: HistoryMode;
+        summaryChunkSize: number;
+        summaryTailMessages: number;
       }
     | undefined;
 
@@ -597,6 +995,12 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
   const model = requestedModel ?? existingChat.model;
   const requestedReasoningEffortRaw = request.body?.reasoningEffort;
   const reasoningEffort = parseReasoningEffort(requestedReasoningEffortRaw);
+  const requestedHistoryMode = parseHistoryMode(request.body?.historyMode);
+  const requestedSummaryChunkSize = parsePositiveInteger(request.body?.summaryChunkSize);
+  const requestedSummaryTailMessages = parsePositiveInteger(request.body?.summaryTailMessages);
+  const historyMode = requestedHistoryMode ?? existingChat.historyMode;
+  const summaryChunkSize = requestedSummaryChunkSize ?? existingChat.summaryChunkSize;
+  const summaryTailMessages = requestedSummaryTailMessages ?? existingChat.summaryTailMessages;
   const systemPrompt =
     typeof request.body?.systemPrompt === "string" ? request.body.systemPrompt : existingChat.systemPrompt;
   const startedAt = Date.now();
@@ -649,19 +1053,123 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
     };
   }
 
-  const persistedMessagesRaw = listMessagesStmt.all(chatId) as Array<{ role: Role; content: string }>;
-  const persistedMessages = persistedMessagesRaw.map((item) => ({
+  if (request.body?.historyMode !== undefined && requestedHistoryMode === undefined) {
+    reply.code(400);
+    return { error: "historyMode must be one of: summary, full" };
+  }
+  if (
+    request.body?.summaryChunkSize !== undefined &&
+    parsePositiveInteger(request.body?.summaryChunkSize) === undefined
+  ) {
+    reply.code(400);
+    return { error: "summaryChunkSize must be an integer between 1 and 100" };
+  }
+  if (
+    request.body?.summaryTailMessages !== undefined &&
+    parsePositiveInteger(request.body?.summaryTailMessages) === undefined
+  ) {
+    reply.code(400);
+    return { error: "summaryTailMessages must be an integer between 1 and 100" };
+  }
+
+  const abortController = new AbortController();
+  request.raw.on("aborted", () => {
+    abortController.abort();
+  });
+  reply.raw.on("close", () => {
+    if (!reply.raw.writableEnded) {
+      abortController.abort();
+    }
+  });
+  reply.raw.on("error", () => {
+    abortController.abort();
+  });
+
+  const persistedMessagesRaw = listMessagesStmt.all(chatId) as Array<{
+    role: Role;
+    content: string;
+    createdAt: number;
+    savedInputTokens: number | null;
+  }>;
+  const persistedMessages: PersistedMessage[] = persistedMessagesRaw.map((item) => ({
+    role: item.role,
+    content: item.content,
+    createdAt: item.createdAt,
+  }));
+  const persistedInputMessages = persistedMessages.map((item) => ({
     role: item.role,
     content: item.content,
   }));
-  const inputMessages = [...persistedMessages, { role: "user" as const, content: userPrompt }];
+  const cumulativeSavedInputTokens = persistedMessagesRaw.reduce(
+    (total, item) => total + (item.savedInputTokens ?? 0),
+    0
+  );
+
+  let contextInstructions = systemPrompt;
+  let historyModeUsed: HistoryMode = historyMode;
+  let summaryIncluded = false;
+  let summaryChars = 0;
+  let summaryTailMessagesCount = persistedMessages.length;
+  let inputMessages: Array<{ role: Role; content: string }> = [];
+
+  if (historyMode === "summary") {
+    const headMessages = persistedMessages.slice(0, Math.max(0, persistedMessages.length - summaryTailMessages));
+    const tailMessages = persistedMessages.slice(-summaryTailMessages);
+    const tailInputMessages = tailMessages.map((item) => ({ role: item.role, content: item.content }));
+    summaryTailMessagesCount = tailMessages.length;
+
+    try {
+      const refreshedSummary = await refreshChatSummary({
+        chatId,
+        model,
+        headMessages,
+        chunkSize: summaryChunkSize,
+        signal: abortController.signal,
+      });
+      const summaryChunks = refreshedSummary.summaryChunks;
+      if (summaryChunks.length > 0) {
+        contextInstructions = buildSummaryInstructions(systemPrompt, summaryChunks);
+        summaryIncluded = true;
+        summaryChars = summaryChunks.reduce((total, item) => total + item.length, 0);
+      }
+      inputMessages = [...tailInputMessages, { role: "user", content: userPrompt }];
+    } catch (error) {
+      app.log.warn({ err: error }, "Failed to build summary context, falling back to full history");
+      historyModeUsed = "full";
+      inputMessages = [...persistedInputMessages, { role: "user", content: userPrompt }];
+      contextInstructions = systemPrompt;
+      summaryIncluded = false;
+      summaryChars = 0;
+      summaryTailMessagesCount = persistedMessages.length;
+    }
+  } else {
+    inputMessages = [...persistedInputMessages, { role: "user", content: userPrompt }];
+  }
 
   const now = Date.now();
-  updateChatStmt.run(existingChat.title, model, systemPrompt, now, chatId);
+  updateChatStmt.run(
+    existingChat.title,
+    model,
+    systemPrompt,
+    historyMode,
+    summaryChunkSize,
+    summaryTailMessages,
+    now,
+    chatId
+  );
 
   if (existingChat.title === "New chat") {
     const nextTitle = userPrompt.slice(0, 42).trim() || "New chat";
-    updateChatStmt.run(nextTitle, model, systemPrompt, now, chatId);
+    updateChatStmt.run(
+      nextTitle,
+      model,
+      systemPrompt,
+      historyMode,
+      summaryChunkSize,
+      summaryTailMessages,
+      now,
+      chatId
+    );
   }
 
   const userMessageId = createId();
@@ -670,6 +1178,10 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
     chatId,
     "user",
     userPrompt,
+    null,
+    null,
+    null,
+    null,
     null,
     null,
     null,
@@ -689,19 +1201,6 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
     Connection: "keep-alive",
   });
 
-  const abortController = new AbortController();
-  request.raw.on("aborted", () => {
-    abortController.abort();
-  });
-  reply.raw.on("close", () => {
-    if (!reply.raw.writableEnded) {
-      abortController.abort();
-    }
-  });
-  reply.raw.on("error", () => {
-    abortController.abort();
-  });
-
   const sendSse = (event: string, data: unknown): void => {
     reply.raw.write(`event: ${event}\n`);
     reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -710,7 +1209,7 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
   try {
     const openaiRequestBody = buildOpenAiRequestBody({
       model,
-      systemPrompt,
+      instructions: contextInstructions,
       inputMessages,
       profile: modelProfile,
       reasoningEffort,
@@ -720,6 +1219,15 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
     sendSse("debug_request", {
       target: "openai.responses.create",
       modelProfile,
+      context: {
+        historyModeRequested: historyMode,
+        historyModeUsed,
+        summaryChunkSize,
+        summaryTailMessages,
+        tailMessagesCount: summaryTailMessagesCount,
+        summaryIncluded,
+        summaryChars,
+      },
       body: openaiRequestBody,
     });
 
@@ -834,6 +1342,35 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
             body: finalDebugResponse,
           });
 
+          const actualInputTokens = finalUsage?.inputTokens ?? null;
+          const fullInputTokens =
+            historyModeUsed === "full" || !summaryIncluded
+              ? actualInputTokens
+              : await estimateFullInputTokens({
+                  model,
+                  profile: modelProfile,
+                  systemPrompt,
+                  reasoningEffort,
+                  temperature,
+                  inputMessages: [...persistedInputMessages, { role: "user", content: userPrompt }],
+                  signal: abortController.signal,
+                });
+          const savedInputTokens =
+            fullInputTokens !== null && actualInputTokens !== null
+              ? Math.max(fullInputTokens - actualInputTokens, 0)
+              : 0;
+          const savedInputPercent =
+            fullInputTokens && fullInputTokens > 0
+              ? Number(((savedInputTokens / fullInputTokens) * 100).toFixed(2))
+              : 0;
+          const tokenSavings: TokenSavings = {
+            actualInputTokens,
+            fullInputTokens,
+            savedInputTokens,
+            savedInputPercent,
+            cumulativeSavedInputTokens: cumulativeSavedInputTokens + savedInputTokens,
+          };
+
           const assistantMessageId = createId();
           const finishedAt = Date.now();
           insertMessageStmt.run(
@@ -850,6 +1387,10 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
             finalCost?.totalCostUsd ?? null,
             finalCost?.inputCostUsd ?? null,
             finalCost?.outputCostUsd ?? null,
+            actualInputTokens,
+            fullInputTokens,
+            savedInputTokens,
+            savedInputPercent,
             finishedAt
           );
           updateChatUpdatedAtStmt.run(finishedAt, chatId);
@@ -863,6 +1404,7 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
               costUsd: finalCost?.totalCostUsd ?? null,
               inputCostUsd: finalCost?.inputCostUsd ?? null,
               outputCostUsd: finalCost?.outputCostUsd ?? null,
+              tokenSavings,
             },
           });
           reply.raw.end();
@@ -889,6 +1431,13 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
 
     if (assistantText) {
       const finishedAt = Date.now();
+      const tokenSavings: TokenSavings = {
+        actualInputTokens: null,
+        fullInputTokens: null,
+        savedInputTokens: 0,
+        savedInputPercent: 0,
+        cumulativeSavedInputTokens,
+      };
       insertMessageStmt.run(
         createId(),
         chatId,
@@ -903,6 +1452,10 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
         fallbackTotalCostUsd,
         fallbackInputCostUsd,
         fallbackOutputCostUsd,
+        tokenSavings.actualInputTokens,
+        tokenSavings.fullInputTokens,
+        tokenSavings.savedInputTokens,
+        tokenSavings.savedInputPercent,
         finishedAt
       );
       updateChatUpdatedAtStmt.run(finishedAt, chatId);
@@ -921,6 +1474,13 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
         costUsd: fallbackTotalCostUsd,
         inputCostUsd: fallbackInputCostUsd,
         outputCostUsd: fallbackOutputCostUsd,
+        tokenSavings: {
+          actualInputTokens: null,
+          fullInputTokens: null,
+          savedInputTokens: 0,
+          savedInputPercent: 0,
+          cumulativeSavedInputTokens,
+        } satisfies TokenSavings,
       },
     });
     reply.raw.end();
@@ -935,6 +1495,13 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
           costUsd: null,
           inputCostUsd: null,
           outputCostUsd: null,
+          tokenSavings: {
+            actualInputTokens: null,
+            fullInputTokens: null,
+            savedInputTokens: 0,
+            savedInputPercent: 0,
+            cumulativeSavedInputTokens,
+          } satisfies TokenSavings,
         },
       });
       reply.raw.end();

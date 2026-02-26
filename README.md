@@ -1,4 +1,4 @@
-# MD108
+# MD109
 
 Веб-приложение для чата с OpenAI через backend-proxy со streaming-ответами.
 
@@ -8,12 +8,15 @@
 - автогенерация названия нового чата по первому сообщению
 - глобальный `System prompt` (модалка)
 - выбор модели и параметров (`reasoning effort`, `temperature` с валидацией)
+- режим истории в composer: `Summary mode` / `Full request`
+- настройка суммаризации: `Messages without summary` и `Summary chunk size` (1..100)
 - чат с потоковым ответом (`Send` / `Stop`)
 - кнопка `Gen ~5k` для быстрого заполнения длинного промпта
 - копирование всего диалога в буфер обмена
 - индикатор текущего контекста (`Context: current / max tokens`)
 - инспектор справа:
   - `Metrics` (текущий запрос, суммарно по диалогу, рост по ходам)
+  - `Context savings` (экономия входных токенов за запрос и накопительно)
   - `Request` / `Response` JSON
   - `Overflow error` при `context_length_exceeded`
   - полноэкранный просмотр JSON
@@ -35,6 +38,12 @@
 
 - история чатов и сообщений хранится в SQLite
 - файл БД: `backend/data/md.sqlite`
+- для суммаризации используются таблицы `chat_context_summary` и `chat_context_summary_chunks`
+- в сообщениях сохраняются метрики экономии контекста:
+  - `actual_input_tokens`
+  - `full_input_tokens`
+  - `saved_input_tokens`
+  - `saved_input_percent`
 
 ## Переменные окружения
 
@@ -99,11 +108,11 @@ npm run dev
 
 - `GET /health`
 - `GET /api/chats` - список чатов
-- `POST /api/chats` - создать чат
+- `POST /api/chats` - создать чат (`title`, `model`, `systemPrompt`, `historyMode`, `summaryChunkSize`, `summaryTailMessages`)
 - `GET /api/chats/:id/messages` - история сообщений
-- `PATCH /api/chats/:id` - обновить чат (`title`, `model`, `systemPrompt`)
+- `PATCH /api/chats/:id` - обновить чат (`title`, `model`, `systemPrompt`, `historyMode`, `summaryChunkSize`, `summaryTailMessages`)
 - `DELETE /api/chats/:id` - удалить чат
-- `POST /api/chats/:id/stream` - отправить сообщение и получить streaming-ответ
+- `POST /api/chats/:id/stream` - отправить сообщение и получить streaming-ответ (`userPrompt`, `model`, `systemPrompt`, `reasoningEffort`, `temperature`, `historyMode`, `summaryChunkSize`, `summaryTailMessages`)
 
 SSE-события stream endpoint:
 
@@ -112,6 +121,9 @@ SSE-события stream endpoint:
 - `debug_response_final`
 - `done`
 - `error`
+
+Событие `done` содержит `metrics.tokenSavings` (экономия токенов), а `debug_request.context` показывает
+использованный режим истории и параметры суммаризации.
 
 ## Управление вводом
 

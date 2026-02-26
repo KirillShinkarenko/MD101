@@ -276,6 +276,11 @@ textarea {
   gap: 8px;
 }
 
+.context-meta {
+  display: grid;
+  gap: 4px;
+}
+
 .secondary-action {
   font-size: 12px;
   padding: 6px 9px;
@@ -285,9 +290,31 @@ textarea {
   margin: 0;
   font-size: 12px;
   color: #b8c1cc;
-  white-space: nowrap;
+}
+
+.history-mode-switch {
+  display: inline-flex;
+  border: 1px solid #333333;
+  border-radius: 8px;
   overflow: hidden;
-  text-overflow: ellipsis;
+}
+
+.history-mode-switch button {
+  border: 0;
+  border-right: 1px solid #333333;
+  border-radius: 0;
+  background: #1c1c1c;
+  color: #d6d6d6;
+  font-size: 12px;
+  padding: 6px 10px;
+}
+
+.history-mode-switch button:last-child {
+  border-right: 0;
+}
+
+.history-mode-switch button.active {
+  background: #343434;
 }
 
 .status {
@@ -575,6 +602,7 @@ textarea {
   }
 
   .composer-actions {
+    flex-wrap: wrap;
     justify-content: flex-end;
   }
 }

@@ -29,16 +29,20 @@ function App() {
         status={view.status}
         userPrompt={view.userPrompt}
         isStreaming={view.isStreaming}
+        historyMode={view.historyMode}
         currentContextTokens={view.currentContextTokens}
         maxContextTokens={view.maxContextTokens}
         formatNumber={view.formatNumber}
         messages={view.messages}
+        requestSavedInputTokens={view.requestSavedInputTokens}
+        requestSavedInputPercent={view.requestSavedInputPercent}
         chatEndRef={view.chatEndRef}
         onUserPromptChange={actions.setUserPrompt}
         onPromptKeyDown={actions.handlePromptKeyDown}
         onMainAction={actions.handleMainAction}
         onCopyConversationText={() => void actions.copyConversationText()}
         onGenerateLongPrompt={actions.generateLongPrompt}
+        onHistoryModeChange={(value) => void actions.handleHistoryModeChange(value)}
       />
 
       <InspectorPanel
@@ -50,6 +54,9 @@ function App() {
         responseRaw={view.responseRaw}
         overflowErrorRaw={view.overflowErrorRaw}
         errorText={view.errorText}
+        historyMode={view.historyMode}
+        cumulativeSavedInputTokens={view.cumulativeSavedInputTokens}
+        averageSavedPercent={view.averageSavedPercent}
         formatNumber={view.formatNumber}
         formatUsd={view.formatUsd}
         onOpenFullScreenRequest={() => actions.setFullScreenView("request")}
@@ -61,6 +68,8 @@ function App() {
         model={view.model}
         temperature={view.temperature}
         reasoningEffort={view.reasoningEffort}
+        summaryChunkSize={view.summaryChunkSize}
+        summaryTailMessages={view.summaryTailMessages}
         isStreaming={view.isStreaming}
         isTemperatureSupported={view.isTemperatureSupported}
         isReasoningSupported={view.isReasoningSupported}
@@ -71,6 +80,9 @@ function App() {
         onModelChange={(value) => void actions.handleModelChange(value)}
         onTemperatureChange={actions.setTemperature}
         onReasoningEffortChange={actions.setReasoningEffort}
+        onSummaryChunkSizeChange={(value) => void actions.handleSummaryChunkSizeChange(value)}
+        onSummaryTailMessagesChange={(value) => void actions.handleSummaryTailMessagesChange(value)}
+        onSaveSummarySettings={() => void actions.saveSummarySettings()}
       />
 
       <SystemPromptModal

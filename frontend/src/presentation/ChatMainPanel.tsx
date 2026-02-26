@@ -1,12 +1,15 @@
-import type { ChatMessage, Status } from "../domain/chat";
+import type { ChatMessage, HistoryMode, Status } from "../domain/chat";
 import type { KeyboardEvent, RefObject } from "react";
 
 type Props = {
   status: Status;
   userPrompt: string;
   isStreaming: boolean;
+  historyMode: HistoryMode;
   currentContextTokens: number | null;
   maxContextTokens: number | null;
+  requestSavedInputTokens: number;
+  requestSavedInputPercent: number;
   formatNumber: (value: number | null) => string;
   messages: ChatMessage[];
   chatEndRef: RefObject<HTMLDivElement>;
@@ -15,6 +18,7 @@ type Props = {
   onMainAction: () => void;
   onCopyConversationText: () => void;
   onGenerateLongPrompt: () => void;
+  onHistoryModeChange: (value: HistoryMode) => void;
 };
 
 export function ChatMainPanel(props: Props) {
@@ -22,8 +26,11 @@ export function ChatMainPanel(props: Props) {
     status,
     userPrompt,
     isStreaming,
+    historyMode,
     currentContextTokens,
     maxContextTokens,
+    requestSavedInputTokens,
+    requestSavedInputPercent,
     formatNumber,
     messages,
     chatEndRef,
@@ -32,12 +39,13 @@ export function ChatMainPanel(props: Props) {
     onMainAction,
     onCopyConversationText,
     onGenerateLongPrompt,
+    onHistoryModeChange,
   } = props;
 
   return (
     <section className="center-col">
       <div className="panel-header">
-        <h1>MD108 UI</h1>
+        <h1>MD109 UI</h1>
         <div className="header-actions">
           <button
             type="button"
@@ -73,10 +81,36 @@ export function ChatMainPanel(props: Props) {
         />
 
         <div className="composer-bottom">
-          <p className="context-indicator">
-            <strong>Context:</strong> {formatNumber(currentContextTokens)} / {formatNumber(maxContextTokens)} tokens
-          </p>
+          <div className="context-meta">
+            <p className="context-indicator">
+              <strong>Context:</strong> {formatNumber(currentContextTokens)} / {formatNumber(maxContextTokens)} tokens
+            </p>
+            <p className="context-indicator">
+              <strong>Saved this request:</strong>{" "}
+              {historyMode === "full"
+                ? "0 tokens (full request mode)"
+                : `${formatNumber(requestSavedInputTokens)} (${requestSavedInputPercent.toFixed(2)}%)`}
+            </p>
+          </div>
           <div className="composer-actions">
+            <div className="history-mode-switch" role="group" aria-label="History mode">
+              <button
+                type="button"
+                className={historyMode === "summary" ? "active" : ""}
+                onClick={() => onHistoryModeChange("summary")}
+                disabled={isStreaming}
+              >
+                Summary mode
+              </button>
+              <button
+                type="button"
+                className={historyMode === "full" ? "active" : ""}
+                onClick={() => onHistoryModeChange("full")}
+                disabled={isStreaming}
+              >
+                Full request
+              </button>
+            </div>
             <button type="button" className="secondary-action" onClick={onGenerateLongPrompt} disabled={isStreaming}>
               Gen ~5k
             </button>

@@ -44,7 +44,16 @@ export const chatApi = {
     return payload?.chats ?? [];
   },
 
-  async createChat(body?: Partial<{ title: string; model: string; systemPrompt: string }>): Promise<ChatSummary> {
+  async createChat(
+    body?: Partial<{
+      title: string;
+      model: string;
+      systemPrompt: string;
+      historyMode: "summary" | "full";
+      summaryChunkSize: number;
+      summaryTailMessages: number;
+    }>
+  ): Promise<ChatSummary> {
     const response = await fetch(`${API_BASE}/api/chats`, {
       method: "POST",
       headers: jsonHeaders,
@@ -86,7 +95,14 @@ export const chatApi = {
 
   async updateChat(
     chatId: string,
-    body: Partial<{ title: string; model: string; systemPrompt: string }>
+    body: Partial<{
+      title: string;
+      model: string;
+      systemPrompt: string;
+      historyMode: "summary" | "full";
+      summaryChunkSize: number;
+      summaryTailMessages: number;
+    }>
   ): Promise<ChatSummary> {
     const response = await fetch(`${API_BASE}/api/chats/${chatId}`, {
       method: "PATCH",
@@ -108,6 +124,9 @@ export const chatApi = {
       systemPrompt: string;
       reasoningEffort?: string;
       temperature?: number;
+      historyMode?: "summary" | "full";
+      summaryChunkSize?: number;
+      summaryTailMessages?: number;
     },
     signal: AbortSignal
   ): Promise<Response> {

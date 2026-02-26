@@ -7,28 +7,21 @@ import {
   MODEL_OPTIONS,
   MODEL_REASONING_OPTIONS,
   MODEL_TEMPERATURE_POLICY,
-  SYSTEM_PROMPT_STORAGE_KEY,
   type ChatMessage,
   type ChatSummary,
   type FullScreenView,
+  type HistoryMode,
   type HistoryTotals,
   type ReasoningEffort,
   type RunMetrics,
   type Status,
+  type TokenSavingsMetrics,
   type TurnGrowthRow,
 } from "../domain/chat";
 import { chatApi } from "../infrastructure/chatApi";
 import { formatNumber, formatUsd } from "../shared/format";
 import { createId } from "../shared/id";
 import { parseJsonSafe, prettyJsonText } from "../shared/json";
-
-const loadStoredSystemPrompt = (): string => {
-  if (typeof window === "undefined") {
-    return DEFAULT_SYSTEM_PROMPT;
-  }
-  const stored = localStorage.getItem(SYSTEM_PROMPT_STORAGE_KEY);
-  return stored?.trim() || DEFAULT_SYSTEM_PROMPT;
-};
 
 const parseTemperature = (value: string): { value?: number; error?: string } => {
   const trimmed = value.trim();
@@ -45,6 +38,34 @@ const parseTemperature = (value: string): { value?: number; error?: string } => 
   }
 
   return { value: parsed };
+};
+
+const parsePositiveIntSetting = (
+  value: string,
+  label: string,
+  min = 1,
+  max = 100
+): { value?: number; error?: string } => {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return { error: `${label} is required.` };
+  }
+  const parsed = Number(trimmed);
+  if (!Number.isInteger(parsed)) {
+    return { error: `${label} must be an integer.` };
+  }
+  if (parsed < min || parsed > max) {
+    return { error: `${label} must be between ${min} and ${max}.` };
+  }
+  return { value: parsed };
+};
+
+const toPositiveIntOrFallback = (value: string, fallback: number): number => {
+  const parsed = Number(value.trim());
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 100) {
+    return fallback;
+  }
+  return parsed;
 };
 
 const generateApprox5000TokenText = (): string => {
@@ -79,6 +100,16 @@ const extractRawApiPayload = (payload: unknown): unknown => {
   return payload;
 };
 
+const EMPTY_TOKEN_SAVINGS: TokenSavingsMetrics = {
+  actualInputTokens: null,
+  fullInputTokens: null,
+  savedInputTokens: 0,
+  savedInputPercent: 0,
+  cumulativeSavedInputTokens: 0,
+};
+const DEFAULT_SUMMARY_CHUNK_SIZE = 10;
+const DEFAULT_SUMMARY_TAIL_MESSAGES = 10;
+
 export type ChatController = ReturnType<typeof useChatController>;
 
 export function useChatController() {
@@ -90,9 +121,12 @@ export function useChatController() {
   const [errorText, setErrorText] = useState("");
 
   const [model, setModel] = useState(DEFAULT_MODEL);
-  const [systemPrompt, setSystemPrompt] = useState(loadStoredSystemPrompt);
+  const [historyMode, setHistoryMode] = useState<HistoryMode>("summary");
+  const [systemPrompt, setSystemPrompt] = useState(DEFAULT_SYSTEM_PROMPT);
   const [temperature, setTemperature] = useState("0.7");
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("low");
+  const [summaryChunkSize, setSummaryChunkSize] = useState(String(DEFAULT_SUMMARY_CHUNK_SIZE));
+  const [summaryTailMessages, setSummaryTailMessages] = useState(String(DEFAULT_SUMMARY_TAIL_MESSAGES));
 
   const [metrics, setMetrics] = useState<RunMetrics | null>(null);
   const [requestRaw, setRequestRaw] = useState("");
@@ -105,6 +139,7 @@ export function useChatController() {
 
   const controllerRef = useRef<AbortController | null>(null);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
+  const lastSettingsChatIdRef = useRef<string | null>(null);
 
   const activeChat = useMemo(
     () => chats.find((chat) => chat.id === activeChatId) ?? null,
@@ -134,6 +169,7 @@ export function useChatController() {
           outputTokens: acc.outputTokens + (message.outputTokens ?? 0),
           totalTokens: acc.totalTokens + (message.totalTokens ?? 0),
           costUsd: Number((acc.costUsd + (message.costUsd ?? 0)).toFixed(8)),
+          savedInputTokens: acc.savedInputTokens + (message.savedInputTokens ?? 0),
         };
       },
       {
@@ -141,6 +177,7 @@ export function useChatController() {
         outputTokens: 0,
         totalTokens: 0,
         costUsd: 0,
+        savedInputTokens: 0,
       }
     );
   }, [messages]);
@@ -149,6 +186,7 @@ export function useChatController() {
     const rows: TurnGrowthRow[] = [];
     let cumulativeTotalTokens = 0;
     let cumulativeCostUsd = 0;
+    let cumulativeSavedInputTokens = 0;
 
     for (const message of messages) {
       if (message.role !== "assistant") {
@@ -157,6 +195,7 @@ export function useChatController() {
 
       cumulativeTotalTokens += message.totalTokens ?? 0;
       cumulativeCostUsd = Number((cumulativeCostUsd + (message.costUsd ?? 0)).toFixed(8));
+      cumulativeSavedInputTokens += message.savedInputTokens ?? 0;
 
       rows.push({
         turnIndex: rows.length + 1,
@@ -167,6 +206,8 @@ export function useChatController() {
         cumulativeTotalTokens,
         cumulativeCostUsd,
         latencyMs: message.latencyMs,
+        savedInputTokens: message.savedInputTokens,
+        cumulativeSavedInputTokens,
       });
     }
 
@@ -184,6 +225,17 @@ export function useChatController() {
   }, [messages]);
 
   const maxContextTokens = MODEL_CONTEXT_WINDOW[model] ?? null;
+  const averageSavedPercent = useMemo(() => {
+    const assistantMessages = messages.filter((item) => item.role === "assistant");
+    if (assistantMessages.length === 0) {
+      return 0;
+    }
+    const totalPercent = assistantMessages.reduce((total, item) => total + (item.savedInputPercent ?? 0), 0);
+    return Number((totalPercent / assistantMessages.length).toFixed(2));
+  }, [messages]);
+  const requestSavedInputTokens = metrics?.tokenSavings.savedInputTokens ?? 0;
+  const requestSavedInputPercent = metrics?.tokenSavings.savedInputPercent ?? 0;
+  const cumulativeSavedInputTokens = metrics?.tokenSavings.cumulativeSavedInputTokens ?? historyTotals.savedInputTokens;
 
   const selectChat = useCallback((chatId: string) => {
     setActiveChatId(chatId);
@@ -208,6 +260,11 @@ export function useChatController() {
         return;
       }
 
+      const cumulativeSavedInputTokens = nextMessages.reduce(
+        (total, item) => total + (item.savedInputTokens ?? 0),
+        0
+      );
+
       setMetrics({
         model: activeChat?.model ?? model,
         latencyMs: latestAssistant.latencyMs,
@@ -217,6 +274,13 @@ export function useChatController() {
         costUsd: latestAssistant.costUsd,
         inputCostUsd: latestAssistant.inputCostUsd,
         outputCostUsd: latestAssistant.outputCostUsd,
+        tokenSavings: {
+          actualInputTokens: latestAssistant.actualInputTokens,
+          fullInputTokens: latestAssistant.fullInputTokens,
+          savedInputTokens: latestAssistant.savedInputTokens ?? 0,
+          savedInputPercent: latestAssistant.savedInputPercent ?? 0,
+          cumulativeSavedInputTokens,
+        },
       });
     },
     [activeChat?.model, model]
@@ -242,10 +306,18 @@ export function useChatController() {
     const listed = await chatApi.listChats();
 
     if (listed.length === 0) {
-      const created = await chatApi.createChat({ model });
+      const created = await chatApi.createChat({
+        model,
+        historyMode: "summary",
+        summaryChunkSize: DEFAULT_SUMMARY_CHUNK_SIZE,
+        summaryTailMessages: DEFAULT_SUMMARY_TAIL_MESSAGES,
+      });
       setChats([created]);
       selectChat(created.id);
       setModel(created.model);
+      setHistoryMode(created.historyMode);
+      setSummaryChunkSize(String(created.summaryChunkSize));
+      setSummaryTailMessages(String(created.summaryTailMessages));
       await loadMessages(created.id);
       return;
     }
@@ -261,11 +333,21 @@ export function useChatController() {
     selectChat(nextActiveId);
     const selected = listed.find((chat) => chat.id === nextActiveId) ?? listed[0];
     setModel(selected.model);
+    setHistoryMode(selected.historyMode);
+    setSummaryChunkSize(String(selected.summaryChunkSize));
+    setSummaryTailMessages(String(selected.summaryTailMessages));
     await loadMessages(selected.id);
   }, [activeChatId, loadMessages, model, selectChat]);
 
   const createChat = useCallback(async () => {
-    const chat = await chatApi.createChat({ model });
+    const createSummaryChunkSize = toPositiveIntOrFallback(summaryChunkSize, 10);
+    const createSummaryTailMessages = toPositiveIntOrFallback(summaryTailMessages, 10);
+    const chat = await chatApi.createChat({
+      model,
+      historyMode: "summary",
+      summaryChunkSize: createSummaryChunkSize,
+      summaryTailMessages: createSummaryTailMessages,
+    });
     setChats((prev) => [chat, ...prev]);
     selectChat(chat.id);
     setMessages([]);
@@ -274,7 +356,10 @@ export function useChatController() {
     setResponseRaw("");
     setOverflowErrorRaw("");
     setModel(chat.model);
-  }, [model, selectChat]);
+    setHistoryMode(chat.historyMode);
+    setSummaryChunkSize(String(chat.summaryChunkSize));
+    setSummaryTailMessages(String(chat.summaryTailMessages));
+  }, [model, selectChat, summaryChunkSize, summaryTailMessages]);
 
   const deleteChat = useCallback(
     async (chatId: string) => {
@@ -284,10 +369,22 @@ export function useChatController() {
     [loadChats]
   );
 
-  const patchChat = useCallback(async (chatId: string, body: Partial<{ title: string; model: string }>) => {
+  const patchChat = useCallback(
+    async (
+      chatId: string,
+      body: Partial<{
+        title: string;
+        model: string;
+        historyMode: HistoryMode;
+        summaryChunkSize: number;
+        summaryTailMessages: number;
+      }>
+    ) => {
     const updated = await chatApi.updateChat(chatId, body);
     setChats((prev) => prev.map((chat) => (chat.id === updated.id ? { ...chat, ...updated } : chat)));
-  }, []);
+    },
+    []
+  );
 
   const handleModelChange = useCallback(
     async (nextModel: string) => {
@@ -305,6 +402,65 @@ export function useChatController() {
     [activeChatId, patchChat]
   );
 
+  const handleHistoryModeChange = useCallback(
+    async (nextMode: HistoryMode) => {
+      setHistoryMode(nextMode);
+      if (!activeChatId) {
+        return;
+      }
+      try {
+        await patchChat(activeChatId, { historyMode: nextMode });
+      } catch (error) {
+        setErrorText(error instanceof Error ? error.message : "Failed to update history mode");
+        setStatus("error");
+      }
+    },
+    [activeChatId, patchChat]
+  );
+
+  const handleSummaryChunkSizeChange = useCallback((value: string) => {
+    setSummaryChunkSize(value);
+  }, []);
+
+  const handleSummaryTailMessagesChange = useCallback((value: string) => {
+    setSummaryTailMessages(value);
+  }, []);
+
+  const saveSummarySettings = useCallback(async () => {
+    if (!activeChatId || !activeChat) {
+      return;
+    }
+    const parsed = parsePositiveIntSetting(summaryChunkSize, "Summary chunk size");
+    if (!parsed.value) {
+      setSummaryChunkSize(String(activeChat.summaryChunkSize));
+      setErrorText(parsed.error ?? "Invalid summary chunk size");
+      setStatus("error");
+      return;
+    }
+
+    const parsedTail = parsePositiveIntSetting(summaryTailMessages, "Messages without summary");
+    if (!parsedTail.value) {
+      setSummaryTailMessages(String(activeChat.summaryTailMessages));
+      setErrorText(parsedTail.error ?? "Invalid messages without summary");
+      setStatus("error");
+      return;
+    }
+
+    try {
+      await patchChat(activeChatId, {
+        summaryChunkSize: parsed.value,
+        summaryTailMessages: parsedTail.value,
+      });
+      setErrorText("");
+      setStatus((prev) => (prev === "error" ? "idle" : prev));
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : "Failed to update summary settings");
+      setStatus("error");
+      setSummaryChunkSize(String(activeChat.summaryChunkSize));
+      setSummaryTailMessages(String(activeChat.summaryTailMessages));
+    }
+  }, [activeChat, activeChatId, patchChat, summaryChunkSize, summaryTailMessages]);
+
   const stopStreaming = useCallback(() => {
     controllerRef.current?.abort();
     controllerRef.current = null;
@@ -319,6 +475,21 @@ export function useChatController() {
     const parsedTemperature = parseTemperature(temperature);
     if (parsedTemperature.error) {
       setErrorText(parsedTemperature.error);
+      setStatus("error");
+      return;
+    }
+    const parsedChunkSize = parsePositiveIntSetting(summaryChunkSize, "Summary chunk size");
+    if (parsedChunkSize.error) {
+      setErrorText(parsedChunkSize.error);
+      setStatus("error");
+      return;
+    }
+    const parsedTailMessages = parsePositiveIntSetting(
+      summaryTailMessages,
+      "Messages without summary"
+    );
+    if (parsedTailMessages.error) {
+      setErrorText(parsedTailMessages.error);
       setStatus("error");
       return;
     }
@@ -341,6 +512,10 @@ export function useChatController() {
       costUsd: null,
       inputCostUsd: null,
       outputCostUsd: null,
+      actualInputTokens: null,
+      fullInputTokens: null,
+      savedInputTokens: null,
+      savedInputPercent: null,
       createdAt: Date.now(),
     };
 
@@ -359,6 +534,10 @@ export function useChatController() {
       costUsd: null,
       inputCostUsd: null,
       outputCostUsd: null,
+      actualInputTokens: null,
+      fullInputTokens: null,
+      savedInputTokens: null,
+      savedInputPercent: null,
       createdAt: Date.now(),
     };
 
@@ -377,6 +556,9 @@ export function useChatController() {
           systemPrompt,
           reasoningEffort: isReasoningSupported ? reasoningEffort : undefined,
           temperature: isTemperatureSupported ? parsedTemperature.value : undefined,
+          historyMode,
+          summaryChunkSize: parsedChunkSize.value,
+          summaryTailMessages: parsedTailMessages.value,
         },
         controller.signal
       );
@@ -502,6 +684,29 @@ export function useChatController() {
               hasApiResponsePayload = true;
             }
             const usage = payload?.metrics?.usage;
+            const tokenSavingsPayload = payload?.metrics?.tokenSavings;
+            const tokenSavings: TokenSavingsMetrics = {
+              actualInputTokens:
+                typeof tokenSavingsPayload?.actualInputTokens === "number"
+                  ? tokenSavingsPayload.actualInputTokens
+                  : null,
+              fullInputTokens:
+                typeof tokenSavingsPayload?.fullInputTokens === "number"
+                  ? tokenSavingsPayload.fullInputTokens
+                  : null,
+              savedInputTokens:
+                typeof tokenSavingsPayload?.savedInputTokens === "number"
+                  ? tokenSavingsPayload.savedInputTokens
+                  : 0,
+              savedInputPercent:
+                typeof tokenSavingsPayload?.savedInputPercent === "number"
+                  ? tokenSavingsPayload.savedInputPercent
+                  : 0,
+              cumulativeSavedInputTokens:
+                typeof tokenSavingsPayload?.cumulativeSavedInputTokens === "number"
+                  ? tokenSavingsPayload.cumulativeSavedInputTokens
+                  : 0,
+            };
             const nextMetrics: RunMetrics = {
               model: payload?.metrics?.model ?? model,
               latencyMs:
@@ -514,6 +719,7 @@ export function useChatController() {
                 typeof payload?.metrics?.inputCostUsd === "number" ? payload.metrics.inputCostUsd : null,
               outputCostUsd:
                 typeof payload?.metrics?.outputCostUsd === "number" ? payload.metrics.outputCostUsd : null,
+              tokenSavings,
             };
             setMetrics(nextMetrics);
             setStatus((prev) => (prev === "streaming" ? "done" : prev));
@@ -596,6 +802,7 @@ export function useChatController() {
     }
   }, [
     activeChatId,
+    historyMode,
     isStreaming,
     isReasoningSupported,
     isTemperatureSupported,
@@ -604,6 +811,8 @@ export function useChatController() {
     model,
     reasoningEffort,
     systemPrompt,
+    summaryChunkSize,
+    summaryTailMessages,
     temperature,
     userPrompt,
   ]);
@@ -666,14 +875,16 @@ export function useChatController() {
       return;
     }
     setModel(activeChat.model);
+    setHistoryMode(activeChat.historyMode);
+    if (lastSettingsChatIdRef.current !== activeChat.id) {
+      setSummaryChunkSize(String(activeChat.summaryChunkSize));
+      setSummaryTailMessages(String(activeChat.summaryTailMessages));
+      lastSettingsChatIdRef.current = activeChat.id;
+    }
     if (isReasoningSupported && !reasoningOptions.includes(reasoningEffort)) {
       setReasoningEffort(reasoningOptions[0] ?? "low");
     }
   }, [activeChat, isReasoningSupported, reasoningEffort, reasoningOptions]);
-
-  useEffect(() => {
-    localStorage.setItem(SYSTEM_PROMPT_STORAGE_KEY, systemPrompt);
-  }, [systemPrompt]);
 
   useEffect(() => {
     if (!activeChatId) {
@@ -694,6 +905,9 @@ export function useChatController() {
       status,
       errorText,
       model,
+      historyMode,
+      summaryChunkSize,
+      summaryTailMessages,
       systemPrompt,
       temperature,
       reasoningEffort,
@@ -717,6 +931,10 @@ export function useChatController() {
       chatEndRef,
       formatNumber,
       formatUsd,
+      requestSavedInputTokens,
+      requestSavedInputPercent,
+      cumulativeSavedInputTokens,
+      averageSavedPercent,
     },
     actions: {
       setUserPrompt,
@@ -730,6 +948,10 @@ export function useChatController() {
       deleteChat,
       selectChat,
       handleModelChange,
+      handleHistoryModeChange,
+      handleSummaryChunkSizeChange,
+      handleSummaryTailMessagesChange,
+      saveSummarySettings,
       handleMainAction,
       handlePromptKeyDown,
       copyConversationText,

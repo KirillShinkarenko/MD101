@@ -5,6 +5,8 @@ type Props = {
   model: string;
   temperature: string;
   reasoningEffort: ReasoningEffort;
+  summaryChunkSize: string;
+  summaryTailMessages: string;
   isStreaming: boolean;
   isTemperatureSupported: boolean;
   isReasoningSupported: boolean;
@@ -15,6 +17,9 @@ type Props = {
   onModelChange: (value: string) => void;
   onTemperatureChange: (value: string) => void;
   onReasoningEffortChange: (value: ReasoningEffort) => void;
+  onSummaryChunkSizeChange: (value: string) => void;
+  onSummaryTailMessagesChange: (value: string) => void;
+  onSaveSummarySettings: () => void;
 };
 
 export function ModelSettingsModal(props: Props) {
@@ -23,6 +28,8 @@ export function ModelSettingsModal(props: Props) {
     model,
     temperature,
     reasoningEffort,
+    summaryChunkSize,
+    summaryTailMessages,
     isStreaming,
     isTemperatureSupported,
     isReasoningSupported,
@@ -33,6 +40,9 @@ export function ModelSettingsModal(props: Props) {
     onModelChange,
     onTemperatureChange,
     onReasoningEffortChange,
+    onSummaryChunkSizeChange,
+    onSummaryTailMessagesChange,
+    onSaveSummarySettings,
   } = props;
 
   if (!isOpen) {
@@ -96,6 +106,29 @@ export function ModelSettingsModal(props: Props) {
           {temperaturePolicy === "reasoning_none_only" ? (
             <p className="hint">Temperature is available only with reasoning effort = none.</p>
           ) : null}
+          <label htmlFor="modal-summary-tail">Messages without summary</label>
+          <input
+            id="modal-summary-tail"
+            type="text"
+            inputMode="numeric"
+            pattern="[0-9]*"
+            value={summaryTailMessages}
+            onChange={(event) => onSummaryTailMessagesChange(event.target.value)}
+            disabled={isStreaming}
+          />
+          <label htmlFor="modal-summary-chunk">Summary chunk size</label>
+          <input
+            id="modal-summary-chunk"
+            type="text"
+            inputMode="numeric"
+            pattern="[0-9]*"
+            value={summaryChunkSize}
+            onChange={(event) => onSummaryChunkSizeChange(event.target.value)}
+            disabled={isStreaming}
+          />
+          <button type="button" onClick={onSaveSummarySettings} disabled={isStreaming}>
+            Save summary settings
+          </button>
         </div>
       </section>
     </div>
