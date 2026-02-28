@@ -1,4 +1,4 @@
-# MD108
+# MD101
 
 Веб-приложение для чата с OpenAI через backend-proxy со streaming-ответами.
 
@@ -8,14 +8,20 @@
 - автогенерация названия нового чата по первому сообщению
 - глобальный `System prompt` (модалка)
 - выбор модели и параметров (`reasoning effort`, `temperature` с валидацией)
+- стратегии памяти (пер-чат): переключатель в левой панели
+  - `None` (по умолчанию): в OpenAI отправляется полная история
+  - `Sliding Window` (реализовано): в OpenAI отправляются только последние `N` сообщений
+  - `Sticky Facts / Key-Value Memory` и `Branching` отображаются как `Coming soon`
 - чат с потоковым ответом (`Send` / `Stop`)
 - кнопка `Gen ~5k` для быстрого заполнения длинного промпта
 - копирование всего диалога в буфер обмена
 - индикатор текущего контекста (`Context: current / max tokens`)
+- модалка `Conversation info` с метриками:
+  - `Current request`
+  - `Conversation total`
+  - `Growth by turns`
 - инспектор справа:
-  - `Metrics` (текущий запрос, суммарно по диалогу, рост по ходам)
   - `Request` / `Response` JSON
-  - `Overflow error` при `context_length_exceeded`
   - полноэкранный просмотр JSON
 
 ## Архитектура
@@ -100,10 +106,18 @@ npm run dev
 - `GET /health`
 - `GET /api/chats` - список чатов
 - `POST /api/chats` - создать чат
+- опциональные поля: `memoryStrategy`, `slidingWindowSize`
 - `GET /api/chats/:id/messages` - история сообщений
-- `PATCH /api/chats/:id` - обновить чат (`title`, `model`, `systemPrompt`)
+- `PATCH /api/chats/:id` - обновить чат (`title`, `model`, `systemPrompt`, `memoryStrategy`, `slidingWindowSize`)
 - `DELETE /api/chats/:id` - удалить чат
 - `POST /api/chats/:id/stream` - отправить сообщение и получить streaming-ответ
+  - опциональные поля: `memoryStrategy`, `slidingWindowSize`
+
+Примечание по стратегиям памяти:
+- по умолчанию используется `memoryStrategy=none` (полная история)
+- сейчас поддерживаются `none` и `sliding_window`
+- для `sticky_facts` и `branching` backend вернет `400 not implemented yet`
+- допустимые значения `memoryStrategy`: `none`, `sliding_window`, `sticky_facts`, `branching`
 
 SSE-события stream endpoint:
 

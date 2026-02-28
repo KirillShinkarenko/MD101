@@ -1,4 +1,4 @@
-import { MODEL_OPTIONS } from "./domain/chat";
+import { MEMORY_STRATEGY_OPTIONS, MODEL_OPTIONS } from "./domain/chat";
 import { useChatController } from "./application/useChatController";
 import { ChatSidebar } from "./presentation/ChatSidebar";
 import { ChatMainPanel } from "./presentation/ChatMainPanel";
@@ -6,6 +6,7 @@ import { InspectorPanel } from "./presentation/InspectorPanel";
 import { ModelSettingsModal } from "./presentation/ModelSettingsModal";
 import { SystemPromptModal } from "./presentation/SystemPromptModal";
 import { FullScreenJsonModal } from "./presentation/FullScreenJsonModal";
+import { ConversationInfoModal } from "./presentation/ConversationInfoModal";
 
 function App() {
   const { view, actions } = useChatController();
@@ -18,11 +19,17 @@ function App() {
         isModelSettingsOpen={view.isModelSettingsOpen}
         isSystemPromptOpen={view.isSystemPromptOpen}
         activeModelLabel={view.activeModelLabel}
+        memoryStrategy={view.memoryStrategy}
+        slidingWindowSize={view.slidingWindowSize}
+        isStreaming={view.isStreaming}
+        memoryStrategyOptions={MEMORY_STRATEGY_OPTIONS}
         onCreateChat={() => void actions.createChat()}
         onSelectChat={actions.selectChat}
         onDeleteChat={(chatId) => void actions.deleteChat(chatId)}
         onOpenSystemPrompt={() => actions.setIsSystemPromptOpen(true)}
         onOpenModelSettings={() => actions.setIsModelSettingsOpen(true)}
+        onMemoryStrategyChange={(value) => void actions.handleMemoryStrategyChange(value)}
+        onSlidingWindowSizeChange={(value) => void actions.handleSlidingWindowSizeChange(value)}
       />
 
       <ChatMainPanel
@@ -37,21 +44,13 @@ function App() {
         onUserPromptChange={actions.setUserPrompt}
         onPromptKeyDown={actions.handlePromptKeyDown}
         onMainAction={actions.handleMainAction}
-        onCopyConversationText={() => void actions.copyConversationText()}
-        onGenerateLongPrompt={actions.generateLongPrompt}
+        onOpenConversationInfo={() => actions.setIsConversationInfoOpen(true)}
       />
 
       <InspectorPanel
-        model={view.model}
-        metrics={view.metrics}
-        historyTotals={view.historyTotals}
-        turnRows={view.turnRows}
         requestRaw={view.requestRaw}
         responseRaw={view.responseRaw}
-        overflowErrorRaw={view.overflowErrorRaw}
         errorText={view.errorText}
-        formatNumber={view.formatNumber}
-        formatUsd={view.formatUsd}
         onOpenFullScreenRequest={() => actions.setFullScreenView("request")}
         onOpenFullScreenResponse={() => actions.setFullScreenView("response")}
       />
@@ -85,6 +84,17 @@ function App() {
         requestRaw={view.requestRaw}
         responseRaw={view.responseRaw}
         onClose={() => actions.setFullScreenView(null)}
+      />
+
+      <ConversationInfoModal
+        isOpen={view.isConversationInfoOpen}
+        model={view.model}
+        metrics={view.metrics}
+        historyTotals={view.historyTotals}
+        turnRows={view.turnRows}
+        formatNumber={view.formatNumber}
+        formatUsd={view.formatUsd}
+        onClose={() => actions.setIsConversationInfoOpen(false)}
       />
     </main>
   );

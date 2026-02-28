@@ -1,4 +1,4 @@
-import type { ChatMessage, ChatSummary } from "../domain/chat";
+import type { ChatMessage, ChatSummary, MemoryStrategy } from "../domain/chat";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "";
 
@@ -44,7 +44,15 @@ export const chatApi = {
     return payload?.chats ?? [];
   },
 
-  async createChat(body?: Partial<{ title: string; model: string; systemPrompt: string }>): Promise<ChatSummary> {
+  async createChat(
+    body?: Partial<{
+      title: string;
+      model: string;
+      systemPrompt: string;
+      memoryStrategy: MemoryStrategy;
+      slidingWindowSize: number;
+    }>
+  ): Promise<ChatSummary> {
     const response = await fetch(`${API_BASE}/api/chats`, {
       method: "POST",
       headers: jsonHeaders,
@@ -86,7 +94,13 @@ export const chatApi = {
 
   async updateChat(
     chatId: string,
-    body: Partial<{ title: string; model: string; systemPrompt: string }>
+    body: Partial<{
+      title: string;
+      model: string;
+      systemPrompt: string;
+      memoryStrategy: MemoryStrategy;
+      slidingWindowSize: number;
+    }>
   ): Promise<ChatSummary> {
     const response = await fetch(`${API_BASE}/api/chats/${chatId}`, {
       method: "PATCH",
@@ -108,6 +122,8 @@ export const chatApi = {
       systemPrompt: string;
       reasoningEffort?: string;
       temperature?: number;
+      memoryStrategy?: MemoryStrategy;
+      slidingWindowSize?: number;
     },
     signal: AbortSignal
   ): Promise<Response> {

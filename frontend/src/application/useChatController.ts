@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import {
   ACTIVE_CHAT_STORAGE_KEY,
+  DEFAULT_MEMORY_STRATEGY,
   DEFAULT_MODEL,
+  DEFAULT_SLIDING_WINDOW_SIZE,
   DEFAULT_SYSTEM_PROMPT,
   MODEL_CONTEXT_WINDOW,
   MODEL_OPTIONS,
@@ -12,6 +14,7 @@ import {
   type ChatSummary,
   type FullScreenView,
   type HistoryTotals,
+  type MemoryStrategy,
   type ReasoningEffort,
   type RunMetrics,
   type Status,
@@ -47,15 +50,18 @@ const parseTemperature = (value: string): { value?: number; error?: string } => 
   return { value: parsed };
 };
 
-const generateApprox5000TokenText = (): string => {
-  const seed =
-    "This is a generated long context block for stress testing token limits in the chat application. ";
-  const targetChars = 20_000;
-  let result = "";
-  while (result.length < targetChars) {
-    result += seed;
+const parseSlidingWindowSizeInput = (value: string): { value?: number; error?: string } => {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return { error: "Sliding window size is required." };
   }
-  return result.slice(0, targetChars);
+
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 1) {
+    return { error: "Sliding window size must be an integer >= 1." };
+  }
+
+  return { value: parsed };
 };
 
 const extractRawApiPayload = (payload: unknown): unknown => {
@@ -93,6 +99,8 @@ export function useChatController() {
   const [systemPrompt, setSystemPrompt] = useState(loadStoredSystemPrompt);
   const [temperature, setTemperature] = useState("0.7");
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("low");
+  const [memoryStrategy, setMemoryStrategy] = useState<MemoryStrategy>(DEFAULT_MEMORY_STRATEGY);
+  const [slidingWindowSize, setSlidingWindowSize] = useState(String(DEFAULT_SLIDING_WINDOW_SIZE));
 
   const [metrics, setMetrics] = useState<RunMetrics | null>(null);
   const [requestRaw, setRequestRaw] = useState("");
@@ -101,6 +109,7 @@ export function useChatController() {
 
   const [isModelSettingsOpen, setIsModelSettingsOpen] = useState(false);
   const [isSystemPromptOpen, setIsSystemPromptOpen] = useState(false);
+  const [isConversationInfoOpen, setIsConversationInfoOpen] = useState(false);
   const [fullScreenView, setFullScreenView] = useState<FullScreenView>(null);
 
   const controllerRef = useRef<AbortController | null>(null);
@@ -246,6 +255,8 @@ export function useChatController() {
       setChats([created]);
       selectChat(created.id);
       setModel(created.model);
+      setMemoryStrategy(created.memoryStrategy);
+      setSlidingWindowSize(String(created.slidingWindowSize));
       await loadMessages(created.id);
       return;
     }
@@ -261,6 +272,8 @@ export function useChatController() {
     selectChat(nextActiveId);
     const selected = listed.find((chat) => chat.id === nextActiveId) ?? listed[0];
     setModel(selected.model);
+    setMemoryStrategy(selected.memoryStrategy);
+    setSlidingWindowSize(String(selected.slidingWindowSize));
     await loadMessages(selected.id);
   }, [activeChatId, loadMessages, model, selectChat]);
 
@@ -274,6 +287,8 @@ export function useChatController() {
     setResponseRaw("");
     setOverflowErrorRaw("");
     setModel(chat.model);
+    setMemoryStrategy(chat.memoryStrategy);
+    setSlidingWindowSize(String(chat.slidingWindowSize));
   }, [model, selectChat]);
 
   const deleteChat = useCallback(
@@ -284,10 +299,21 @@ export function useChatController() {
     [loadChats]
   );
 
-  const patchChat = useCallback(async (chatId: string, body: Partial<{ title: string; model: string }>) => {
-    const updated = await chatApi.updateChat(chatId, body);
-    setChats((prev) => prev.map((chat) => (chat.id === updated.id ? { ...chat, ...updated } : chat)));
-  }, []);
+  const patchChat = useCallback(
+    async (
+      chatId: string,
+      body: Partial<{
+        title: string;
+        model: string;
+        memoryStrategy: MemoryStrategy;
+        slidingWindowSize: number;
+      }>
+    ) => {
+      const updated = await chatApi.updateChat(chatId, body);
+      setChats((prev) => prev.map((chat) => (chat.id === updated.id ? { ...chat, ...updated } : chat)));
+    },
+    []
+  );
 
   const handleModelChange = useCallback(
     async (nextModel: string) => {
@@ -299,6 +325,48 @@ export function useChatController() {
         await patchChat(activeChatId, { model: nextModel });
       } catch (error) {
         setErrorText(error instanceof Error ? error.message : "Failed to update model");
+        setStatus("error");
+      }
+    },
+    [activeChatId, patchChat]
+  );
+
+  const handleMemoryStrategyChange = useCallback(
+    async (nextMemoryStrategy: MemoryStrategy) => {
+      setMemoryStrategy(nextMemoryStrategy);
+      if (!activeChatId) {
+        return;
+      }
+      try {
+        await patchChat(activeChatId, { memoryStrategy: nextMemoryStrategy });
+      } catch (error) {
+        setErrorText(error instanceof Error ? error.message : "Failed to update memory strategy");
+        setStatus("error");
+      }
+    },
+    [activeChatId, patchChat]
+  );
+
+  const handleSlidingWindowSizeChange = useCallback(
+    async (nextSlidingWindowSize: string) => {
+      setSlidingWindowSize(nextSlidingWindowSize);
+      const parsed = parseSlidingWindowSizeInput(nextSlidingWindowSize);
+      if (parsed.error) {
+        setErrorText(parsed.error);
+        setStatus("error");
+        return;
+      }
+      if (parsed.value === undefined) {
+        return;
+      }
+      if (!activeChatId) {
+        return;
+      }
+      try {
+        await patchChat(activeChatId, { slidingWindowSize: parsed.value });
+        setErrorText("");
+      } catch (error) {
+        setErrorText(error instanceof Error ? error.message : "Failed to update sliding window size");
         setStatus("error");
       }
     },
@@ -321,6 +389,19 @@ export function useChatController() {
       setErrorText(parsedTemperature.error);
       setStatus("error");
       return;
+    }
+    let nextSlidingWindowSize: number | undefined;
+    if (memoryStrategy === "sliding_window") {
+      const parsedSlidingWindowSize = parseSlidingWindowSizeInput(slidingWindowSize);
+      if (parsedSlidingWindowSize.error) {
+        setErrorText(parsedSlidingWindowSize.error);
+        setStatus("error");
+        return;
+      }
+      if (parsedSlidingWindowSize.value === undefined) {
+        return;
+      }
+      nextSlidingWindowSize = parsedSlidingWindowSize.value;
     }
 
     setStatus("streaming");
@@ -377,6 +458,8 @@ export function useChatController() {
           systemPrompt,
           reasoningEffort: isReasoningSupported ? reasoningEffort : undefined,
           temperature: isTemperatureSupported ? parsedTemperature.value : undefined,
+          memoryStrategy,
+          slidingWindowSize: nextSlidingWindowSize,
         },
         controller.signal
       );
@@ -603,7 +686,9 @@ export function useChatController() {
     loadMessages,
     model,
     reasoningEffort,
+    memoryStrategy,
     systemPrompt,
+    slidingWindowSize,
     temperature,
     userPrompt,
   ]);
@@ -645,11 +730,6 @@ export function useChatController() {
     }
   }, [messages]);
 
-  const generateLongPrompt = useCallback(() => {
-    setUserPrompt(generateApprox5000TokenText());
-    setErrorText("");
-  }, []);
-
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages]);
@@ -666,6 +746,8 @@ export function useChatController() {
       return;
     }
     setModel(activeChat.model);
+    setMemoryStrategy(activeChat.memoryStrategy);
+    setSlidingWindowSize(String(activeChat.slidingWindowSize));
     if (isReasoningSupported && !reasoningOptions.includes(reasoningEffort)) {
       setReasoningEffort(reasoningOptions[0] ?? "low");
     }
@@ -697,12 +779,15 @@ export function useChatController() {
       systemPrompt,
       temperature,
       reasoningEffort,
+      memoryStrategy,
+      slidingWindowSize,
       metrics,
       requestRaw,
       responseRaw,
       overflowErrorRaw,
       isModelSettingsOpen,
       isSystemPromptOpen,
+      isConversationInfoOpen,
       fullScreenView,
       activeModelLabel,
       isStreaming,
@@ -723,8 +808,11 @@ export function useChatController() {
       setSystemPrompt,
       setTemperature,
       setReasoningEffort,
+      handleMemoryStrategyChange,
+      handleSlidingWindowSizeChange,
       setIsModelSettingsOpen,
       setIsSystemPromptOpen,
+      setIsConversationInfoOpen,
       setFullScreenView,
       createChat,
       deleteChat,
@@ -733,7 +821,6 @@ export function useChatController() {
       handleMainAction,
       handlePromptKeyDown,
       copyConversationText,
-      generateLongPrompt,
     },
   };
 }

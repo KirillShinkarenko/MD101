@@ -15,6 +15,10 @@ await app.register(cors, {
 });
 
 type Role = "user" | "assistant";
+type MemoryStrategy = "none" | "sliding_window" | "sticky_facts" | "branching";
+
+const DEFAULT_MEMORY_STRATEGY: MemoryStrategy = "none";
+const DEFAULT_SLIDING_WINDOW_SIZE = 10;
 
 type ChatBody = {
   userPrompt?: string;
@@ -22,18 +26,24 @@ type ChatBody = {
   model?: string;
   reasoningEffort?: string;
   systemPrompt?: string;
+  memoryStrategy?: string;
+  slidingWindowSize?: number | string;
 };
 
 type CreateChatBody = {
   title?: string;
   model?: string;
   systemPrompt?: string;
+  memoryStrategy?: string;
+  slidingWindowSize?: number | string;
 };
 
 type PatchChatBody = {
   title?: string;
   model?: string;
   systemPrompt?: string;
+  memoryStrategy?: string;
+  slidingWindowSize?: number | string;
 };
 
 type UsageSummary = {
@@ -119,6 +129,8 @@ CREATE TABLE IF NOT EXISTS chats (
   title TEXT NOT NULL,
   model TEXT NOT NULL,
   system_prompt TEXT NOT NULL,
+  memory_strategy TEXT NOT NULL DEFAULT 'none',
+  sliding_window_size INTEGER NOT NULL DEFAULT 10,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -144,6 +156,20 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_chat_id_created_at ON messages (chat_id, created_at);
 `);
 
+const chatColumns = db.prepare("PRAGMA table_info(chats)").all() as Array<{ name: string }>;
+const chatColumnNames = new Set(chatColumns.map((column) => column.name));
+
+if (!chatColumnNames.has("memory_strategy")) {
+  db.exec(
+    `ALTER TABLE chats ADD COLUMN memory_strategy TEXT NOT NULL DEFAULT '${DEFAULT_MEMORY_STRATEGY}'`
+  );
+}
+if (!chatColumnNames.has("sliding_window_size")) {
+  db.exec(
+    `ALTER TABLE chats ADD COLUMN sliding_window_size INTEGER NOT NULL DEFAULT ${DEFAULT_SLIDING_WINDOW_SIZE}`
+  );
+}
+
 const parseTemperature = (value: unknown): number | undefined => {
   if (value === undefined || value === null) {
     return undefined;
@@ -168,6 +194,51 @@ const parseModel = (value: unknown): string | undefined => {
   }
   const trimmed = value.trim();
   return trimmed || undefined;
+};
+
+const parseMemoryStrategy = (value: unknown): MemoryStrategy | undefined => {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim().toLowerCase();
+  if (
+    trimmed === "none" ||
+    trimmed === "sliding_window" ||
+    trimmed === "sticky_facts" ||
+    trimmed === "branching"
+  ) {
+    return trimmed;
+  }
+  return undefined;
+};
+
+const parseSlidingWindowSize = (value: unknown): number | undefined => {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  let parsed: number | undefined;
+  if (typeof value === "number") {
+    parsed = Number.isFinite(value) ? value : undefined;
+  } else if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    const nextParsed = Number(trimmed);
+    parsed = Number.isFinite(nextParsed) ? nextParsed : undefined;
+  }
+
+  if (parsed === undefined || !Number.isInteger(parsed) || parsed < 1) {
+    return undefined;
+  }
+  return parsed;
+};
+
+const ensureImplementedMemoryStrategy = (strategy: MemoryStrategy): string | null => {
+  if (strategy !== "none" && strategy !== "sliding_window") {
+    return `memoryStrategy '${strategy}' not implemented yet`;
+  }
+  return null;
 };
 
 const parseReasoningEffort = (
@@ -425,8 +496,31 @@ const buildOpenAiRequestBody = (params: {
   return body;
 };
 
+const applyMemoryStrategy = (params: {
+  messages: Array<{ role: Role; content: string }>;
+  memoryStrategy: MemoryStrategy;
+  slidingWindowSize: number;
+}): Array<{ role: Role; content: string }> => {
+  const { messages, memoryStrategy, slidingWindowSize } = params;
+  if (memoryStrategy === "none") {
+    return messages;
+  }
+  if (memoryStrategy === "sliding_window") {
+    return messages.slice(-slidingWindowSize);
+  }
+  throw new Error(`memoryStrategy '${memoryStrategy}' not implemented yet`);
+};
+
 const getChatStmt = db.prepare(`
-  SELECT id, title, model, system_prompt AS systemPrompt, created_at AS createdAt, updated_at AS updatedAt
+  SELECT
+    id,
+    title,
+    model,
+    system_prompt AS systemPrompt,
+    memory_strategy AS memoryStrategy,
+    sliding_window_size AS slidingWindowSize,
+    created_at AS createdAt,
+    updated_at AS updatedAt
   FROM chats
   WHERE id = ?
 `);
@@ -437,6 +531,8 @@ const listChatsStmt = db.prepare(`
     c.title,
     c.model,
     c.system_prompt AS systemPrompt,
+    c.memory_strategy AS memoryStrategy,
+    c.sliding_window_size AS slidingWindowSize,
     c.created_at AS createdAt,
     c.updated_at AS updatedAt,
     (
@@ -472,13 +568,13 @@ const listMessagesStmt = db.prepare(`
 `);
 
 const insertChatStmt = db.prepare(`
-  INSERT INTO chats (id, title, model, system_prompt, created_at, updated_at)
-  VALUES (?, ?, ?, ?, ?, ?)
+  INSERT INTO chats (id, title, model, system_prompt, memory_strategy, sliding_window_size, created_at, updated_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateChatStmt = db.prepare(`
   UPDATE chats
-  SET title = ?, model = ?, system_prompt = ?, updated_at = ?
+  SET title = ?, model = ?, system_prompt = ?, memory_strategy = ?, sliding_window_size = ?, updated_at = ?
   WHERE id = ?
 `);
 
@@ -495,13 +591,22 @@ const insertMessageStmt = db.prepare(`
 
 const updateChatUpdatedAtStmt = db.prepare(`UPDATE chats SET updated_at = ? WHERE id = ?`);
 
-const createChat = (params?: { title?: string; model?: string; systemPrompt?: string }) => {
+const createChat = (params?: {
+  title?: string;
+  model?: string;
+  systemPrompt?: string;
+  memoryStrategy?: string;
+  slidingWindowSize?: number | string;
+}) => {
   const now = Date.now();
   const id = createId();
   const title = params?.title?.trim() || "New chat";
   const model = parseModel(params?.model) ?? EFFECTIVE_DEFAULT_MODEL;
   const systemPrompt = params?.systemPrompt?.trim() ?? "You are a concise assistant.";
-  insertChatStmt.run(id, title, model, systemPrompt, now, now);
+  const memoryStrategy = parseMemoryStrategy(params?.memoryStrategy) ?? DEFAULT_MEMORY_STRATEGY;
+  const slidingWindowSize =
+    parseSlidingWindowSize(params?.slidingWindowSize) ?? DEFAULT_SLIDING_WINDOW_SIZE;
+  insertChatStmt.run(id, title, model, systemPrompt, memoryStrategy, slidingWindowSize, now, now);
   return getChatStmt.get(id);
 };
 
@@ -512,8 +617,34 @@ app.get("/api/chats", async () => {
   return { chats };
 });
 
-app.post<{ Body: CreateChatBody }>("/api/chats", async (request) => {
-  const chat = createChat(request.body);
+app.post<{ Body: CreateChatBody }>("/api/chats", async (request, reply) => {
+  const requestedMemoryStrategyRaw = request.body?.memoryStrategy;
+  const requestedMemoryStrategy = parseMemoryStrategy(requestedMemoryStrategyRaw);
+  if (requestedMemoryStrategyRaw !== undefined && requestedMemoryStrategy === undefined) {
+    reply.code(400);
+    return { error: "memoryStrategy must be one of: none, sliding_window, sticky_facts, branching" };
+  }
+
+  const memoryStrategy = requestedMemoryStrategy ?? DEFAULT_MEMORY_STRATEGY;
+  const memoryStrategyError = ensureImplementedMemoryStrategy(memoryStrategy);
+  if (memoryStrategyError) {
+    reply.code(400);
+    return { error: memoryStrategyError };
+  }
+
+  const requestedSlidingWindowSizeRaw = request.body?.slidingWindowSize;
+  const requestedSlidingWindowSize = parseSlidingWindowSize(requestedSlidingWindowSizeRaw);
+  if (requestedSlidingWindowSizeRaw !== undefined && requestedSlidingWindowSize === undefined) {
+    reply.code(400);
+    return { error: "slidingWindowSize must be an integer >= 1" };
+  }
+
+  const slidingWindowSize = requestedSlidingWindowSize ?? DEFAULT_SLIDING_WINDOW_SIZE;
+  const chat = createChat({
+    ...request.body,
+    memoryStrategy,
+    slidingWindowSize,
+  });
   return { chat };
 });
 
@@ -536,6 +667,8 @@ app.patch<{ Params: { id: string }; Body: PatchChatBody }>("/api/chats/:id", asy
         title: string;
         model: string;
         systemPrompt: string;
+        memoryStrategy: MemoryStrategy;
+        slidingWindowSize: number;
       }
     | undefined;
 
@@ -548,6 +681,28 @@ app.patch<{ Params: { id: string }; Body: PatchChatBody }>("/api/chats/:id", asy
   const model = parseModel(request.body?.model) ?? chat.model;
   const systemPrompt =
     typeof request.body?.systemPrompt === "string" ? request.body.systemPrompt : chat.systemPrompt;
+  const requestedMemoryStrategyRaw = request.body?.memoryStrategy;
+  const requestedMemoryStrategy = parseMemoryStrategy(requestedMemoryStrategyRaw);
+  if (requestedMemoryStrategyRaw !== undefined && requestedMemoryStrategy === undefined) {
+    reply.code(400);
+    return { error: "memoryStrategy must be one of: none, sliding_window, sticky_facts, branching" };
+  }
+  const persistedMemoryStrategy = parseMemoryStrategy(chat.memoryStrategy) ?? DEFAULT_MEMORY_STRATEGY;
+  const memoryStrategy = requestedMemoryStrategy ?? persistedMemoryStrategy;
+  const memoryStrategyError = ensureImplementedMemoryStrategy(memoryStrategy);
+  if (memoryStrategyError) {
+    reply.code(400);
+    return { error: memoryStrategyError };
+  }
+  const requestedSlidingWindowSizeRaw = request.body?.slidingWindowSize;
+  const requestedSlidingWindowSize = parseSlidingWindowSize(requestedSlidingWindowSizeRaw);
+  if (requestedSlidingWindowSizeRaw !== undefined && requestedSlidingWindowSize === undefined) {
+    reply.code(400);
+    return { error: "slidingWindowSize must be an integer >= 1" };
+  }
+  const persistedSlidingWindowSize =
+    parseSlidingWindowSize(chat.slidingWindowSize) ?? DEFAULT_SLIDING_WINDOW_SIZE;
+  const slidingWindowSize = requestedSlidingWindowSize ?? persistedSlidingWindowSize;
 
   if (!ALLOWED_MODELS.has(model)) {
     reply.code(400);
@@ -555,7 +710,7 @@ app.patch<{ Params: { id: string }; Body: PatchChatBody }>("/api/chats/:id", asy
   }
 
   const nextTitle = title || "New chat";
-  updateChatStmt.run(nextTitle, model, systemPrompt, Date.now(), chatId);
+  updateChatStmt.run(nextTitle, model, systemPrompt, memoryStrategy, slidingWindowSize, Date.now(), chatId);
   return { chat: getChatStmt.get(chatId) };
 });
 
@@ -583,6 +738,8 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
         title: string;
         model: string;
         systemPrompt: string;
+        memoryStrategy: MemoryStrategy;
+        slidingWindowSize: number;
       }
     | undefined;
 
@@ -599,6 +756,16 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
   const reasoningEffort = parseReasoningEffort(requestedReasoningEffortRaw);
   const systemPrompt =
     typeof request.body?.systemPrompt === "string" ? request.body.systemPrompt : existingChat.systemPrompt;
+  const requestedMemoryStrategyRaw = request.body?.memoryStrategy;
+  const requestedMemoryStrategy = parseMemoryStrategy(requestedMemoryStrategyRaw);
+  const persistedMemoryStrategy =
+    parseMemoryStrategy(existingChat.memoryStrategy) ?? DEFAULT_MEMORY_STRATEGY;
+  const memoryStrategy = requestedMemoryStrategy ?? persistedMemoryStrategy;
+  const requestedSlidingWindowSizeRaw = request.body?.slidingWindowSize;
+  const requestedSlidingWindowSize = parseSlidingWindowSize(requestedSlidingWindowSizeRaw);
+  const persistedSlidingWindowSize =
+    parseSlidingWindowSize(existingChat.slidingWindowSize) ?? DEFAULT_SLIDING_WINDOW_SIZE;
+  const slidingWindowSize = requestedSlidingWindowSize ?? persistedSlidingWindowSize;
   const startedAt = Date.now();
 
   if (!userPrompt) {
@@ -612,6 +779,21 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
   }
 
   const modelProfile = MODEL_API_PROFILES[model];
+
+  if (requestedMemoryStrategyRaw !== undefined && requestedMemoryStrategy === undefined) {
+    reply.code(400);
+    return { error: "memoryStrategy must be one of: none, sliding_window, sticky_facts, branching" };
+  }
+  const memoryStrategyError = ensureImplementedMemoryStrategy(memoryStrategy);
+  if (memoryStrategyError) {
+    reply.code(400);
+    return { error: memoryStrategyError };
+  }
+
+  if (requestedSlidingWindowSizeRaw !== undefined && requestedSlidingWindowSize === undefined) {
+    reply.code(400);
+    return { error: "slidingWindowSize must be an integer >= 1" };
+  }
 
   if (request.body?.temperature !== undefined && temperature === undefined) {
     reply.code(400);
@@ -654,14 +836,34 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
     role: item.role,
     content: item.content,
   }));
-  const inputMessages = [...persistedMessages, { role: "user" as const, content: userPrompt }];
+  const inputMessages = applyMemoryStrategy({
+    messages: [...persistedMessages, { role: "user" as const, content: userPrompt }],
+    memoryStrategy,
+    slidingWindowSize,
+  });
 
   const now = Date.now();
-  updateChatStmt.run(existingChat.title, model, systemPrompt, now, chatId);
+  updateChatStmt.run(
+    existingChat.title,
+    model,
+    systemPrompt,
+    memoryStrategy,
+    slidingWindowSize,
+    now,
+    chatId
+  );
 
   if (existingChat.title === "New chat") {
     const nextTitle = userPrompt.slice(0, 42).trim() || "New chat";
-    updateChatStmt.run(nextTitle, model, systemPrompt, now, chatId);
+    updateChatStmt.run(
+      nextTitle,
+      model,
+      systemPrompt,
+      memoryStrategy,
+      slidingWindowSize,
+      now,
+      chatId
+    );
   }
 
   const userMessageId = createId();

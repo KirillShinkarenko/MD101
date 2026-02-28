@@ -1,5 +1,7 @@
 import type { ChatMessage, Status } from "../domain/chat";
 import type { KeyboardEvent, RefObject } from "react";
+import { PanelHeader } from "./ui/PanelHeader";
+import { UiButton } from "./ui/UiButton";
 
 type Props = {
   status: Status;
@@ -13,8 +15,7 @@ type Props = {
   onUserPromptChange: (value: string) => void;
   onPromptKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
   onMainAction: () => void;
-  onCopyConversationText: () => void;
-  onGenerateLongPrompt: () => void;
+  onOpenConversationInfo: () => void;
 };
 
 export function ChatMainPanel(props: Props) {
@@ -30,27 +31,28 @@ export function ChatMainPanel(props: Props) {
     onUserPromptChange,
     onPromptKeyDown,
     onMainAction,
-    onCopyConversationText,
-    onGenerateLongPrompt,
+    onOpenConversationInfo,
   } = props;
 
   return (
     <section className="center-col">
-      <div className="panel-header">
-        <h1>MD108 UI</h1>
-        <div className="header-actions">
-          <button
-            type="button"
-            className="copy-dialog-button"
-            onClick={onCopyConversationText}
-            title="Copy conversation text"
-            aria-label="Copy conversation text"
-          >
-            📋
-          </button>
-          <span className={`status ${status}`}>{status}</span>
-        </div>
-      </div>
+      <PanelHeader
+        as="h1"
+        variant="panel"
+        title="День 10. Управление контекстом: разные стратегии"
+        titleClassName="day-task-heading"
+        actions={
+          <>
+            <UiButton
+              className="conversation-info-button"
+              onClick={onOpenConversationInfo}
+            >
+              Conversation info
+            </UiButton>
+            <span className={`status ${status}`}>{status}</span>
+          </>
+        }
+      />
 
       <div className="messages">
         {messages.length === 0 ? <p className="empty">Start a conversation...</p> : null}
@@ -77,12 +79,9 @@ export function ChatMainPanel(props: Props) {
             <strong>Context:</strong> {formatNumber(currentContextTokens)} / {formatNumber(maxContextTokens)} tokens
           </p>
           <div className="composer-actions">
-            <button type="button" className="secondary-action" onClick={onGenerateLongPrompt} disabled={isStreaming}>
-              Gen ~5k
-            </button>
-            <button type="button" onClick={onMainAction} disabled={!isStreaming && !userPrompt.trim()}>
+            <UiButton onClick={onMainAction} disabled={!isStreaming && !userPrompt.trim()}>
               {isStreaming ? "Stop" : "Send"}
-            </button>
+            </UiButton>
           </div>
         </div>
       </div>

@@ -1,4 +1,8 @@
-import type { ChatSummary } from "../domain/chat";
+import type { ChatSummary, MemoryStrategy } from "../domain/chat";
+import { DropdownSelect } from "./DropdownSelect";
+import { FormField } from "./ui/FormField";
+import { PanelHeader } from "./ui/PanelHeader";
+import { UiButton } from "./ui/UiButton";
 
 type Props = {
   chats: ChatSummary[];
@@ -6,11 +10,21 @@ type Props = {
   isModelSettingsOpen: boolean;
   isSystemPromptOpen: boolean;
   activeModelLabel: string;
+  memoryStrategy: MemoryStrategy;
+  slidingWindowSize: string;
+  isStreaming: boolean;
+  memoryStrategyOptions: ReadonlyArray<{
+    value: MemoryStrategy;
+    label: string;
+    implemented: boolean;
+  }>;
   onCreateChat: () => void;
   onSelectChat: (chatId: string) => void;
   onDeleteChat: (chatId: string) => void;
   onOpenSystemPrompt: () => void;
   onOpenModelSettings: () => void;
+  onMemoryStrategyChange: (value: MemoryStrategy) => void;
+  onSlidingWindowSizeChange: (value: string) => void;
 };
 
 export function ChatSidebar(props: Props) {
@@ -20,21 +34,27 @@ export function ChatSidebar(props: Props) {
     isModelSettingsOpen,
     isSystemPromptOpen,
     activeModelLabel,
+    memoryStrategy,
+    slidingWindowSize,
+    isStreaming,
+    memoryStrategyOptions,
     onCreateChat,
     onSelectChat,
     onDeleteChat,
     onOpenSystemPrompt,
     onOpenModelSettings,
+    onMemoryStrategyChange,
+    onSlidingWindowSizeChange,
   } = props;
 
   return (
     <aside className="sidebar left-col">
-      <div className="panel-header">
-        <h2>Chats</h2>
-        <button onClick={onCreateChat} type="button">
-          New chat
-        </button>
-      </div>
+      <PanelHeader
+        as="h2"
+        variant="panel"
+        title="Chats"
+        actions={<UiButton onClick={onCreateChat}>New chat</UiButton>}
+      />
 
       <div className="chat-list">
         {chats.map((chat) => (
@@ -64,24 +84,58 @@ export function ChatSidebar(props: Props) {
       </div>
 
       <div className="left-footer">
+        <section className="memory-settings">
+          <p className="memory-settings-title">Memory strategy</p>
+          <FormField label="Strategy" htmlFor="memory-strategy-select">
+            <DropdownSelect
+              id="memory-strategy-select"
+              value={memoryStrategy}
+              onChange={(value) => onMemoryStrategyChange(value as MemoryStrategy)}
+              disabled={isStreaming}
+              options={memoryStrategyOptions.map((option) => ({
+                value: option.value,
+                label: option.label,
+                disabled: !option.implemented,
+              }))}
+            />
+          </FormField>
+          {memoryStrategy === "sliding_window" ? (
+            <FormField
+              label="Sliding window size (N)"
+              htmlFor="sliding-window-size-input"
+              hint="Only Sliding Window is implemented for now."
+            >
+              <input
+                id="sliding-window-size-input"
+                type="number"
+                min={1}
+                value={slidingWindowSize}
+                onChange={(event) => onSlidingWindowSizeChange(event.target.value)}
+                disabled={isStreaming}
+              />
+            </FormField>
+          ) : (
+            <p className="hint">History is sent in full.</p>
+          )}
+        </section>
         <div className="left-footer-buttons">
-          <button
+          <UiButton
             className="footer-control-button"
-            type="button"
+            fullWidth
             onClick={onOpenSystemPrompt}
             aria-expanded={isSystemPromptOpen}
           >
             <span>System prompt</span>
-          </button>
-          <button
+          </UiButton>
+          <UiButton
             className="footer-control-button"
-            type="button"
+            fullWidth
             onClick={onOpenModelSettings}
             aria-expanded={isModelSettingsOpen}
           >
             <span>⚙</span>
             <span>{activeModelLabel}</span>
-          </button>
+          </UiButton>
         </div>
       </div>
     </aside>

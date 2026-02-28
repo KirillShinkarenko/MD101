@@ -1,12 +1,15 @@
 export type Status = "idle" | "streaming" | "stopped" | "done" | "error";
 export type Role = "user" | "assistant";
 export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+export type MemoryStrategy = "none" | "sliding_window" | "sticky_facts" | "branching";
 
 export type ChatSummary = {
   id: string;
   title: string;
   model: string;
   systemPrompt: string;
+  memoryStrategy: MemoryStrategy;
+  slidingWindowSize: number;
   createdAt: number;
   updatedAt: number;
   lastMessagePreview: string | null;
@@ -70,6 +73,23 @@ export const MODEL_OPTIONS = [
 
 export const DEFAULT_MODEL = "gpt-5-mini";
 export const DEFAULT_SYSTEM_PROMPT = "You are a concise assistant.";
+export const DEFAULT_MEMORY_STRATEGY: MemoryStrategy = "none";
+export const DEFAULT_SLIDING_WINDOW_SIZE = 10;
+
+export const MEMORY_STRATEGY_OPTIONS = [
+  { value: "none", label: "None", implemented: true },
+  { value: "sliding_window", label: "Sliding Window", implemented: true },
+  {
+    value: "sticky_facts",
+    label: "Sticky Facts / Key-Value Memory (coming soon)",
+    implemented: false,
+  },
+  { value: "branching", label: "Branching (coming soon)", implemented: false },
+] as const satisfies ReadonlyArray<{
+  value: MemoryStrategy;
+  label: string;
+  implemented: boolean;
+}>;
 
 export const MODEL_TEMPERATURE_POLICY: Record<string, "never" | "always" | "reasoning_none_only"> = {
   "gpt-3.5-turbo": "always",
