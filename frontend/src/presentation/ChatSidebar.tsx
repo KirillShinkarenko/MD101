@@ -1,4 +1,4 @@
-import type { ChatSummary, MemoryStrategy } from "../domain/chat";
+import type { ChatSummary, MemoryStrategy, StickyFacts } from "../domain/chat";
 import { DropdownSelect } from "./DropdownSelect";
 import { FormField } from "./ui/FormField";
 import { PanelHeader } from "./ui/PanelHeader";
@@ -12,6 +12,8 @@ type Props = {
   activeModelLabel: string;
   memoryStrategy: MemoryStrategy;
   slidingWindowSize: string;
+  stickyWindowSize: string;
+  stickyFacts: StickyFacts;
   isStreaming: boolean;
   memoryStrategyOptions: ReadonlyArray<{
     value: MemoryStrategy;
@@ -25,6 +27,7 @@ type Props = {
   onOpenModelSettings: () => void;
   onMemoryStrategyChange: (value: MemoryStrategy) => void;
   onSlidingWindowSizeChange: (value: string) => void;
+  onStickyWindowSizeChange: (value: string) => void;
 };
 
 export function ChatSidebar(props: Props) {
@@ -36,6 +39,8 @@ export function ChatSidebar(props: Props) {
     activeModelLabel,
     memoryStrategy,
     slidingWindowSize,
+    stickyWindowSize,
+    stickyFacts,
     isStreaming,
     memoryStrategyOptions,
     onCreateChat,
@@ -45,7 +50,10 @@ export function ChatSidebar(props: Props) {
     onOpenModelSettings,
     onMemoryStrategyChange,
     onSlidingWindowSizeChange,
+    onStickyWindowSizeChange,
   } = props;
+
+  const stickyFactsPreview = JSON.stringify(stickyFacts, null, 2);
 
   return (
     <aside className="sidebar left-col">
@@ -103,7 +111,6 @@ export function ChatSidebar(props: Props) {
             <FormField
               label="Sliding window size (N)"
               htmlFor="sliding-window-size-input"
-              hint="Only Sliding Window is implemented for now."
             >
               <input
                 id="sliding-window-size-input"
@@ -114,9 +121,29 @@ export function ChatSidebar(props: Props) {
                 disabled={isStreaming}
               />
             </FormField>
-          ) : (
+          ) : null}
+          {memoryStrategy === "sticky_facts" ? (
+            <>
+              <FormField label="Recent messages (N)" htmlFor="sticky-window-size-input">
+                <input
+                  id="sticky-window-size-input"
+                  type="number"
+                  min={1}
+                  value={stickyWindowSize}
+                  onChange={(event) => onStickyWindowSizeChange(event.target.value)}
+                  disabled={isStreaming}
+                />
+              </FormField>
+              <FormField label="Current facts" htmlFor="sticky-facts-preview">
+                <pre id="sticky-facts-preview" className="sticky-facts-preview">
+                  {stickyFactsPreview}
+                </pre>
+              </FormField>
+            </>
+          ) : null}
+          {(memoryStrategy === "none" || memoryStrategy === "branching") ? (
             <p className="hint">History is sent in full.</p>
-          )}
+          ) : null}
         </section>
         <div className="left-footer-buttons">
           <UiButton

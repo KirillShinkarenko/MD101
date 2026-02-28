@@ -16,9 +16,32 @@ await app.register(cors, {
 
 type Role = "user" | "assistant";
 type MemoryStrategy = "none" | "sliding_window" | "sticky_facts" | "branching";
+type StickyFactKey = "goal" | "constraints" | "preferences" | "decisions" | "agreements";
+type StickyFacts = {
+  goal: string | null;
+  constraints: string[];
+  preferences: string[];
+  decisions: string[];
+  agreements: string[];
+};
 
 const DEFAULT_MEMORY_STRATEGY: MemoryStrategy = "none";
 const DEFAULT_SLIDING_WINDOW_SIZE = 10;
+const DEFAULT_STICKY_WINDOW_SIZE = 10;
+const STICKY_FACT_KEYS: StickyFactKey[] = [
+  "goal",
+  "constraints",
+  "preferences",
+  "decisions",
+  "agreements",
+];
+const EMPTY_STICKY_FACTS: StickyFacts = {
+  goal: null,
+  constraints: [],
+  preferences: [],
+  decisions: [],
+  agreements: [],
+};
 
 type ChatBody = {
   userPrompt?: string;
@@ -28,6 +51,7 @@ type ChatBody = {
   systemPrompt?: string;
   memoryStrategy?: string;
   slidingWindowSize?: number | string;
+  stickyWindowSize?: number | string;
 };
 
 type CreateChatBody = {
@@ -36,6 +60,7 @@ type CreateChatBody = {
   systemPrompt?: string;
   memoryStrategy?: string;
   slidingWindowSize?: number | string;
+  stickyWindowSize?: number | string;
 };
 
 type PatchChatBody = {
@@ -44,6 +69,7 @@ type PatchChatBody = {
   systemPrompt?: string;
   memoryStrategy?: string;
   slidingWindowSize?: number | string;
+  stickyWindowSize?: number | string;
 };
 
 type UsageSummary = {
@@ -64,6 +90,7 @@ type ModelApiProfile = {
 };
 
 const DEFAULT_MODEL = process.env.OPENAI_MODEL?.trim() || "gpt-5-mini";
+const OPENAI_FACTS_MODEL = process.env.OPENAI_FACTS_MODEL?.trim() || "gpt-4.1-nano";
 const NETWORK_ERROR_HINTS: Record<string, string> = {
   ENOTFOUND: "DNS lookup failed. Check internet connection or DNS settings.",
   ECONNRESET: "Network connection was reset while calling OpenAI.",
@@ -131,6 +158,7 @@ CREATE TABLE IF NOT EXISTS chats (
   system_prompt TEXT NOT NULL,
   memory_strategy TEXT NOT NULL DEFAULT 'none',
   sliding_window_size INTEGER NOT NULL DEFAULT 10,
+  sticky_window_size INTEGER NOT NULL DEFAULT 10,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -153,7 +181,17 @@ CREATE TABLE IF NOT EXISTS messages (
   FOREIGN KEY (chat_id) REFERENCES chats (id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS chat_facts (
+  chat_id TEXT NOT NULL,
+  fact_key TEXT NOT NULL CHECK (fact_key IN ('goal', 'constraints', 'preferences', 'decisions', 'agreements')),
+  fact_value TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (chat_id, fact_key),
+  FOREIGN KEY (chat_id) REFERENCES chats (id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_chat_id_created_at ON messages (chat_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_chat_facts_chat_id_updated_at ON chat_facts (chat_id, updated_at DESC);
 `);
 
 const chatColumns = db.prepare("PRAGMA table_info(chats)").all() as Array<{ name: string }>;
@@ -167,6 +205,11 @@ if (!chatColumnNames.has("memory_strategy")) {
 if (!chatColumnNames.has("sliding_window_size")) {
   db.exec(
     `ALTER TABLE chats ADD COLUMN sliding_window_size INTEGER NOT NULL DEFAULT ${DEFAULT_SLIDING_WINDOW_SIZE}`
+  );
+}
+if (!chatColumnNames.has("sticky_window_size")) {
+  db.exec(
+    `ALTER TABLE chats ADD COLUMN sticky_window_size INTEGER NOT NULL DEFAULT ${DEFAULT_STICKY_WINDOW_SIZE}`
   );
 }
 
@@ -234,8 +277,30 @@ const parseSlidingWindowSize = (value: unknown): number | undefined => {
   return parsed;
 };
 
+const parseStickyWindowSize = (value: unknown): number | undefined => {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  let parsed: number | undefined;
+  if (typeof value === "number") {
+    parsed = Number.isFinite(value) ? value : undefined;
+  } else if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    const nextParsed = Number(trimmed);
+    parsed = Number.isFinite(nextParsed) ? nextParsed : undefined;
+  }
+
+  if (parsed === undefined || !Number.isInteger(parsed) || parsed < 1) {
+    return undefined;
+  }
+  return parsed;
+};
+
 const ensureImplementedMemoryStrategy = (strategy: MemoryStrategy): string | null => {
-  if (strategy !== "none" && strategy !== "sliding_window") {
+  if (strategy !== "none" && strategy !== "sliding_window" && strategy !== "sticky_facts") {
     return `memoryStrategy '${strategy}' not implemented yet`;
   }
   return null;
@@ -304,6 +369,70 @@ const parseJsonSafe = (value: string): unknown => {
   } catch {
     return null;
   }
+};
+
+const createEmptyStickyFacts = (): StickyFacts => ({
+  goal: null,
+  constraints: [],
+  preferences: [],
+  decisions: [],
+  agreements: [],
+});
+
+const normalizeGoal = (value: unknown): string | null => {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  return trimmed || null;
+};
+
+const normalizeStickyList = (value: unknown): string[] => {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const normalized = value
+    .map((item) => (typeof item === "string" ? item.trim() : ""))
+    .filter((item) => item.length > 0);
+  return Array.from(new Set(normalized));
+};
+
+const normalizeStickyFacts = (value: unknown): StickyFacts | null => {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const candidate = value as Record<string, unknown>;
+  return {
+    goal: normalizeGoal(candidate.goal),
+    constraints: normalizeStickyList(candidate.constraints),
+    preferences: normalizeStickyList(candidate.preferences),
+    decisions: normalizeStickyList(candidate.decisions),
+    agreements: normalizeStickyList(candidate.agreements),
+  };
+};
+
+const parsePossiblyFencedJson = (value: string): unknown => {
+  const trimmed = value.trim();
+  const fencedMatch = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  const content = fencedMatch ? fencedMatch[1] : trimmed;
+  return parseJsonSafe(content);
+};
+
+const serializeStickyFactsForPrompt = (facts: StickyFacts): string => JSON.stringify(facts);
+
+const buildStickyFactsInstructions = (params: {
+  systemPrompt: string;
+  facts: StickyFacts;
+}): string => {
+  const sections = [
+    params.systemPrompt?.trim() || "",
+    [
+      "Persistent memory facts for this conversation.",
+      "Treat them as source of truth unless the user overrides them in the current message.",
+      serializeStickyFactsForPrompt(params.facts),
+    ].join("\n"),
+  ].filter(Boolean);
+  return sections.join("\n\n");
 };
 
 const isContextOverflowError = (params: { code?: string; type?: string; message?: string }): boolean => {
@@ -464,6 +593,67 @@ const estimateCostBreakdownUsd = (model: string, usageSummary: UsageSummary): Co
   };
 };
 
+const extractFactsTextFromResponse = (response: unknown): string => {
+  if (!response || typeof response !== "object") {
+    return "";
+  }
+  const candidate = response as { output_text?: unknown };
+  if (typeof candidate.output_text === "string" && candidate.output_text.trim()) {
+    return candidate.output_text;
+  }
+  return extractCompletedText(response);
+};
+
+const extractStickyFactsWithModel = async (params: {
+  userPrompt: string;
+  currentFacts: StickyFacts;
+  signal?: AbortSignal;
+}): Promise<StickyFacts | null> => {
+  const extractorBody = {
+    model: OPENAI_FACTS_MODEL,
+    stream: false,
+    truncation: "disabled",
+    instructions:
+      "Extract and update conversation memory facts. Return JSON only with keys goal, constraints, preferences, decisions, agreements. " +
+      "goal must be string or null. Other keys must be arrays of strings.",
+    input: [
+      {
+        role: "user",
+        content: [
+          "Current facts JSON:",
+          serializeStickyFactsForPrompt(params.currentFacts),
+          "",
+          "Latest user message:",
+          params.userPrompt,
+        ].join("\n"),
+      },
+    ],
+  };
+
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    signal: params.signal,
+    body: JSON.stringify(extractorBody),
+  });
+
+  if (!response.ok) {
+    const payloadText = await response.text();
+    throw new Error(`facts extractor failed (${response.status}): ${payloadText}`);
+  }
+
+  const payload = (await response.json()) as unknown;
+  const text = extractFactsTextFromResponse(payload);
+  if (!text.trim()) {
+    throw new Error("facts extractor returned empty response");
+  }
+  const parsed = parsePossiblyFencedJson(text);
+  return normalizeStickyFacts(parsed);
+};
+
 const buildOpenAiRequestBody = (params: {
   model: string;
   systemPrompt: string;
@@ -500,13 +690,17 @@ const applyMemoryStrategy = (params: {
   messages: Array<{ role: Role; content: string }>;
   memoryStrategy: MemoryStrategy;
   slidingWindowSize: number;
+  stickyWindowSize: number;
 }): Array<{ role: Role; content: string }> => {
-  const { messages, memoryStrategy, slidingWindowSize } = params;
+  const { messages, memoryStrategy, slidingWindowSize, stickyWindowSize } = params;
   if (memoryStrategy === "none") {
     return messages;
   }
   if (memoryStrategy === "sliding_window") {
     return messages.slice(-slidingWindowSize);
+  }
+  if (memoryStrategy === "sticky_facts") {
+    return messages.slice(-stickyWindowSize);
   }
   throw new Error(`memoryStrategy '${memoryStrategy}' not implemented yet`);
 };
@@ -519,6 +713,7 @@ const getChatStmt = db.prepare(`
     system_prompt AS systemPrompt,
     memory_strategy AS memoryStrategy,
     sliding_window_size AS slidingWindowSize,
+    sticky_window_size AS stickyWindowSize,
     created_at AS createdAt,
     updated_at AS updatedAt
   FROM chats
@@ -533,6 +728,7 @@ const listChatsStmt = db.prepare(`
     c.system_prompt AS systemPrompt,
     c.memory_strategy AS memoryStrategy,
     c.sliding_window_size AS slidingWindowSize,
+    c.sticky_window_size AS stickyWindowSize,
     c.created_at AS createdAt,
     c.updated_at AS updatedAt,
     (
@@ -567,14 +763,33 @@ const listMessagesStmt = db.prepare(`
   ORDER BY created_at ASC
 `);
 
+const listChatFactsStmt = db.prepare(`
+  SELECT
+    fact_key AS factKey,
+    fact_value AS factValue
+  FROM chat_facts
+  WHERE chat_id = ?
+`);
+
+const upsertChatFactStmt = db.prepare(`
+  INSERT INTO chat_facts (chat_id, fact_key, fact_value, updated_at)
+  VALUES (?, ?, ?, ?)
+  ON CONFLICT (chat_id, fact_key)
+  DO UPDATE SET
+    fact_value = excluded.fact_value,
+    updated_at = excluded.updated_at
+`);
+
 const insertChatStmt = db.prepare(`
-  INSERT INTO chats (id, title, model, system_prompt, memory_strategy, sliding_window_size, created_at, updated_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO chats (
+    id, title, model, system_prompt, memory_strategy, sliding_window_size, sticky_window_size, created_at, updated_at
+  )
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateChatStmt = db.prepare(`
   UPDATE chats
-  SET title = ?, model = ?, system_prompt = ?, memory_strategy = ?, sliding_window_size = ?, updated_at = ?
+  SET title = ?, model = ?, system_prompt = ?, memory_strategy = ?, sliding_window_size = ?, sticky_window_size = ?, updated_at = ?
   WHERE id = ?
 `);
 
@@ -591,22 +806,74 @@ const insertMessageStmt = db.prepare(`
 
 const updateChatUpdatedAtStmt = db.prepare(`UPDATE chats SET updated_at = ? WHERE id = ?`);
 
+const loadStickyFacts = (chatId: string): StickyFacts => {
+  const rows = listChatFactsStmt.all(chatId) as Array<{ factKey: string; factValue: string }>;
+  const facts = createEmptyStickyFacts();
+
+  for (const row of rows) {
+    const parsed = parseJsonSafe(row.factValue);
+    if (row.factKey === "goal") {
+      facts.goal = normalizeGoal(parsed);
+      continue;
+    }
+
+    if (row.factKey === "constraints") {
+      facts.constraints = normalizeStickyList(parsed);
+      continue;
+    }
+    if (row.factKey === "preferences") {
+      facts.preferences = normalizeStickyList(parsed);
+      continue;
+    }
+    if (row.factKey === "decisions") {
+      facts.decisions = normalizeStickyList(parsed);
+      continue;
+    }
+    if (row.factKey === "agreements") {
+      facts.agreements = normalizeStickyList(parsed);
+      continue;
+    }
+  }
+
+  return facts;
+};
+
+const saveStickyFacts = (chatId: string, facts: StickyFacts, updatedAt: number): void => {
+  const normalized = normalizeStickyFacts(facts) ?? EMPTY_STICKY_FACTS;
+  for (const factKey of STICKY_FACT_KEYS) {
+    upsertChatFactStmt.run(chatId, factKey, JSON.stringify(normalized[factKey]), updatedAt);
+  }
+};
+
 const createChat = (params?: {
   title?: string;
   model?: string;
   systemPrompt?: string;
   memoryStrategy?: string;
   slidingWindowSize?: number | string;
+  stickyWindowSize?: number | string;
 }) => {
   const now = Date.now();
   const id = createId();
   const title = params?.title?.trim() || "New chat";
   const model = parseModel(params?.model) ?? EFFECTIVE_DEFAULT_MODEL;
-  const systemPrompt = params?.systemPrompt?.trim() ?? "You are a concise assistant.";
+  const systemPrompt = params?.systemPrompt?.trim() ?? "";
   const memoryStrategy = parseMemoryStrategy(params?.memoryStrategy) ?? DEFAULT_MEMORY_STRATEGY;
   const slidingWindowSize =
     parseSlidingWindowSize(params?.slidingWindowSize) ?? DEFAULT_SLIDING_WINDOW_SIZE;
-  insertChatStmt.run(id, title, model, systemPrompt, memoryStrategy, slidingWindowSize, now, now);
+  const stickyWindowSize = parseStickyWindowSize(params?.stickyWindowSize) ?? DEFAULT_STICKY_WINDOW_SIZE;
+  insertChatStmt.run(
+    id,
+    title,
+    model,
+    systemPrompt,
+    memoryStrategy,
+    slidingWindowSize,
+    stickyWindowSize,
+    now,
+    now
+  );
+  saveStickyFacts(id, EMPTY_STICKY_FACTS, now);
   return getChatStmt.get(id);
 };
 
@@ -638,12 +905,20 @@ app.post<{ Body: CreateChatBody }>("/api/chats", async (request, reply) => {
     reply.code(400);
     return { error: "slidingWindowSize must be an integer >= 1" };
   }
+  const requestedStickyWindowSizeRaw = request.body?.stickyWindowSize;
+  const requestedStickyWindowSize = parseStickyWindowSize(requestedStickyWindowSizeRaw);
+  if (requestedStickyWindowSizeRaw !== undefined && requestedStickyWindowSize === undefined) {
+    reply.code(400);
+    return { error: "stickyWindowSize must be an integer >= 1" };
+  }
 
   const slidingWindowSize = requestedSlidingWindowSize ?? DEFAULT_SLIDING_WINDOW_SIZE;
+  const stickyWindowSize = requestedStickyWindowSize ?? DEFAULT_STICKY_WINDOW_SIZE;
   const chat = createChat({
     ...request.body,
     memoryStrategy,
     slidingWindowSize,
+    stickyWindowSize,
   });
   return { chat };
 });
@@ -659,16 +934,28 @@ app.get<{ Params: { id: string } }>("/api/chats/:id/messages", async (request, r
   return { messages };
 });
 
+app.get<{ Params: { id: string } }>("/api/chats/:id/facts", async (request, reply) => {
+  const chatId = request.params.id;
+  const chat = getChatStmt.get(chatId);
+  if (!chat) {
+    reply.code(404);
+    return { error: "chat not found" };
+  }
+  const facts = loadStickyFacts(chatId);
+  return { facts };
+});
+
 app.patch<{ Params: { id: string }; Body: PatchChatBody }>("/api/chats/:id", async (request, reply) => {
   const chatId = request.params.id;
   const chat = getChatStmt.get(chatId) as
-    | {
+      | {
         id: string;
         title: string;
         model: string;
         systemPrompt: string;
         memoryStrategy: MemoryStrategy;
         slidingWindowSize: number;
+        stickyWindowSize: number;
       }
     | undefined;
 
@@ -703,6 +990,15 @@ app.patch<{ Params: { id: string }; Body: PatchChatBody }>("/api/chats/:id", asy
   const persistedSlidingWindowSize =
     parseSlidingWindowSize(chat.slidingWindowSize) ?? DEFAULT_SLIDING_WINDOW_SIZE;
   const slidingWindowSize = requestedSlidingWindowSize ?? persistedSlidingWindowSize;
+  const requestedStickyWindowSizeRaw = request.body?.stickyWindowSize;
+  const requestedStickyWindowSize = parseStickyWindowSize(requestedStickyWindowSizeRaw);
+  if (requestedStickyWindowSizeRaw !== undefined && requestedStickyWindowSize === undefined) {
+    reply.code(400);
+    return { error: "stickyWindowSize must be an integer >= 1" };
+  }
+  const persistedStickyWindowSize =
+    parseStickyWindowSize(chat.stickyWindowSize) ?? DEFAULT_STICKY_WINDOW_SIZE;
+  const stickyWindowSize = requestedStickyWindowSize ?? persistedStickyWindowSize;
 
   if (!ALLOWED_MODELS.has(model)) {
     reply.code(400);
@@ -710,7 +1006,16 @@ app.patch<{ Params: { id: string }; Body: PatchChatBody }>("/api/chats/:id", asy
   }
 
   const nextTitle = title || "New chat";
-  updateChatStmt.run(nextTitle, model, systemPrompt, memoryStrategy, slidingWindowSize, Date.now(), chatId);
+  updateChatStmt.run(
+    nextTitle,
+    model,
+    systemPrompt,
+    memoryStrategy,
+    slidingWindowSize,
+    stickyWindowSize,
+    Date.now(),
+    chatId
+  );
   return { chat: getChatStmt.get(chatId) };
 });
 
@@ -733,13 +1038,14 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
 
   const chatId = request.params.id;
   const existingChat = getChatStmt.get(chatId) as
-    | {
+      | {
         id: string;
         title: string;
         model: string;
         systemPrompt: string;
         memoryStrategy: MemoryStrategy;
         slidingWindowSize: number;
+        stickyWindowSize: number;
       }
     | undefined;
 
@@ -766,6 +1072,11 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
   const persistedSlidingWindowSize =
     parseSlidingWindowSize(existingChat.slidingWindowSize) ?? DEFAULT_SLIDING_WINDOW_SIZE;
   const slidingWindowSize = requestedSlidingWindowSize ?? persistedSlidingWindowSize;
+  const requestedStickyWindowSizeRaw = request.body?.stickyWindowSize;
+  const requestedStickyWindowSize = parseStickyWindowSize(requestedStickyWindowSizeRaw);
+  const persistedStickyWindowSize =
+    parseStickyWindowSize(existingChat.stickyWindowSize) ?? DEFAULT_STICKY_WINDOW_SIZE;
+  const stickyWindowSize = requestedStickyWindowSize ?? persistedStickyWindowSize;
   const startedAt = Date.now();
 
   if (!userPrompt) {
@@ -793,6 +1104,10 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
   if (requestedSlidingWindowSizeRaw !== undefined && requestedSlidingWindowSize === undefined) {
     reply.code(400);
     return { error: "slidingWindowSize must be an integer >= 1" };
+  }
+  if (requestedStickyWindowSizeRaw !== undefined && requestedStickyWindowSize === undefined) {
+    reply.code(400);
+    return { error: "stickyWindowSize must be an integer >= 1" };
   }
 
   if (request.body?.temperature !== undefined && temperature === undefined) {
@@ -836,11 +1151,34 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
     role: item.role,
     content: item.content,
   }));
+  const existingFacts = loadStickyFacts(chatId);
+  let stickyFacts = existingFacts;
+  if (memoryStrategy === "sticky_facts") {
+    try {
+      const nextFacts = await extractStickyFactsWithModel({
+        userPrompt,
+        currentFacts: existingFacts,
+      });
+      if (nextFacts) {
+        stickyFacts = nextFacts;
+        saveStickyFacts(chatId, stickyFacts, Date.now());
+      } else {
+        app.log.warn({ chatId }, "facts extractor returned invalid structure; using existing facts");
+      }
+    } catch (error) {
+      app.log.warn({ err: error, chatId }, "facts extractor failed; using existing facts");
+    }
+  }
   const inputMessages = applyMemoryStrategy({
     messages: [...persistedMessages, { role: "user" as const, content: userPrompt }],
     memoryStrategy,
     slidingWindowSize,
+    stickyWindowSize,
   });
+  const effectiveSystemPrompt =
+    memoryStrategy === "sticky_facts"
+      ? buildStickyFactsInstructions({ systemPrompt, facts: stickyFacts })
+      : systemPrompt;
 
   const now = Date.now();
   updateChatStmt.run(
@@ -849,6 +1187,7 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
     systemPrompt,
     memoryStrategy,
     slidingWindowSize,
+    stickyWindowSize,
     now,
     chatId
   );
@@ -861,6 +1200,7 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
       systemPrompt,
       memoryStrategy,
       slidingWindowSize,
+      stickyWindowSize,
       now,
       chatId
     );
@@ -912,7 +1252,7 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
   try {
     const openaiRequestBody = buildOpenAiRequestBody({
       model,
-      systemPrompt,
+      systemPrompt: effectiveSystemPrompt,
       inputMessages,
       profile: modelProfile,
       reasoningEffort,

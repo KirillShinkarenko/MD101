@@ -11,7 +11,8 @@
 - стратегии памяти (пер-чат): переключатель в левой панели
   - `None` (по умолчанию): в OpenAI отправляется полная история
   - `Sliding Window` (реализовано): в OpenAI отправляются только последние `N` сообщений
-  - `Sticky Facts / Key-Value Memory` и `Branching` отображаются как `Coming soon`
+  - `Sticky Facts / Key-Value Memory` (реализовано): в OpenAI отправляются `facts` + последние `N` сообщений
+  - `Branching` отображается как `Coming soon`
 - чат с потоковым ответом (`Send` / `Stop`)
 - кнопка `Gen ~5k` для быстрого заполнения длинного промпта
 - копирование всего диалога в буфер обмена
@@ -106,17 +107,18 @@ npm run dev
 - `GET /health`
 - `GET /api/chats` - список чатов
 - `POST /api/chats` - создать чат
-- опциональные поля: `memoryStrategy`, `slidingWindowSize`
+- опциональные поля: `memoryStrategy`, `slidingWindowSize`, `stickyWindowSize`
 - `GET /api/chats/:id/messages` - история сообщений
-- `PATCH /api/chats/:id` - обновить чат (`title`, `model`, `systemPrompt`, `memoryStrategy`, `slidingWindowSize`)
+- `GET /api/chats/:id/facts` - текущие sticky facts (`goal`, `constraints`, `preferences`, `decisions`, `agreements`)
+- `PATCH /api/chats/:id` - обновить чат (`title`, `model`, `systemPrompt`, `memoryStrategy`, `slidingWindowSize`, `stickyWindowSize`)
 - `DELETE /api/chats/:id` - удалить чат
 - `POST /api/chats/:id/stream` - отправить сообщение и получить streaming-ответ
-  - опциональные поля: `memoryStrategy`, `slidingWindowSize`
+  - опциональные поля: `memoryStrategy`, `slidingWindowSize`, `stickyWindowSize`
 
 Примечание по стратегиям памяти:
 - по умолчанию используется `memoryStrategy=none` (полная история)
-- сейчас поддерживаются `none` и `sliding_window`
-- для `sticky_facts` и `branching` backend вернет `400 not implemented yet`
+- сейчас поддерживаются `none`, `sliding_window`, `sticky_facts`
+- для `branching` backend вернет `400 not implemented yet`
 - допустимые значения `memoryStrategy`: `none`, `sliding_window`, `sticky_facts`, `branching`
 
 SSE-события stream endpoint:

@@ -23,7 +23,7 @@ export function InspectorPanel(props: Props) {
 
   const inspectorRows =
     isRequestOpen && isResponseOpen
-      ? "minmax(0, 2fr) minmax(0, 1fr) auto"
+      ? "minmax(0, 1fr) minmax(0, 1fr) auto"
       : isRequestOpen
       ? "minmax(0, 1fr) auto auto"
       : isResponseOpen

@@ -10,9 +10,18 @@ export type ChatSummary = {
   systemPrompt: string;
   memoryStrategy: MemoryStrategy;
   slidingWindowSize: number;
+  stickyWindowSize: number;
   createdAt: number;
   updatedAt: number;
   lastMessagePreview: string | null;
+};
+
+export type StickyFacts = {
+  goal: string | null;
+  constraints: string[];
+  preferences: string[];
+  decisions: string[];
+  agreements: string[];
 };
 
 export type ChatMessage = {
@@ -72,18 +81,22 @@ export const MODEL_OPTIONS = [
 ] as const;
 
 export const DEFAULT_MODEL = "gpt-5-mini";
-export const DEFAULT_SYSTEM_PROMPT = "You are a concise assistant.";
+export const DEFAULT_SYSTEM_PROMPT = "";
 export const DEFAULT_MEMORY_STRATEGY: MemoryStrategy = "none";
 export const DEFAULT_SLIDING_WINDOW_SIZE = 10;
+export const DEFAULT_STICKY_WINDOW_SIZE = 10;
+export const EMPTY_STICKY_FACTS: StickyFacts = {
+  goal: null,
+  constraints: [],
+  preferences: [],
+  decisions: [],
+  agreements: [],
+};
 
 export const MEMORY_STRATEGY_OPTIONS = [
   { value: "none", label: "None", implemented: true },
   { value: "sliding_window", label: "Sliding Window", implemented: true },
-  {
-    value: "sticky_facts",
-    label: "Sticky Facts / Key-Value Memory (coming soon)",
-    implemented: false,
-  },
+  { value: "sticky_facts", label: "Sticky Facts / Key-Value Memory", implemented: true },
   { value: "branching", label: "Branching (coming soon)", implemented: false },
 ] as const satisfies ReadonlyArray<{
   value: MemoryStrategy;
