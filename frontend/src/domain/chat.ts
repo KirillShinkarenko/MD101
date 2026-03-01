@@ -11,6 +11,9 @@ export type ChatSummary = {
   memoryStrategy: MemoryStrategy;
   slidingWindowSize: number;
   stickyWindowSize: number;
+  branchFromChatId: string | null;
+  branchFromChatTitle: string | null;
+  branchCheckpointMessageCount: number | null;
   createdAt: number;
   updatedAt: number;
   lastMessagePreview: string | null;
@@ -83,8 +86,8 @@ export const MODEL_OPTIONS = [
 export const DEFAULT_MODEL = "gpt-5-mini";
 export const DEFAULT_SYSTEM_PROMPT = "";
 export const DEFAULT_MEMORY_STRATEGY: MemoryStrategy = "none";
-export const DEFAULT_SLIDING_WINDOW_SIZE = 10;
-export const DEFAULT_STICKY_WINDOW_SIZE = 10;
+export const DEFAULT_SLIDING_WINDOW_SIZE = 6;
+export const DEFAULT_STICKY_WINDOW_SIZE = 6;
 export const EMPTY_STICKY_FACTS: StickyFacts = {
   goal: null,
   constraints: [],
@@ -97,20 +100,12 @@ export const MEMORY_STRATEGY_OPTIONS = [
   { value: "none", label: "None", implemented: true },
   { value: "sliding_window", label: "Sliding Window", implemented: true },
   { value: "sticky_facts", label: "Sticky Facts / Key-Value Memory", implemented: true },
-  { value: "branching", label: "Branching (coming soon)", implemented: false },
+  { value: "branching", label: "Branching", implemented: true },
 ] as const satisfies ReadonlyArray<{
   value: MemoryStrategy;
   label: string;
   implemented: boolean;
 }>;
-
-export const MODEL_TEMPERATURE_POLICY: Record<string, "never" | "always" | "reasoning_none_only"> = {
-  "gpt-3.5-turbo": "always",
-  "gpt-4.1-nano": "always",
-  "gpt-5-mini": "never",
-  "gpt-5.1": "reasoning_none_only",
-  "gpt-5.2": "reasoning_none_only",
-};
 
 export const MODEL_REASONING_OPTIONS: Record<string, ReasoningEffort[]> = {
   "gpt-3.5-turbo": [],

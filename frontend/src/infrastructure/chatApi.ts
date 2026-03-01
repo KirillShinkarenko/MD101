@@ -73,6 +73,17 @@ export const chatApi = {
     return payload.chat;
   },
 
+  async branchChat(chatId: string): Promise<ChatSummary> {
+    const response = await fetch(`${API_BASE}/api/chats/${chatId}/branch`, {
+      method: "POST",
+    });
+    const payload = await readJson<{ chat?: ChatSummary; error?: string }>(response);
+    if (!response.ok || !payload?.chat) {
+      throw extractError(payload, "Failed to branch chat");
+    }
+    return payload.chat;
+  },
+
   async deleteChat(chatId: string): Promise<void> {
     const response = await fetch(`${API_BASE}/api/chats/${chatId}`, {
       method: "DELETE",
@@ -147,7 +158,6 @@ export const chatApi = {
       model: string;
       systemPrompt: string;
       reasoningEffort?: string;
-      temperature?: number;
       memoryStrategy?: MemoryStrategy;
       slidingWindowSize?: number;
       stickyWindowSize?: number;

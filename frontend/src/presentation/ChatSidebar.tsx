@@ -1,6 +1,7 @@
 import type { ChatSummary, MemoryStrategy, StickyFacts } from "../domain/chat";
 import { DropdownSelect } from "./DropdownSelect";
 import { FormField } from "./ui/FormField";
+import { NumberStepperInput } from "./ui/NumberStepperInput";
 import { PanelHeader } from "./ui/PanelHeader";
 import { UiButton } from "./ui/UiButton";
 
@@ -28,6 +29,7 @@ type Props = {
   onMemoryStrategyChange: (value: MemoryStrategy) => void;
   onSlidingWindowSizeChange: (value: string) => void;
   onStickyWindowSizeChange: (value: string) => void;
+  onBranchInNewChat: () => void;
 };
 
 export function ChatSidebar(props: Props) {
@@ -51,6 +53,7 @@ export function ChatSidebar(props: Props) {
     onMemoryStrategyChange,
     onSlidingWindowSizeChange,
     onStickyWindowSizeChange,
+    onBranchInNewChat,
   } = props;
 
   const stickyFactsPreview = JSON.stringify(stickyFacts, null, 2);
@@ -112,12 +115,11 @@ export function ChatSidebar(props: Props) {
               label="Sliding window size (N)"
               htmlFor="sliding-window-size-input"
             >
-              <input
+              <NumberStepperInput
                 id="sliding-window-size-input"
-                type="number"
                 min={1}
                 value={slidingWindowSize}
-                onChange={(event) => onSlidingWindowSizeChange(event.target.value)}
+                onChange={onSlidingWindowSizeChange}
                 disabled={isStreaming}
               />
             </FormField>
@@ -125,12 +127,11 @@ export function ChatSidebar(props: Props) {
           {memoryStrategy === "sticky_facts" ? (
             <>
               <FormField label="Recent messages (N)" htmlFor="sticky-window-size-input">
-                <input
+                <NumberStepperInput
                   id="sticky-window-size-input"
-                  type="number"
                   min={1}
                   value={stickyWindowSize}
-                  onChange={(event) => onStickyWindowSizeChange(event.target.value)}
+                  onChange={onStickyWindowSizeChange}
                   disabled={isStreaming}
                 />
               </FormField>
@@ -141,10 +142,19 @@ export function ChatSidebar(props: Props) {
               </FormField>
             </>
           ) : null}
-          {(memoryStrategy === "none" || memoryStrategy === "branching") ? (
+          {memoryStrategy === "none" ? (
             <p className="hint">History is sent in full.</p>
           ) : null}
+          {memoryStrategy === "branching" ? (
+            <>
+              <p className="hint">Branching uses full history and creates a copied chat branch.</p>
+              <UiButton onClick={onBranchInNewChat} disabled={isStreaming}>
+                Branch in new chat
+              </UiButton>
+            </>
+          ) : null}
         </section>
+        <div className="memory-settings-divider" aria-hidden="true" />
         <div className="left-footer-buttons">
           <UiButton
             className="footer-control-button"

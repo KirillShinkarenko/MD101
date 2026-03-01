@@ -26,8 +26,9 @@ type StickyFacts = {
 };
 
 const DEFAULT_MEMORY_STRATEGY: MemoryStrategy = "none";
-const DEFAULT_SLIDING_WINDOW_SIZE = 10;
-const DEFAULT_STICKY_WINDOW_SIZE = 10;
+const DEFAULT_SLIDING_WINDOW_SIZE = 6;
+const DEFAULT_STICKY_WINDOW_SIZE = 6;
+const BRANCH_CHAT_TITLE_PREFIX = "Ветка - ";
 const STICKY_FACT_KEYS: StickyFactKey[] = [
   "goal",
   "constraints",
@@ -45,7 +46,6 @@ const EMPTY_STICKY_FACTS: StickyFacts = {
 
 type ChatBody = {
   userPrompt?: string;
-  temperature?: number | string;
   model?: string;
   reasoningEffort?: string;
   systemPrompt?: string;
@@ -85,7 +85,6 @@ type CostBreakdownUsd = {
 };
 
 type ModelApiProfile = {
-  temperaturePolicy: "never" | "always" | "reasoning_none_only";
   reasoningEfforts: Array<"none" | "minimal" | "low" | "medium" | "high" | "xhigh">;
 };
 
@@ -109,23 +108,18 @@ const MODEL_PRICING_KEYS = Object.keys(MODEL_PRICING_PER_1M).sort((a, b) => b.le
 
 const MODEL_API_PROFILES: Record<string, ModelApiProfile> = {
   "gpt-3.5-turbo": {
-    temperaturePolicy: "always",
     reasoningEfforts: [],
   },
   "gpt-4.1-nano": {
-    temperaturePolicy: "always",
     reasoningEfforts: [],
   },
   "gpt-5-mini": {
-    temperaturePolicy: "never",
     reasoningEfforts: ["minimal", "low", "medium", "high"],
   },
   "gpt-5.1": {
-    temperaturePolicy: "reasoning_none_only",
     reasoningEfforts: ["none", "low", "medium", "high"],
   },
   "gpt-5.2": {
-    temperaturePolicy: "reasoning_none_only",
     reasoningEfforts: ["none", "low", "medium", "high", "xhigh"],
   },
 };
@@ -157,8 +151,11 @@ CREATE TABLE IF NOT EXISTS chats (
   model TEXT NOT NULL,
   system_prompt TEXT NOT NULL,
   memory_strategy TEXT NOT NULL DEFAULT 'none',
-  sliding_window_size INTEGER NOT NULL DEFAULT 10,
-  sticky_window_size INTEGER NOT NULL DEFAULT 10,
+  sliding_window_size INTEGER NOT NULL DEFAULT 6,
+  sticky_window_size INTEGER NOT NULL DEFAULT 6,
+  branch_from_chat_id TEXT,
+  branch_from_chat_title TEXT,
+  branch_checkpoint_message_count INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -212,24 +209,15 @@ if (!chatColumnNames.has("sticky_window_size")) {
     `ALTER TABLE chats ADD COLUMN sticky_window_size INTEGER NOT NULL DEFAULT ${DEFAULT_STICKY_WINDOW_SIZE}`
   );
 }
-
-const parseTemperature = (value: unknown): number | undefined => {
-  if (value === undefined || value === null) {
-    return undefined;
-  }
-  if (typeof value === "number") {
-    return Number.isFinite(value) ? value : undefined;
-  }
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (!trimmed) {
-      return undefined;
-    }
-    const parsed = Number(trimmed);
-    return Number.isFinite(parsed) ? parsed : undefined;
-  }
-  return undefined;
-};
+if (!chatColumnNames.has("branch_from_chat_id")) {
+  db.exec("ALTER TABLE chats ADD COLUMN branch_from_chat_id TEXT");
+}
+if (!chatColumnNames.has("branch_from_chat_title")) {
+  db.exec("ALTER TABLE chats ADD COLUMN branch_from_chat_title TEXT");
+}
+if (!chatColumnNames.has("branch_checkpoint_message_count")) {
+  db.exec("ALTER TABLE chats ADD COLUMN branch_checkpoint_message_count INTEGER");
+}
 
 const parseModel = (value: unknown): string | undefined => {
   if (typeof value !== "string") {
@@ -237,6 +225,11 @@ const parseModel = (value: unknown): string | undefined => {
   }
   const trimmed = value.trim();
   return trimmed || undefined;
+};
+
+const buildBranchChatTitle = (sourceTitle: string): string => {
+  const normalizedSource = sourceTitle.trim() || "New chat";
+  return `${BRANCH_CHAT_TITLE_PREFIX}${normalizedSource}`;
 };
 
 const parseMemoryStrategy = (value: unknown): MemoryStrategy | undefined => {
@@ -300,7 +293,12 @@ const parseStickyWindowSize = (value: unknown): number | undefined => {
 };
 
 const ensureImplementedMemoryStrategy = (strategy: MemoryStrategy): string | null => {
-  if (strategy !== "none" && strategy !== "sliding_window" && strategy !== "sticky_facts") {
+  if (
+    strategy !== "none" &&
+    strategy !== "sliding_window" &&
+    strategy !== "sticky_facts" &&
+    strategy !== "branching"
+  ) {
     return `memoryStrategy '${strategy}' not implemented yet`;
   }
   return null;
@@ -658,11 +656,9 @@ const buildOpenAiRequestBody = (params: {
   model: string;
   systemPrompt: string;
   inputMessages: Array<{ role: Role; content: string }>;
-  profile: ModelApiProfile;
   reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
-  temperature?: number;
 }): Record<string, unknown> => {
-  const { model, systemPrompt, inputMessages, temperature, profile, reasoningEffort } = params;
+  const { model, systemPrompt, inputMessages, reasoningEffort } = params;
   const body: Record<string, unknown> = {
     model,
     stream: true,
@@ -670,14 +666,6 @@ const buildOpenAiRequestBody = (params: {
     instructions: systemPrompt || undefined,
     input: inputMessages,
   };
-
-  const canUseTemperature =
-    profile.temperaturePolicy === "always" ||
-    (profile.temperaturePolicy === "reasoning_none_only" && reasoningEffort === "none");
-
-  if (canUseTemperature && temperature !== undefined) {
-    body.temperature = temperature;
-  }
 
   if (reasoningEffort !== undefined) {
     body.reasoning = { effort: reasoningEffort };
@@ -702,7 +690,10 @@ const applyMemoryStrategy = (params: {
   if (memoryStrategy === "sticky_facts") {
     return messages.slice(-stickyWindowSize);
   }
-  throw new Error(`memoryStrategy '${memoryStrategy}' not implemented yet`);
+  if (memoryStrategy === "branching") {
+    return messages;
+  }
+  throw new Error(`Unsupported memoryStrategy '${memoryStrategy}'`);
 };
 
 const getChatStmt = db.prepare(`
@@ -714,6 +705,9 @@ const getChatStmt = db.prepare(`
     memory_strategy AS memoryStrategy,
     sliding_window_size AS slidingWindowSize,
     sticky_window_size AS stickyWindowSize,
+    branch_from_chat_id AS branchFromChatId,
+    branch_from_chat_title AS branchFromChatTitle,
+    branch_checkpoint_message_count AS branchCheckpointMessageCount,
     created_at AS createdAt,
     updated_at AS updatedAt
   FROM chats
@@ -729,6 +723,9 @@ const listChatsStmt = db.prepare(`
     c.memory_strategy AS memoryStrategy,
     c.sliding_window_size AS slidingWindowSize,
     c.sticky_window_size AS stickyWindowSize,
+    c.branch_from_chat_id AS branchFromChatId,
+    c.branch_from_chat_title AS branchFromChatTitle,
+    c.branch_checkpoint_message_count AS branchCheckpointMessageCount,
     c.created_at AS createdAt,
     c.updated_at AS updatedAt,
     (
@@ -763,6 +760,24 @@ const listMessagesStmt = db.prepare(`
   ORDER BY created_at ASC
 `);
 
+const listMessagesForBranchStmt = db.prepare(`
+  SELECT
+    role,
+    content,
+    request_json AS requestJson,
+    response_json AS responseJson,
+    latency_ms AS latencyMs,
+    input_tokens AS inputTokens,
+    output_tokens AS outputTokens,
+    total_tokens AS totalTokens,
+    cost_usd AS costUsd,
+    input_cost_usd AS inputCostUsd,
+    output_cost_usd AS outputCostUsd
+  FROM messages
+  WHERE chat_id = ?
+  ORDER BY created_at ASC
+`);
+
 const listChatFactsStmt = db.prepare(`
   SELECT
     fact_key AS factKey,
@@ -782,14 +797,16 @@ const upsertChatFactStmt = db.prepare(`
 
 const insertChatStmt = db.prepare(`
   INSERT INTO chats (
-    id, title, model, system_prompt, memory_strategy, sliding_window_size, sticky_window_size, created_at, updated_at
+    id, title, model, system_prompt, memory_strategy, sliding_window_size, sticky_window_size,
+    branch_from_chat_id, branch_from_chat_title, branch_checkpoint_message_count, created_at, updated_at
   )
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateChatStmt = db.prepare(`
   UPDATE chats
-  SET title = ?, model = ?, system_prompt = ?, memory_strategy = ?, sliding_window_size = ?, sticky_window_size = ?, updated_at = ?
+  SET title = ?, model = ?, system_prompt = ?, memory_strategy = ?, sliding_window_size = ?, sticky_window_size = ?,
+      branch_from_chat_id = ?, branch_from_chat_title = ?, branch_checkpoint_message_count = ?, updated_at = ?
   WHERE id = ?
 `);
 
@@ -852,6 +869,9 @@ const createChat = (params?: {
   memoryStrategy?: string;
   slidingWindowSize?: number | string;
   stickyWindowSize?: number | string;
+  branchFromChatId?: string | null;
+  branchFromChatTitle?: string | null;
+  branchCheckpointMessageCount?: number | null;
 }) => {
   const now = Date.now();
   const id = createId();
@@ -862,6 +882,20 @@ const createChat = (params?: {
   const slidingWindowSize =
     parseSlidingWindowSize(params?.slidingWindowSize) ?? DEFAULT_SLIDING_WINDOW_SIZE;
   const stickyWindowSize = parseStickyWindowSize(params?.stickyWindowSize) ?? DEFAULT_STICKY_WINDOW_SIZE;
+  const branchFromChatId =
+    typeof params?.branchFromChatId === "string" && params.branchFromChatId.trim()
+      ? params.branchFromChatId.trim()
+      : null;
+  const branchFromChatTitle =
+    typeof params?.branchFromChatTitle === "string" && params.branchFromChatTitle.trim()
+      ? params.branchFromChatTitle.trim()
+      : null;
+  const branchCheckpointMessageCount =
+    typeof params?.branchCheckpointMessageCount === "number" &&
+    Number.isInteger(params.branchCheckpointMessageCount) &&
+    params.branchCheckpointMessageCount >= 0
+      ? params.branchCheckpointMessageCount
+      : null;
   insertChatStmt.run(
     id,
     title,
@@ -870,6 +904,9 @@ const createChat = (params?: {
     memoryStrategy,
     slidingWindowSize,
     stickyWindowSize,
+    branchFromChatId,
+    branchFromChatTitle,
+    branchCheckpointMessageCount,
     now,
     now
   );
@@ -948,7 +985,7 @@ app.get<{ Params: { id: string } }>("/api/chats/:id/facts", async (request, repl
 app.patch<{ Params: { id: string }; Body: PatchChatBody }>("/api/chats/:id", async (request, reply) => {
   const chatId = request.params.id;
   const chat = getChatStmt.get(chatId) as
-      | {
+    | {
         id: string;
         title: string;
         model: string;
@@ -956,6 +993,9 @@ app.patch<{ Params: { id: string }; Body: PatchChatBody }>("/api/chats/:id", asy
         memoryStrategy: MemoryStrategy;
         slidingWindowSize: number;
         stickyWindowSize: number;
+        branchFromChatId: string | null;
+        branchFromChatTitle: string | null;
+        branchCheckpointMessageCount: number | null;
       }
     | undefined;
 
@@ -1013,6 +1053,9 @@ app.patch<{ Params: { id: string }; Body: PatchChatBody }>("/api/chats/:id", asy
     memoryStrategy,
     slidingWindowSize,
     stickyWindowSize,
+    chat.branchFromChatId ?? null,
+    chat.branchFromChatTitle ?? null,
+    chat.branchCheckpointMessageCount ?? null,
     Date.now(),
     chatId
   );
@@ -1030,15 +1073,10 @@ app.delete<{ Params: { id: string } }>("/api/chats/:id", async (request, reply) 
   return { ok: true };
 });
 
-app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", async (request, reply) => {
-  if (!OPENAI_API_KEY) {
-    reply.code(500);
-    return { error: "OPENAI_API_KEY is not configured" };
-  }
-
-  const chatId = request.params.id;
-  const existingChat = getChatStmt.get(chatId) as
-      | {
+app.post<{ Params: { id: string } }>("/api/chats/:id/branch", async (request, reply) => {
+  const sourceChatId = request.params.id;
+  const sourceChat = getChatStmt.get(sourceChatId) as
+    | {
         id: string;
         title: string;
         model: string;
@@ -1049,13 +1087,97 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
       }
     | undefined;
 
+  if (!sourceChat) {
+    reply.code(404);
+    return { error: "chat not found" };
+  }
+
+  const sourceMessages = listMessagesForBranchStmt.all(sourceChatId) as Array<{
+    role: Role;
+    content: string;
+    requestJson: string | null;
+    responseJson: string | null;
+    latencyMs: number | null;
+    inputTokens: number | null;
+    outputTokens: number | null;
+    totalTokens: number | null;
+    costUsd: number | null;
+    inputCostUsd: number | null;
+    outputCostUsd: number | null;
+  }>;
+
+  const created = createChat({
+    title: buildBranchChatTitle(sourceChat.title),
+    model: sourceChat.model,
+    systemPrompt: sourceChat.systemPrompt,
+    memoryStrategy: sourceChat.memoryStrategy,
+    slidingWindowSize: sourceChat.slidingWindowSize,
+    stickyWindowSize: sourceChat.stickyWindowSize,
+    branchFromChatId: sourceChat.id,
+    branchFromChatTitle: sourceChat.title,
+    branchCheckpointMessageCount: sourceMessages.length,
+  }) as { id: string } | undefined;
+
+  if (!created) {
+    reply.code(500);
+    return { error: "failed to create branch chat" };
+  }
+
+  const baseTimestamp = Date.now();
+  sourceMessages.forEach((message, index) => {
+    insertMessageStmt.run(
+      createId(),
+      created.id,
+      message.role,
+      message.content,
+      message.requestJson,
+      message.responseJson,
+      message.latencyMs,
+      message.inputTokens,
+      message.outputTokens,
+      message.totalTokens,
+      message.costUsd,
+      message.inputCostUsd,
+      message.outputCostUsd,
+      baseTimestamp + index
+    );
+  });
+
+  const sourceFacts = loadStickyFacts(sourceChatId);
+  saveStickyFacts(created.id, sourceFacts, baseTimestamp);
+  updateChatUpdatedAtStmt.run(baseTimestamp + sourceMessages.length, created.id);
+
+  return { chat: getChatStmt.get(created.id) };
+});
+
+app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", async (request, reply) => {
+  if (!OPENAI_API_KEY) {
+    reply.code(500);
+    return { error: "OPENAI_API_KEY is not configured" };
+  }
+
+  const chatId = request.params.id;
+  const existingChat = getChatStmt.get(chatId) as
+    | {
+        id: string;
+        title: string;
+        model: string;
+        systemPrompt: string;
+        memoryStrategy: MemoryStrategy;
+        slidingWindowSize: number;
+        stickyWindowSize: number;
+        branchFromChatId: string | null;
+        branchFromChatTitle: string | null;
+        branchCheckpointMessageCount: number | null;
+      }
+    | undefined;
+
   if (!existingChat) {
     reply.code(404);
     return { error: "chat not found" };
   }
 
   const userPrompt = request.body?.userPrompt?.trim() ?? "";
-  const temperature = parseTemperature(request.body?.temperature);
   const requestedModel = parseModel(request.body?.model);
   const model = requestedModel ?? existingChat.model;
   const requestedReasoningEffortRaw = request.body?.reasoningEffort;
@@ -1108,30 +1230,6 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
   if (requestedStickyWindowSizeRaw !== undefined && requestedStickyWindowSize === undefined) {
     reply.code(400);
     return { error: "stickyWindowSize must be an integer >= 1" };
-  }
-
-  if (request.body?.temperature !== undefined && temperature === undefined) {
-    reply.code(400);
-    return { error: "temperature must be a valid number" };
-  }
-
-  if (temperature !== undefined && (temperature < 0 || temperature > 2)) {
-    reply.code(400);
-    return { error: "temperature must be between 0 and 2" };
-  }
-
-  if (modelProfile.temperaturePolicy === "never" && request.body?.temperature !== undefined) {
-    reply.code(400);
-    return { error: `temperature is not supported for model ${model}` };
-  }
-
-  if (
-    modelProfile.temperaturePolicy === "reasoning_none_only" &&
-    request.body?.temperature !== undefined &&
-    reasoningEffort !== "none"
-  ) {
-    reply.code(400);
-    return { error: `temperature for model ${model} is only supported when reasoningEffort=none` };
   }
 
   if (requestedReasoningEffortRaw !== undefined && reasoningEffort === undefined) {
@@ -1188,6 +1286,9 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
     memoryStrategy,
     slidingWindowSize,
     stickyWindowSize,
+    existingChat.branchFromChatId ?? null,
+    existingChat.branchFromChatTitle ?? null,
+    existingChat.branchCheckpointMessageCount ?? null,
     now,
     chatId
   );
@@ -1201,6 +1302,9 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
       memoryStrategy,
       slidingWindowSize,
       stickyWindowSize,
+      existingChat.branchFromChatId ?? null,
+      existingChat.branchFromChatTitle ?? null,
+      existingChat.branchCheckpointMessageCount ?? null,
       now,
       chatId
     );
@@ -1254,9 +1358,7 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
       model,
       systemPrompt: effectiveSystemPrompt,
       inputMessages,
-      profile: modelProfile,
       reasoningEffort,
-      temperature,
     });
 
     sendSse("debug_request", {

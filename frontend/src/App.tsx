@@ -33,12 +33,16 @@ function App() {
         onMemoryStrategyChange={(value) => void actions.handleMemoryStrategyChange(value)}
         onSlidingWindowSizeChange={(value) => void actions.handleSlidingWindowSizeChange(value)}
         onStickyWindowSizeChange={(value) => void actions.handleStickyWindowSizeChange(value)}
+        onBranchInNewChat={() => void actions.branchInNewChat()}
       />
 
       <ChatMainPanel
-        status={view.status}
         userPrompt={view.userPrompt}
         isStreaming={view.isStreaming}
+        isBranchAvailable={Boolean(view.activeChatId)}
+        branchFromChatId={view.branchFromChatId}
+        branchFromChatTitle={view.branchFromChatTitle}
+        branchCheckpointMessageCount={view.branchCheckpointMessageCount}
         currentContextTokens={view.currentContextTokens}
         maxContextTokens={view.maxContextTokens}
         formatNumber={view.formatNumber}
@@ -48,6 +52,8 @@ function App() {
         onPromptKeyDown={actions.handlePromptKeyDown}
         onMainAction={actions.handleMainAction}
         onOpenConversationInfo={() => actions.setIsConversationInfoOpen(true)}
+        onBranchInNewChat={() => void actions.branchInNewChat()}
+        onOpenBranchSource={actions.openBranchSourceChat}
       />
 
       <InspectorPanel
@@ -61,17 +67,13 @@ function App() {
       <ModelSettingsModal
         isOpen={view.isModelSettingsOpen}
         model={view.model}
-        temperature={view.temperature}
         reasoningEffort={view.reasoningEffort}
         isStreaming={view.isStreaming}
-        isTemperatureSupported={view.isTemperatureSupported}
         isReasoningSupported={view.isReasoningSupported}
-        temperaturePolicy={view.temperaturePolicy}
         reasoningOptions={view.reasoningOptions}
         modelOptions={[...MODEL_OPTIONS]}
         onClose={() => actions.setIsModelSettingsOpen(false)}
         onModelChange={(value) => void actions.handleModelChange(value)}
-        onTemperatureChange={actions.setTemperature}
         onReasoningEffortChange={actions.setReasoningEffort}
       />
 

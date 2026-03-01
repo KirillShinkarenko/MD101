@@ -10,7 +10,6 @@ import {
   MODEL_CONTEXT_WINDOW,
   MODEL_OPTIONS,
   MODEL_REASONING_OPTIONS,
-  MODEL_TEMPERATURE_POLICY,
   SYSTEM_PROMPT_STORAGE_KEY,
   type ChatMessage,
   type ChatSummary,
@@ -39,23 +38,6 @@ const loadStoredSystemPrompt = (): string => {
     return DEFAULT_SYSTEM_PROMPT;
   }
   return normalized;
-};
-
-const parseTemperature = (value: string): { value?: number; error?: string } => {
-  const trimmed = value.trim();
-  if (!trimmed) {
-    return {};
-  }
-
-  const parsed = Number(trimmed);
-  if (!Number.isFinite(parsed)) {
-    return { error: "Temperature must be a valid number." };
-  }
-  if (parsed < 0 || parsed > 2) {
-    return { error: "Temperature must be between 0 and 2." };
-  }
-
-  return { value: parsed };
 };
 
 const parseSlidingWindowSizeInput = (value: string): { value?: number; error?: string } => {
@@ -127,7 +109,6 @@ export function useChatController() {
 
   const [model, setModel] = useState(DEFAULT_MODEL);
   const [systemPrompt, setSystemPrompt] = useState(loadStoredSystemPrompt);
-  const [temperature, setTemperature] = useState("0.7");
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("low");
   const [memoryStrategy, setMemoryStrategy] = useState<MemoryStrategy>(DEFAULT_MEMORY_STRATEGY);
   const [slidingWindowSize, setSlidingWindowSize] = useState(String(DEFAULT_SLIDING_WINDOW_SIZE));
@@ -158,12 +139,8 @@ export function useChatController() {
   );
 
   const isStreaming = status === "streaming";
-  const temperaturePolicy = MODEL_TEMPERATURE_POLICY[model] ?? "always";
   const reasoningOptions = MODEL_REASONING_OPTIONS[model] ?? [];
   const isReasoningSupported = reasoningOptions.length > 0;
-  const isTemperatureSupported =
-    temperaturePolicy === "always" ||
-    (temperaturePolicy === "reasoning_none_only" && reasoningEffort === "none");
   const historyTotals = useMemo<HistoryTotals>(() => {
     return messages.reduce<HistoryTotals>(
       (acc, message) => {
@@ -346,6 +323,47 @@ export function useChatController() {
     [loadChats]
   );
 
+  const branchInNewChat = useCallback(async () => {
+    if (!activeChatId || isStreaming) {
+      return;
+    }
+
+    try {
+      const branched = await chatApi.branchChat(activeChatId);
+      setChats((prev) => [branched, ...prev.filter((chat) => chat.id !== branched.id)]);
+      selectChat(branched.id);
+      setModel(branched.model);
+      setMemoryStrategy(branched.memoryStrategy);
+      setSlidingWindowSize(String(branched.slidingWindowSize));
+      setStickyWindowSize(String(branched.stickyWindowSize));
+      setErrorText("");
+      setStatus("idle");
+      await loadMessages(branched.id);
+      await loadFacts(branched.id);
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : "Failed to branch chat");
+      setStatus("error");
+    }
+  }, [activeChatId, isStreaming, loadFacts, loadMessages, selectChat]);
+
+  const openBranchSourceChat = useCallback(
+    (sourceChatId: string) => {
+      if (!sourceChatId) {
+        return;
+      }
+      const hasSource = chats.some((chat) => chat.id === sourceChatId);
+      if (!hasSource) {
+        setErrorText("Source chat is not available.");
+        setStatus("error");
+        return;
+      }
+      selectChat(sourceChatId);
+      setErrorText("");
+      setStatus("idle");
+    },
+    [chats, selectChat]
+  );
+
   const patchChat = useCallback(
     async (
       chatId: string,
@@ -457,13 +475,6 @@ export function useChatController() {
     if (!activeChatId || isStreaming || !userPrompt.trim()) {
       return;
     }
-
-    const parsedTemperature = parseTemperature(temperature);
-    if (parsedTemperature.error) {
-      setErrorText(parsedTemperature.error);
-      setStatus("error");
-      return;
-    }
     let nextSlidingWindowSize: number | undefined;
     let nextStickyWindowSize: number | undefined;
     if (memoryStrategy === "sliding_window") {
@@ -544,7 +555,6 @@ export function useChatController() {
           model,
           systemPrompt,
           reasoningEffort: isReasoningSupported ? reasoningEffort : undefined,
-          temperature: isTemperatureSupported ? parsedTemperature.value : undefined,
           memoryStrategy,
           slidingWindowSize: nextSlidingWindowSize,
           stickyWindowSize: nextStickyWindowSize,
@@ -770,7 +780,6 @@ export function useChatController() {
     activeChatId,
     isStreaming,
     isReasoningSupported,
-    isTemperatureSupported,
     loadChats,
     loadFacts,
     loadMessages,
@@ -780,7 +789,6 @@ export function useChatController() {
     systemPrompt,
     slidingWindowSize,
     stickyWindowSize,
-    temperature,
     userPrompt,
   ]);
 
@@ -874,12 +882,14 @@ export function useChatController() {
       errorText,
       model,
       systemPrompt,
-      temperature,
       reasoningEffort,
       memoryStrategy,
       slidingWindowSize,
       stickyWindowSize,
       stickyFacts,
+      branchFromChatId: activeChat?.branchFromChatId ?? null,
+      branchFromChatTitle: activeChat?.branchFromChatTitle ?? null,
+      branchCheckpointMessageCount: activeChat?.branchCheckpointMessageCount ?? null,
       metrics,
       requestRaw,
       responseRaw,
@@ -890,10 +900,8 @@ export function useChatController() {
       fullScreenView,
       activeModelLabel,
       isStreaming,
-      temperaturePolicy,
       reasoningOptions,
       isReasoningSupported,
-      isTemperatureSupported,
       historyTotals,
       turnRows,
       currentContextTokens,
@@ -905,7 +913,6 @@ export function useChatController() {
     actions: {
       setUserPrompt,
       setSystemPrompt,
-      setTemperature,
       setReasoningEffort,
       handleMemoryStrategyChange,
       handleSlidingWindowSizeChange,
@@ -915,8 +922,10 @@ export function useChatController() {
       setIsConversationInfoOpen,
       setFullScreenView,
       createChat,
+      branchInNewChat,
       deleteChat,
       selectChat,
+      openBranchSourceChat,
       handleModelChange,
       handleMainAction,
       handlePromptKeyDown,

@@ -7,12 +7,14 @@
 - мультичат: список, создание, удаление, переключение
 - автогенерация названия нового чата по первому сообщению
 - глобальный `System prompt` (модалка)
-- выбор модели и параметров (`reasoning effort`, `temperature` с валидацией)
+- выбор модели и параметров (`reasoning effort`)
 - стратегии памяти (пер-чат): переключатель в левой панели
   - `None` (по умолчанию): в OpenAI отправляется полная история
   - `Sliding Window` (реализовано): в OpenAI отправляются только последние `N` сообщений
   - `Sticky Facts / Key-Value Memory` (реализовано): в OpenAI отправляются `facts` + последние `N` сообщений
-  - `Branching` отображается как `Coming soon`
+- `Branching` (реализовано): в runtime используется полная история, а ветка создается через `Branch in new chat`
+- ответвление чата: кнопка `Branch in new chat` создает полную копию диалога с заголовком `Ветка - ...`
+  - в новом чате хранится checkpoint ветвления, разделитель `Ответвление от [название]` показывается в точке ветвления и ведет в исходный чат
 - чат с потоковым ответом (`Send` / `Stop`)
 - кнопка `Gen ~5k` для быстрого заполнения длинного промпта
 - копирование всего диалога в буфер обмена
@@ -97,11 +99,6 @@ npm run dev
 - `gpt-5.1`
 - `gpt-5.2`
 
-Ограничения:
-
-- для `gpt-5-mini` `temperature` не поддерживается
-- для `gpt-5.1` и `gpt-5.2` `temperature` доступен только при `reasoningEffort=none`
-
 ## API backend
 
 - `GET /health`
@@ -112,13 +109,14 @@ npm run dev
 - `GET /api/chats/:id/facts` - текущие sticky facts (`goal`, `constraints`, `preferences`, `decisions`, `agreements`)
 - `PATCH /api/chats/:id` - обновить чат (`title`, `model`, `systemPrompt`, `memoryStrategy`, `slidingWindowSize`, `stickyWindowSize`)
 - `DELETE /api/chats/:id` - удалить чат
+- `POST /api/chats/:id/branch` - создать новую ветку как копию чата
 - `POST /api/chats/:id/stream` - отправить сообщение и получить streaming-ответ
   - опциональные поля: `memoryStrategy`, `slidingWindowSize`, `stickyWindowSize`
 
 Примечание по стратегиям памяти:
 - по умолчанию используется `memoryStrategy=none` (полная история)
-- сейчас поддерживаются `none`, `sliding_window`, `sticky_facts`
-- для `branching` backend вернет `400 not implemented yet`
+- сейчас поддерживаются `none`, `sliding_window`, `sticky_facts`, `branching`
+- `branching` в runtime эквивалентен полной истории (как `none`)
 - допустимые значения `memoryStrategy`: `none`, `sliding_window`, `sticky_facts`, `branching`
 
 SSE-события stream endpoint:
