@@ -127,6 +127,11 @@ export function useChatController() {
 
   const controllerRef = useRef<AbortController | null>(null);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
+  const modelRef = useRef(model);
+
+  useEffect(() => {
+    modelRef.current = model;
+  }, [model]);
 
   const activeChat = useMemo(
     () => chats.find((chat) => chat.id === activeChatId) ?? null,
@@ -269,7 +274,7 @@ export function useChatController() {
     const listed = await chatApi.listChats();
 
     if (listed.length === 0) {
-      const created = await chatApi.createChat({ model });
+      const created = await chatApi.createChat({ model: modelRef.current });
       setChats([created]);
       selectChat(created.id);
       setModel(created.model);
@@ -297,7 +302,7 @@ export function useChatController() {
     setStickyWindowSize(String(selected.stickyWindowSize));
     await loadMessages(selected.id);
     await loadFacts(selected.id);
-  }, [activeChatId, loadFacts, loadMessages, model, selectChat]);
+  }, [activeChatId, loadFacts, loadMessages, selectChat]);
 
   const createChat = useCallback(async () => {
     const chat = await chatApi.createChat({ model });
@@ -811,24 +816,6 @@ export function useChatController() {
     [sendMessage]
   );
 
-  const copyConversationText = useCallback(async () => {
-    const transcript = messages
-      .map((message) => `${message.role === "user" ? "You" : "Assistant"}:\n${message.content}`)
-      .join("\n\n");
-
-    if (!transcript.trim()) {
-      setErrorText("No messages to copy.");
-      return;
-    }
-
-    try {
-      await navigator.clipboard.writeText(transcript);
-    } catch {
-      setErrorText("Failed to copy conversation text.");
-      setStatus("error");
-    }
-  }, [messages]);
-
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages]);
@@ -929,7 +916,6 @@ export function useChatController() {
       handleModelChange,
       handleMainAction,
       handlePromptKeyDown,
-      copyConversationText,
     },
   };
 }

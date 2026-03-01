@@ -127,6 +127,15 @@ const MODEL_API_PROFILES: Record<string, ModelApiProfile> = {
 const ALLOWED_MODELS = new Set(Object.keys(MODEL_API_PROFILES));
 const EFFECTIVE_DEFAULT_MODEL = ALLOWED_MODELS.has(DEFAULT_MODEL) ? DEFAULT_MODEL : "gpt-5-mini";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const MODEL_VALIDATION_ERROR = `model must be one of: ${Array.from(ALLOWED_MODELS).join(", ")}`;
+
+const parseAllowedModel = (value: unknown): string | undefined => {
+  const parsed = parseModel(value);
+  if (!parsed) {
+    return undefined;
+  }
+  return ALLOWED_MODELS.has(parsed) ? parsed : undefined;
+};
 
 if (!OPENAI_API_KEY) {
   app.log.warn("OPENAI_API_KEY is not set. Requests will fail until it is configured.");
@@ -248,7 +257,7 @@ const parseMemoryStrategy = (value: unknown): MemoryStrategy | undefined => {
   return undefined;
 };
 
-const parseSlidingWindowSize = (value: unknown): number | undefined => {
+const parsePositiveInt = (value: unknown): number | undefined => {
   if (value === undefined || value === null) {
     return undefined;
   }
@@ -270,27 +279,8 @@ const parseSlidingWindowSize = (value: unknown): number | undefined => {
   return parsed;
 };
 
-const parseStickyWindowSize = (value: unknown): number | undefined => {
-  if (value === undefined || value === null) {
-    return undefined;
-  }
-  let parsed: number | undefined;
-  if (typeof value === "number") {
-    parsed = Number.isFinite(value) ? value : undefined;
-  } else if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (!trimmed) {
-      return undefined;
-    }
-    const nextParsed = Number(trimmed);
-    parsed = Number.isFinite(nextParsed) ? nextParsed : undefined;
-  }
-
-  if (parsed === undefined || !Number.isInteger(parsed) || parsed < 1) {
-    return undefined;
-  }
-  return parsed;
-};
+const parseSlidingWindowSize = (value: unknown): number | undefined => parsePositiveInt(value);
+const parseStickyWindowSize = (value: unknown): number | undefined => parsePositiveInt(value);
 
 const ensureImplementedMemoryStrategy = (strategy: MemoryStrategy): string | null => {
   if (
@@ -876,7 +866,7 @@ const createChat = (params?: {
   const now = Date.now();
   const id = createId();
   const title = params?.title?.trim() || "New chat";
-  const model = parseModel(params?.model) ?? EFFECTIVE_DEFAULT_MODEL;
+  const model = parseAllowedModel(params?.model) ?? EFFECTIVE_DEFAULT_MODEL;
   const systemPrompt = params?.systemPrompt?.trim() ?? "";
   const memoryStrategy = parseMemoryStrategy(params?.memoryStrategy) ?? DEFAULT_MEMORY_STRATEGY;
   const slidingWindowSize =
@@ -922,6 +912,13 @@ app.get("/api/chats", async () => {
 });
 
 app.post<{ Body: CreateChatBody }>("/api/chats", async (request, reply) => {
+  const requestedModelRaw = request.body?.model;
+  const requestedModel = parseAllowedModel(requestedModelRaw);
+  if (requestedModelRaw !== undefined && requestedModel === undefined) {
+    reply.code(400);
+    return { error: MODEL_VALIDATION_ERROR };
+  }
+
   const requestedMemoryStrategyRaw = request.body?.memoryStrategy;
   const requestedMemoryStrategy = parseMemoryStrategy(requestedMemoryStrategyRaw);
   if (requestedMemoryStrategyRaw !== undefined && requestedMemoryStrategy === undefined) {
@@ -953,6 +950,7 @@ app.post<{ Body: CreateChatBody }>("/api/chats", async (request, reply) => {
   const stickyWindowSize = requestedStickyWindowSize ?? DEFAULT_STICKY_WINDOW_SIZE;
   const chat = createChat({
     ...request.body,
+    model: requestedModel,
     memoryStrategy,
     slidingWindowSize,
     stickyWindowSize,
@@ -1005,7 +1003,13 @@ app.patch<{ Params: { id: string }; Body: PatchChatBody }>("/api/chats/:id", asy
   }
 
   const title = typeof request.body?.title === "string" ? request.body.title.trim() : chat.title;
-  const model = parseModel(request.body?.model) ?? chat.model;
+  const requestedModelRaw = request.body?.model;
+  const requestedModel = parseAllowedModel(requestedModelRaw);
+  if (requestedModelRaw !== undefined && requestedModel === undefined) {
+    reply.code(400);
+    return { error: MODEL_VALIDATION_ERROR };
+  }
+  const model = requestedModel ?? chat.model;
   const systemPrompt =
     typeof request.body?.systemPrompt === "string" ? request.body.systemPrompt : chat.systemPrompt;
   const requestedMemoryStrategyRaw = request.body?.memoryStrategy;
@@ -1042,7 +1046,7 @@ app.patch<{ Params: { id: string }; Body: PatchChatBody }>("/api/chats/:id", asy
 
   if (!ALLOWED_MODELS.has(model)) {
     reply.code(400);
-    return { error: `model must be one of: ${Array.from(ALLOWED_MODELS).join(", ")}` };
+    return { error: MODEL_VALIDATION_ERROR };
   }
 
   const nextTitle = title || "New chat";
@@ -1106,48 +1110,62 @@ app.post<{ Params: { id: string } }>("/api/chats/:id/branch", async (request, re
     outputCostUsd: number | null;
   }>;
 
-  const created = createChat({
-    title: buildBranchChatTitle(sourceChat.title),
-    model: sourceChat.model,
-    systemPrompt: sourceChat.systemPrompt,
-    memoryStrategy: sourceChat.memoryStrategy,
-    slidingWindowSize: sourceChat.slidingWindowSize,
-    stickyWindowSize: sourceChat.stickyWindowSize,
-    branchFromChatId: sourceChat.id,
-    branchFromChatTitle: sourceChat.title,
-    branchCheckpointMessageCount: sourceMessages.length,
-  }) as { id: string } | undefined;
+  const baseTimestamp = Date.now();
+  let createdChatId = "";
+  try {
+    db.exec("BEGIN");
+    const created = createChat({
+      title: buildBranchChatTitle(sourceChat.title),
+      model: sourceChat.model,
+      systemPrompt: sourceChat.systemPrompt,
+      memoryStrategy: sourceChat.memoryStrategy,
+      slidingWindowSize: sourceChat.slidingWindowSize,
+      stickyWindowSize: sourceChat.stickyWindowSize,
+      branchFromChatId: sourceChat.id,
+      branchFromChatTitle: sourceChat.title,
+      branchCheckpointMessageCount: sourceMessages.length,
+    }) as { id: string } | undefined;
 
-  if (!created) {
+    if (!created?.id) {
+      throw new Error("failed to create branch chat");
+    }
+
+    createdChatId = created.id;
+    sourceMessages.forEach((message, index) => {
+      insertMessageStmt.run(
+        createId(),
+        createdChatId,
+        message.role,
+        message.content,
+        message.requestJson,
+        message.responseJson,
+        message.latencyMs,
+        message.inputTokens,
+        message.outputTokens,
+        message.totalTokens,
+        message.costUsd,
+        message.inputCostUsd,
+        message.outputCostUsd,
+        baseTimestamp + index
+      );
+    });
+
+    const sourceFacts = loadStickyFacts(sourceChatId);
+    saveStickyFacts(createdChatId, sourceFacts, baseTimestamp);
+    updateChatUpdatedAtStmt.run(baseTimestamp + sourceMessages.length, createdChatId);
+    db.exec("COMMIT");
+  } catch (error) {
+    try {
+      db.exec("ROLLBACK");
+    } catch (rollbackError) {
+      app.log.error({ err: rollbackError, sourceChatId }, "failed to rollback branch chat transaction");
+    }
+    app.log.error({ err: error, sourceChatId }, "failed to create branch chat");
     reply.code(500);
     return { error: "failed to create branch chat" };
   }
 
-  const baseTimestamp = Date.now();
-  sourceMessages.forEach((message, index) => {
-    insertMessageStmt.run(
-      createId(),
-      created.id,
-      message.role,
-      message.content,
-      message.requestJson,
-      message.responseJson,
-      message.latencyMs,
-      message.inputTokens,
-      message.outputTokens,
-      message.totalTokens,
-      message.costUsd,
-      message.inputCostUsd,
-      message.outputCostUsd,
-      baseTimestamp + index
-    );
-  });
-
-  const sourceFacts = loadStickyFacts(sourceChatId);
-  saveStickyFacts(created.id, sourceFacts, baseTimestamp);
-  updateChatUpdatedAtStmt.run(baseTimestamp + sourceMessages.length, created.id);
-
-  return { chat: getChatStmt.get(created.id) };
+  return { chat: getChatStmt.get(createdChatId) };
 });
 
 app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", async (request, reply) => {
@@ -1178,7 +1196,12 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
   }
 
   const userPrompt = request.body?.userPrompt?.trim() ?? "";
-  const requestedModel = parseModel(request.body?.model);
+  const requestedModelRaw = request.body?.model;
+  const requestedModel = parseAllowedModel(requestedModelRaw);
+  if (requestedModelRaw !== undefined && requestedModel === undefined) {
+    reply.code(400);
+    return { error: MODEL_VALIDATION_ERROR };
+  }
   const model = requestedModel ?? existingChat.model;
   const requestedReasoningEffortRaw = request.body?.reasoningEffort;
   const reasoningEffort = parseReasoningEffort(requestedReasoningEffortRaw);
@@ -1208,7 +1231,7 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
 
   if (!ALLOWED_MODELS.has(model)) {
     reply.code(400);
-    return { error: `model must be one of: ${Array.from(ALLOWED_MODELS).join(", ")}` };
+    return { error: MODEL_VALIDATION_ERROR };
   }
 
   const modelProfile = MODEL_API_PROFILES[model];
