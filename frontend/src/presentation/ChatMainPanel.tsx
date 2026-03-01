@@ -171,8 +171,10 @@ export function ChatMainPanel(props: Props) {
         {messages.length === 0 ? <p className="empty">Start a conversation...</p> : null}
         {messages.map((message, index) => (
           <Fragment key={message.id}>
-            <article className={`bubble ${message.role}`}>
-              <p className="content">{message.content || "..."}</p>
+            <article className={`message-row role-${message.role}`}>
+              <div className={`message-surface is-${message.role}`}>
+                <p className="content">{message.content || "..."}</p>
+              </div>
             </article>
             {dividerPlacement === "between" && dividerAfterIndex === index
               ? renderBranchDivider(`branch-divider-between-${message.id}`)

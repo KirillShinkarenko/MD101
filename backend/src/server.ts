@@ -36,6 +36,12 @@ const STICKY_FACT_KEYS: StickyFactKey[] = [
   "decisions",
   "agreements",
 ];
+const STICKY_LIST_KEYS: Array<Exclude<StickyFactKey, "goal">> = [
+  "constraints",
+  "preferences",
+  "decisions",
+  "agreements",
+];
 const EMPTY_STICKY_FACTS: StickyFacts = {
   goal: null,
   constraints: [],
@@ -386,7 +392,7 @@ const normalizeStickyList = (value: unknown): string[] => {
 };
 
 const normalizeStickyFacts = (value: unknown): StickyFacts | null => {
-  if (!value || typeof value !== "object") {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
   }
   const candidate = value as Record<string, unknown>;
@@ -399,6 +405,79 @@ const normalizeStickyFacts = (value: unknown): StickyFacts | null => {
   };
 };
 
+const parseStrictStickyFacts = (
+  value: unknown
+):
+  | {
+      facts: StickyFacts;
+      invalidReason: null;
+      invalidKeys: string[];
+    }
+  | {
+      facts: null;
+      invalidReason: string;
+      invalidKeys: string[];
+    } => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {
+      facts: null,
+      invalidReason: "payload must be an object",
+      invalidKeys: [],
+    };
+  }
+  const candidate = value as Record<string, unknown>;
+  const missingKeys = STICKY_FACT_KEYS.filter((factKey) => !Object.hasOwn(candidate, factKey));
+  if (missingKeys.length > 0) {
+    return {
+      facts: null,
+      invalidReason: "missing required keys",
+      invalidKeys: missingKeys,
+    };
+  }
+
+  const goal = candidate.goal;
+  if (goal !== null && typeof goal !== "string") {
+    return {
+      facts: null,
+      invalidReason: "goal must be string or null",
+      invalidKeys: ["goal"],
+    };
+  }
+
+  const facts: StickyFacts = {
+    goal,
+    constraints: [],
+    preferences: [],
+    decisions: [],
+    agreements: [],
+  };
+
+  for (const factKey of STICKY_LIST_KEYS) {
+    const raw = candidate[factKey];
+    if (!Array.isArray(raw)) {
+      return {
+        facts: null,
+        invalidReason: `${factKey} must be string[]`,
+        invalidKeys: [factKey],
+      };
+    }
+    if (!raw.every((item) => typeof item === "string")) {
+      return {
+        facts: null,
+        invalidReason: `${factKey} must contain only strings`,
+        invalidKeys: [factKey],
+      };
+    }
+    facts[factKey] = raw;
+  }
+
+  return {
+    facts,
+    invalidReason: null,
+    invalidKeys: [],
+  };
+};
+
 const parsePossiblyFencedJson = (value: string): unknown => {
   const trimmed = value.trim();
   const fencedMatch = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
@@ -407,6 +486,8 @@ const parsePossiblyFencedJson = (value: string): unknown => {
 };
 
 const serializeStickyFactsForPrompt = (facts: StickyFacts): string => JSON.stringify(facts);
+const serializeContextMessagesForPrompt = (messages: Array<{ role: Role; content: string }>): string =>
+  JSON.stringify(messages);
 
 const buildStickyFactsInstructions = (params: {
   systemPrompt: string;
@@ -593,7 +674,9 @@ const extractFactsTextFromResponse = (response: unknown): string => {
 };
 
 const extractStickyFactsWithModel = async (params: {
-  userPrompt: string;
+  chatId: string;
+  systemPrompt: string;
+  contextMessages: Array<{ role: Role; content: string }>;
   currentFacts: StickyFacts;
   signal?: AbortSignal;
 }): Promise<StickyFacts | null> => {
@@ -601,9 +684,46 @@ const extractStickyFactsWithModel = async (params: {
     model: OPENAI_FACTS_MODEL,
     stream: false,
     truncation: "disabled",
-    instructions:
-      "Extract and update conversation memory facts. Return JSON only with keys goal, constraints, preferences, decisions, agreements. " +
-      "goal must be string or null. Other keys must be arrays of strings.",
+    instructions: [
+      "You are a conversation state update engine.",
+      "",
+      "Input:",
+      "1) conversation (recent messages, oldest to newest)",
+      "2) previous_facts (JSON object; may be empty {})",
+      "",
+      "Task:",
+      "Return updated facts as a FULL JSON object.",
+      "",
+      "Output rules (strict):",
+      "1) Return ONLY valid JSON.",
+      "2) Top-level keys must be EXACTLY:",
+      "   - goal",
+      "   - constraints",
+      "   - preferences",
+      "   - decisions",
+      "   - agreements",
+      "3) No extra keys. No markdown. No prose. No code fences.",
+      "4) Keep only stable, meaningful facts. Ignore temporary thoughts, brainstorming, and noise.",
+      "5) Add data only if clearly supported by conversation.",
+      "6) Update values when newer explicit information supersedes older information.",
+      "7) Remove data only when explicitly contradicted or explicitly cancelled.",
+      "8) If evidence is insufficient, keep previous value unchanged.",
+      "9) If no changes are needed, return previous_facts unchanged (same semantic content).",
+      "10) Keep items short, concrete, deduplicated, and language-aligned with the conversation.",
+      "",
+      "Field semantics:",
+      "- goal: main user objective; keep previous goal unless explicitly changed/invalidated; use null only if truly unknown.",
+      "- constraints/preferences/decisions/agreements: arrays of concise strings.",
+      "",
+      "Return format:",
+      '{',
+      '  "goal": string | null,',
+      '  "constraints": string[],',
+      '  "preferences": string[],',
+      '  "decisions": string[],',
+      '  "agreements": string[]',
+      "}",
+    ].join("\n"),
     input: [
       {
         role: "user",
@@ -611,8 +731,11 @@ const extractStickyFactsWithModel = async (params: {
           "Current facts JSON:",
           serializeStickyFactsForPrompt(params.currentFacts),
           "",
-          "Latest user message:",
-          params.userPrompt,
+          "System prompt:",
+          params.systemPrompt?.trim() || "(empty)",
+          "",
+          "Recent conversation messages JSON (oldest to newest):",
+          serializeContextMessagesForPrompt(params.contextMessages),
         ].join("\n"),
       },
     ],
@@ -639,7 +762,39 @@ const extractStickyFactsWithModel = async (params: {
     throw new Error("facts extractor returned empty response");
   }
   const parsed = parsePossiblyFencedJson(text);
-  return normalizeStickyFacts(parsed);
+  const strictParsed = parseStrictStickyFacts(parsed);
+  if (!strictParsed.facts) {
+    app.log.warn(
+      {
+        chatId: params.chatId,
+        model: OPENAI_FACTS_MODEL,
+        contextMessageCount: params.contextMessages.length,
+        parsedType: Array.isArray(parsed) ? "array" : parsed === null ? "null" : typeof parsed,
+        parsedKeys:
+          parsed && typeof parsed === "object" && !Array.isArray(parsed)
+            ? Object.keys(parsed as Record<string, unknown>).slice(0, 8)
+            : [],
+        invalidReason: strictParsed.invalidReason,
+        invalidKeys: strictParsed.invalidKeys,
+      },
+      "facts extractor returned invalid structure"
+    );
+    return null;
+  }
+  app.log.debug(
+    {
+      chatId: params.chatId,
+      model: OPENAI_FACTS_MODEL,
+      contextMessageCount: params.contextMessages.length,
+      goalPresent: strictParsed.facts.goal !== null,
+      constraintsCount: strictParsed.facts.constraints.length,
+      preferencesCount: strictParsed.facts.preferences.length,
+      decisionsCount: strictParsed.facts.decisions.length,
+      agreementsCount: strictParsed.facts.agreements.length,
+    },
+    "facts extractor produced full sticky facts"
+  );
+  return strictParsed.facts;
 };
 
 const buildOpenAiRequestBody = (params: {
@@ -846,7 +1001,7 @@ const loadStickyFacts = (chatId: string): StickyFacts => {
 };
 
 const saveStickyFacts = (chatId: string, facts: StickyFacts, updatedAt: number): void => {
-  const normalized = normalizeStickyFacts(facts) ?? EMPTY_STICKY_FACTS;
+  const normalized = facts;
   for (const factKey of STICKY_FACT_KEYS) {
     upsertChatFactStmt.run(chatId, factKey, JSON.stringify(normalized[factKey]), updatedAt);
   }
@@ -1272,26 +1427,49 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
     role: item.role,
     content: item.content,
   }));
+  const memorySourceMessages = [...persistedMessages, { role: "user" as const, content: userPrompt }];
   const existingFacts = loadStickyFacts(chatId);
   let stickyFacts = existingFacts;
   if (memoryStrategy === "sticky_facts") {
+    const factsContextMessages = memorySourceMessages.slice(-stickyWindowSize);
     try {
       const nextFacts = await extractStickyFactsWithModel({
-        userPrompt,
+        chatId,
+        systemPrompt,
+        contextMessages: factsContextMessages,
         currentFacts: existingFacts,
       });
       if (nextFacts) {
         stickyFacts = nextFacts;
         saveStickyFacts(chatId, stickyFacts, Date.now());
+        app.log.debug(
+          {
+            chatId,
+            stickyWindowSize,
+            contextMessageCount: factsContextMessages.length,
+            goalPresent: stickyFacts.goal !== null,
+            constraintsCount: stickyFacts.constraints.length,
+            preferencesCount: stickyFacts.preferences.length,
+            decisionsCount: stickyFacts.decisions.length,
+            agreementsCount: stickyFacts.agreements.length,
+          },
+          "facts extractor replaced sticky facts"
+        );
       } else {
-        app.log.warn({ chatId }, "facts extractor returned invalid structure; using existing facts");
+        app.log.warn(
+          { chatId, stickyWindowSize, contextMessageCount: factsContextMessages.length },
+          "facts extractor returned invalid structure; using existing facts"
+        );
       }
     } catch (error) {
-      app.log.warn({ err: error, chatId }, "facts extractor failed; using existing facts");
+      app.log.warn(
+        { err: error, chatId, stickyWindowSize, contextMessageCount: factsContextMessages.length },
+        "facts extractor failed; using existing facts"
+      );
     }
   }
   const inputMessages = applyMemoryStrategy({
-    messages: [...persistedMessages, { role: "user" as const, content: userPrompt }],
+    messages: memorySourceMessages,
     memoryStrategy,
     slidingWindowSize,
     stickyWindowSize,

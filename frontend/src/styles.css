@@ -364,20 +364,6 @@ button:disabled {
   margin-top: 0;
 }
 
-.sticky-facts-preview {
-  margin: 0;
-  max-height: 180px;
-  overflow: auto;
-  border: 1px solid var(--color-border-default);
-  border-radius: 8px;
-  padding: 8px;
-  background: #1f1f1f;
-  font-size: var(--font-size-xs);
-  line-height: 1.4;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
 .center-col {
   display: grid;
   grid-template-rows: auto 1fr auto;
@@ -385,11 +371,11 @@ button:disabled {
 }
 
 .messages {
-  padding: 14px;
+  padding: 18px;
   overflow: auto;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 12px;
   min-height: 0;
 }
 
@@ -399,7 +385,7 @@ button:disabled {
 }
 
 .branch-divider {
-  margin: 2px 0 8px;
+  margin: 4px 0;
   width: 100%;
   display: flex;
   align-items: center;
@@ -437,27 +423,53 @@ button:disabled {
   color: #ffffff;
 }
 
-.bubble {
-  max-width: 86%;
-  padding: 6px 9px;
-  border-radius: 10px;
+.message-row {
+  width: 100%;
+  display: flex;
 }
 
-.bubble.user {
-  align-self: flex-end;
-  background: #2b2b2b;
+.message-row.role-user {
+  justify-content: flex-end;
 }
 
-.bubble.assistant {
-  align-self: flex-start;
-  background: #242424;
-  border: 1px solid #333333;
+.message-row.role-assistant {
+  justify-content: flex-start;
+}
+
+.message-surface {
+  min-width: 0;
+  max-width: min(86%, 860px);
+}
+
+.message-surface.is-user {
+  background: #2f3339;
+  border: 1px solid #3d434d;
+  border-radius: 18px 18px 8px 18px;
+  padding: 10px 14px;
+}
+
+.message-surface.is-assistant {
+  max-width: min(92%, 920px);
+  padding: 4px 2px;
+  border: none;
+  background: transparent;
 }
 
 .content {
   margin: 0;
   white-space: pre-wrap;
-  line-height: 1.32;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.message-surface.is-user .content {
+  color: #f4f7fb;
+}
+
+.message-surface.is-assistant .content {
+  color: #eef2f6;
+  min-height: 1.5em;
 }
 
 .composer {
@@ -928,5 +940,19 @@ textarea {
 
   .composer-actions {
     justify-content: flex-end;
+  }
+
+  .messages {
+    padding: 14px;
+    gap: 10px;
+  }
+
+  .message-surface.is-user {
+    max-width: 92%;
+  }
+
+  .message-surface.is-assistant {
+    max-width: 100%;
+    padding-right: 0;
   }
 }

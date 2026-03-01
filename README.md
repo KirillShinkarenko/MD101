@@ -11,7 +11,7 @@
 - стратегии памяти (пер-чат): переключатель в левой панели
   - `None` (по умолчанию): в OpenAI отправляется полная история
   - `Sliding Window` (реализовано): в OpenAI отправляются только последние `N` сообщений
-  - `Sticky Facts / Key-Value Memory` (реализовано): в OpenAI отправляются `facts` + последние `N` сообщений
+  - `Sticky Facts / Key-Value Memory` (реализовано): после каждого user-сообщения `facts` пересчитываются через OpenAI по `systemPrompt` + последним `N` сообщениям (user+assistant); при валидном полном JSON facts полностью заменяются, при невалидном ответе остаются прежними
 - `Branching` (реализовано): в runtime используется полная история, а ветка создается через `Branch in new chat`
 - ответвление чата: кнопка `Branch in new chat` создает полную копию диалога с заголовком `Ветка - ...`
   - в новом чате хранится checkpoint ветвления, разделитель `Ответвление от [название]` показывается в точке ветвления и ведет в исходный чат
@@ -115,6 +115,10 @@ npm run dev
 - по умолчанию используется `memoryStrategy=none` (полная история)
 - сейчас поддерживаются `none`, `sliding_window`, `sticky_facts`, `branching`
 - `branching` в runtime эквивалентен полной истории (как `none`)
+- `sticky_facts`: facts обновляются после каждого user-сообщения; источник для экстрактора — `systemPrompt` + последние `N` сообщений диалога (`stickyWindowSize`)
+- `sticky_facts`: формирование и merge facts выполняются только моделью в OpenAI; сервер не делает дополнительный merge/эвристики содержимого
+- `sticky_facts`: экстрактор использует `previous_facts` как baseline, меняет поля только при явных сигналах, удаляет только при явном опровержении и всегда возвращает полный JSON по ключам `goal/constraints/preferences/decisions/agreements`
+- при невалидном ответе экстрактора (неполный/невалидный JSON) facts не обновляются
 - допустимые значения `memoryStrategy`: `none`, `sliding_window`, `sticky_facts`, `branching`
 
 SSE-события stream endpoint:

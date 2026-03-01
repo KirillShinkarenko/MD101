@@ -1,4 +1,4 @@
-import type { ChatSummary, MemoryStrategy, StickyFacts } from "../domain/chat";
+import type { ChatSummary, MemoryStrategy } from "../domain/chat";
 import { DropdownSelect } from "./DropdownSelect";
 import { FormField } from "./ui/FormField";
 import { NumberStepperInput } from "./ui/NumberStepperInput";
@@ -13,8 +13,6 @@ type Props = {
   activeModelLabel: string;
   memoryStrategy: MemoryStrategy;
   slidingWindowSize: string;
-  stickyWindowSize: string;
-  stickyFacts: StickyFacts;
   isStreaming: boolean;
   memoryStrategyOptions: ReadonlyArray<{
     value: MemoryStrategy;
@@ -28,7 +26,6 @@ type Props = {
   onOpenModelSettings: () => void;
   onMemoryStrategyChange: (value: MemoryStrategy) => void;
   onSlidingWindowSizeChange: (value: string) => void;
-  onStickyWindowSizeChange: (value: string) => void;
   onBranchInNewChat: () => void;
 };
 
@@ -41,8 +38,6 @@ export function ChatSidebar(props: Props) {
     activeModelLabel,
     memoryStrategy,
     slidingWindowSize,
-    stickyWindowSize,
-    stickyFacts,
     isStreaming,
     memoryStrategyOptions,
     onCreateChat,
@@ -52,11 +47,8 @@ export function ChatSidebar(props: Props) {
     onOpenModelSettings,
     onMemoryStrategyChange,
     onSlidingWindowSizeChange,
-    onStickyWindowSizeChange,
     onBranchInNewChat,
   } = props;
-
-  const stickyFactsPreview = JSON.stringify(stickyFacts, null, 2);
 
   return (
     <aside className="sidebar left-col">
@@ -123,24 +115,6 @@ export function ChatSidebar(props: Props) {
                 disabled={isStreaming}
               />
             </FormField>
-          ) : null}
-          {memoryStrategy === "sticky_facts" ? (
-            <>
-              <FormField label="Recent messages (N)" htmlFor="sticky-window-size-input">
-                <NumberStepperInput
-                  id="sticky-window-size-input"
-                  min={1}
-                  value={stickyWindowSize}
-                  onChange={onStickyWindowSizeChange}
-                  disabled={isStreaming}
-                />
-              </FormField>
-              <FormField label="Current facts" htmlFor="sticky-facts-preview">
-                <pre id="sticky-facts-preview" className="sticky-facts-preview">
-                  {stickyFactsPreview}
-                </pre>
-              </FormField>
-            </>
           ) : null}
           {memoryStrategy === "none" ? (
             <p className="hint">History is sent in full.</p>

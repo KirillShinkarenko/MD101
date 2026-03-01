@@ -1,14 +1,15 @@
-import type { ChatMessage, ChatSummary, MemoryStrategy, StickyFacts } from "../domain/chat";
+import type { ChatMessage, ChatSummary, MemoryStrategy } from "../domain/chat";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "";
 
 const jsonHeaders = { "Content-Type": "application/json" };
-const createEmptyFacts = (): StickyFacts => ({
-  goal: null,
-  constraints: [],
-  preferences: [],
-  decisions: [],
-  agreements: [],
+
+const normalizeMemoryStrategy = (value: MemoryStrategy): MemoryStrategy =>
+  value === "sticky_facts" ? "none" : value;
+
+const normalizeChatSummary = (chat: ChatSummary): ChatSummary => ({
+  ...chat,
+  memoryStrategy: normalizeMemoryStrategy(chat.memoryStrategy),
 });
 
 const readJson = async <T>(response: Response): Promise<T | null> => {
@@ -48,7 +49,7 @@ export const chatApi = {
     if (!response.ok) {
       throw extractError(payload, "Failed to load chats");
     }
-    return payload?.chats ?? [];
+    return (payload?.chats ?? []).map(normalizeChatSummary);
   },
 
   async createChat(
@@ -58,7 +59,6 @@ export const chatApi = {
       systemPrompt: string;
       memoryStrategy: MemoryStrategy;
       slidingWindowSize: number;
-      stickyWindowSize: number;
     }>
   ): Promise<ChatSummary> {
     const response = await fetch(`${API_BASE}/api/chats`, {
@@ -70,7 +70,7 @@ export const chatApi = {
     if (!response.ok || !payload?.chat) {
       throw extractError(payload, "Failed to create chat");
     }
-    return payload.chat;
+    return normalizeChatSummary(payload.chat);
   },
 
   async branchChat(chatId: string): Promise<ChatSummary> {
@@ -81,7 +81,7 @@ export const chatApi = {
     if (!response.ok || !payload?.chat) {
       throw extractError(payload, "Failed to branch chat");
     }
-    return payload.chat;
+    return normalizeChatSummary(payload.chat);
   },
 
   async deleteChat(chatId: string): Promise<void> {
@@ -111,23 +111,6 @@ export const chatApi = {
     };
   },
 
-  async getFacts(chatId: string): Promise<{ facts: StickyFacts; isNotFound: boolean }> {
-    const response = await fetch(`${API_BASE}/api/chats/${chatId}/facts`);
-    const payload = await readJson<{ facts?: StickyFacts; error?: string }>(response);
-
-    if (!response.ok) {
-      if (response.status === 404) {
-        return { facts: createEmptyFacts(), isNotFound: true };
-      }
-      throw extractError(payload, "Failed to load facts");
-    }
-
-    return {
-      facts: payload?.facts ?? createEmptyFacts(),
-      isNotFound: false,
-    };
-  },
-
   async updateChat(
     chatId: string,
     body: Partial<{
@@ -136,7 +119,6 @@ export const chatApi = {
       systemPrompt: string;
       memoryStrategy: MemoryStrategy;
       slidingWindowSize: number;
-      stickyWindowSize: number;
     }>
   ): Promise<ChatSummary> {
     const response = await fetch(`${API_BASE}/api/chats/${chatId}`, {
@@ -148,7 +130,7 @@ export const chatApi = {
     if (!response.ok || !payload?.chat) {
       throw extractError(payload, "Failed to update chat");
     }
-    return payload.chat;
+    return normalizeChatSummary(payload.chat);
   },
 
   async streamChat(
@@ -160,7 +142,6 @@ export const chatApi = {
       reasoningEffort?: string;
       memoryStrategy?: MemoryStrategy;
       slidingWindowSize?: number;
-      stickyWindowSize?: number;
     },
     signal: AbortSignal
   ): Promise<Response> {
