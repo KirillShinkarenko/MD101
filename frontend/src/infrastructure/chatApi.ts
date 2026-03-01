@@ -4,14 +4,6 @@ const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "";
 
 const jsonHeaders = { "Content-Type": "application/json" };
 
-const normalizeMemoryStrategy = (value: MemoryStrategy): MemoryStrategy =>
-  value === "sticky_facts" ? "none" : value;
-
-const normalizeChatSummary = (chat: ChatSummary): ChatSummary => ({
-  ...chat,
-  memoryStrategy: normalizeMemoryStrategy(chat.memoryStrategy),
-});
-
 const readJson = async <T>(response: Response): Promise<T | null> => {
   try {
     return (await response.json()) as T;
@@ -49,7 +41,7 @@ export const chatApi = {
     if (!response.ok) {
       throw extractError(payload, "Failed to load chats");
     }
-    return (payload?.chats ?? []).map(normalizeChatSummary);
+    return payload?.chats ?? [];
   },
 
   async createChat(
@@ -70,7 +62,7 @@ export const chatApi = {
     if (!response.ok || !payload?.chat) {
       throw extractError(payload, "Failed to create chat");
     }
-    return normalizeChatSummary(payload.chat);
+    return payload.chat;
   },
 
   async branchChat(chatId: string): Promise<ChatSummary> {
@@ -81,7 +73,7 @@ export const chatApi = {
     if (!response.ok || !payload?.chat) {
       throw extractError(payload, "Failed to branch chat");
     }
-    return normalizeChatSummary(payload.chat);
+    return payload.chat;
   },
 
   async deleteChat(chatId: string): Promise<void> {
@@ -130,7 +122,7 @@ export const chatApi = {
     if (!response.ok || !payload?.chat) {
       throw extractError(payload, "Failed to update chat");
     }
-    return normalizeChatSummary(payload.chat);
+    return payload.chat;
   },
 
   async streamChat(

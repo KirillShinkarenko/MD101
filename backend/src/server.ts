@@ -15,40 +15,11 @@ await app.register(cors, {
 });
 
 type Role = "user" | "assistant";
-type MemoryStrategy = "none" | "sliding_window" | "sticky_facts" | "branching";
-type StickyFactKey = "goal" | "constraints" | "preferences" | "decisions" | "agreements";
-type StickyFacts = {
-  goal: string | null;
-  constraints: string[];
-  preferences: string[];
-  decisions: string[];
-  agreements: string[];
-};
+type MemoryStrategy = "none" | "sliding_window" | "branching";
 
 const DEFAULT_MEMORY_STRATEGY: MemoryStrategy = "none";
 const DEFAULT_SLIDING_WINDOW_SIZE = 6;
-const DEFAULT_STICKY_WINDOW_SIZE = 6;
 const BRANCH_CHAT_TITLE_PREFIX = "Ветка - ";
-const STICKY_FACT_KEYS: StickyFactKey[] = [
-  "goal",
-  "constraints",
-  "preferences",
-  "decisions",
-  "agreements",
-];
-const STICKY_LIST_KEYS: Array<Exclude<StickyFactKey, "goal">> = [
-  "constraints",
-  "preferences",
-  "decisions",
-  "agreements",
-];
-const EMPTY_STICKY_FACTS: StickyFacts = {
-  goal: null,
-  constraints: [],
-  preferences: [],
-  decisions: [],
-  agreements: [],
-};
 
 type ChatBody = {
   userPrompt?: string;
@@ -57,7 +28,6 @@ type ChatBody = {
   systemPrompt?: string;
   memoryStrategy?: string;
   slidingWindowSize?: number | string;
-  stickyWindowSize?: number | string;
 };
 
 type CreateChatBody = {
@@ -66,7 +36,6 @@ type CreateChatBody = {
   systemPrompt?: string;
   memoryStrategy?: string;
   slidingWindowSize?: number | string;
-  stickyWindowSize?: number | string;
 };
 
 type PatchChatBody = {
@@ -75,7 +44,6 @@ type PatchChatBody = {
   systemPrompt?: string;
   memoryStrategy?: string;
   slidingWindowSize?: number | string;
-  stickyWindowSize?: number | string;
 };
 
 type UsageSummary = {
@@ -95,7 +63,6 @@ type ModelApiProfile = {
 };
 
 const DEFAULT_MODEL = process.env.OPENAI_MODEL?.trim() || "gpt-5-mini";
-const OPENAI_FACTS_MODEL = process.env.OPENAI_FACTS_MODEL?.trim() || "gpt-4.1-nano";
 const NETWORK_ERROR_HINTS: Record<string, string> = {
   ENOTFOUND: "DNS lookup failed. Check internet connection or DNS settings.",
   ECONNRESET: "Network connection was reset while calling OpenAI.",
@@ -167,7 +134,6 @@ CREATE TABLE IF NOT EXISTS chats (
   system_prompt TEXT NOT NULL,
   memory_strategy TEXT NOT NULL DEFAULT 'none',
   sliding_window_size INTEGER NOT NULL DEFAULT 6,
-  sticky_window_size INTEGER NOT NULL DEFAULT 6,
   branch_from_chat_id TEXT,
   branch_from_chat_title TEXT,
   branch_checkpoint_message_count INTEGER,
@@ -192,18 +158,7 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at INTEGER NOT NULL,
   FOREIGN KEY (chat_id) REFERENCES chats (id) ON DELETE CASCADE
 );
-
-CREATE TABLE IF NOT EXISTS chat_facts (
-  chat_id TEXT NOT NULL,
-  fact_key TEXT NOT NULL CHECK (fact_key IN ('goal', 'constraints', 'preferences', 'decisions', 'agreements')),
-  fact_value TEXT NOT NULL,
-  updated_at INTEGER NOT NULL,
-  PRIMARY KEY (chat_id, fact_key),
-  FOREIGN KEY (chat_id) REFERENCES chats (id) ON DELETE CASCADE
-);
-
 CREATE INDEX IF NOT EXISTS idx_messages_chat_id_created_at ON messages (chat_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_chat_facts_chat_id_updated_at ON chat_facts (chat_id, updated_at DESC);
 `);
 
 const chatColumns = db.prepare("PRAGMA table_info(chats)").all() as Array<{ name: string }>;
@@ -219,11 +174,6 @@ if (!chatColumnNames.has("sliding_window_size")) {
     `ALTER TABLE chats ADD COLUMN sliding_window_size INTEGER NOT NULL DEFAULT ${DEFAULT_SLIDING_WINDOW_SIZE}`
   );
 }
-if (!chatColumnNames.has("sticky_window_size")) {
-  db.exec(
-    `ALTER TABLE chats ADD COLUMN sticky_window_size INTEGER NOT NULL DEFAULT ${DEFAULT_STICKY_WINDOW_SIZE}`
-  );
-}
 if (!chatColumnNames.has("branch_from_chat_id")) {
   db.exec("ALTER TABLE chats ADD COLUMN branch_from_chat_id TEXT");
 }
@@ -232,6 +182,71 @@ if (!chatColumnNames.has("branch_from_chat_title")) {
 }
 if (!chatColumnNames.has("branch_checkpoint_message_count")) {
   db.exec("ALTER TABLE chats ADD COLUMN branch_checkpoint_message_count INTEGER");
+}
+
+db.exec(`UPDATE chats SET memory_strategy = 'none' WHERE memory_strategy = 'sticky_facts'`);
+db.exec(`DROP TABLE IF EXISTS chat_facts`);
+
+if (chatColumnNames.has("sticky_window_size")) {
+  db.exec("PRAGMA foreign_keys = OFF");
+  db.exec("BEGIN");
+  try {
+    db.exec(`
+      CREATE TABLE chats_new (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        model TEXT NOT NULL,
+        system_prompt TEXT NOT NULL,
+        memory_strategy TEXT NOT NULL DEFAULT 'none',
+        sliding_window_size INTEGER NOT NULL DEFAULT 6,
+        branch_from_chat_id TEXT,
+        branch_from_chat_title TEXT,
+        branch_checkpoint_message_count INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `);
+    db.exec(`
+      INSERT INTO chats_new (
+        id,
+        title,
+        model,
+        system_prompt,
+        memory_strategy,
+        sliding_window_size,
+        branch_from_chat_id,
+        branch_from_chat_title,
+        branch_checkpoint_message_count,
+        created_at,
+        updated_at
+      )
+      SELECT
+        id,
+        title,
+        model,
+        system_prompt,
+        CASE
+          WHEN memory_strategy = 'sticky_facts' THEN 'none'
+          ELSE memory_strategy
+        END,
+        sliding_window_size,
+        branch_from_chat_id,
+        branch_from_chat_title,
+        branch_checkpoint_message_count,
+        created_at,
+        updated_at
+      FROM chats
+    `);
+    db.exec("DROP TABLE chats");
+    db.exec("ALTER TABLE chats_new RENAME TO chats");
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    db.exec("PRAGMA foreign_keys = ON");
+    throw error;
+  }
+  db.exec("PRAGMA foreign_keys = ON");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_messages_chat_id_created_at ON messages (chat_id, created_at)");
 }
 
 const parseModel = (value: unknown): string | undefined => {
@@ -252,12 +267,7 @@ const parseMemoryStrategy = (value: unknown): MemoryStrategy | undefined => {
     return undefined;
   }
   const trimmed = value.trim().toLowerCase();
-  if (
-    trimmed === "none" ||
-    trimmed === "sliding_window" ||
-    trimmed === "sticky_facts" ||
-    trimmed === "branching"
-  ) {
+  if (trimmed === "none" || trimmed === "sliding_window" || trimmed === "branching") {
     return trimmed;
   }
   return undefined;
@@ -286,15 +296,9 @@ const parsePositiveInt = (value: unknown): number | undefined => {
 };
 
 const parseSlidingWindowSize = (value: unknown): number | undefined => parsePositiveInt(value);
-const parseStickyWindowSize = (value: unknown): number | undefined => parsePositiveInt(value);
 
 const ensureImplementedMemoryStrategy = (strategy: MemoryStrategy): string | null => {
-  if (
-    strategy !== "none" &&
-    strategy !== "sliding_window" &&
-    strategy !== "sticky_facts" &&
-    strategy !== "branching"
-  ) {
+  if (strategy !== "none" && strategy !== "sliding_window" && strategy !== "branching") {
     return `memoryStrategy '${strategy}' not implemented yet`;
   }
   return null;
@@ -363,145 +367,6 @@ const parseJsonSafe = (value: string): unknown => {
   } catch {
     return null;
   }
-};
-
-const createEmptyStickyFacts = (): StickyFacts => ({
-  goal: null,
-  constraints: [],
-  preferences: [],
-  decisions: [],
-  agreements: [],
-});
-
-const normalizeGoal = (value: unknown): string | null => {
-  if (typeof value !== "string") {
-    return null;
-  }
-  const trimmed = value.trim();
-  return trimmed || null;
-};
-
-const normalizeStickyList = (value: unknown): string[] => {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  const normalized = value
-    .map((item) => (typeof item === "string" ? item.trim() : ""))
-    .filter((item) => item.length > 0);
-  return Array.from(new Set(normalized));
-};
-
-const normalizeStickyFacts = (value: unknown): StickyFacts | null => {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return null;
-  }
-  const candidate = value as Record<string, unknown>;
-  return {
-    goal: normalizeGoal(candidate.goal),
-    constraints: normalizeStickyList(candidate.constraints),
-    preferences: normalizeStickyList(candidate.preferences),
-    decisions: normalizeStickyList(candidate.decisions),
-    agreements: normalizeStickyList(candidate.agreements),
-  };
-};
-
-const parseStrictStickyFacts = (
-  value: unknown
-):
-  | {
-      facts: StickyFacts;
-      invalidReason: null;
-      invalidKeys: string[];
-    }
-  | {
-      facts: null;
-      invalidReason: string;
-      invalidKeys: string[];
-    } => {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return {
-      facts: null,
-      invalidReason: "payload must be an object",
-      invalidKeys: [],
-    };
-  }
-  const candidate = value as Record<string, unknown>;
-  const missingKeys = STICKY_FACT_KEYS.filter((factKey) => !Object.hasOwn(candidate, factKey));
-  if (missingKeys.length > 0) {
-    return {
-      facts: null,
-      invalidReason: "missing required keys",
-      invalidKeys: missingKeys,
-    };
-  }
-
-  const goal = candidate.goal;
-  if (goal !== null && typeof goal !== "string") {
-    return {
-      facts: null,
-      invalidReason: "goal must be string or null",
-      invalidKeys: ["goal"],
-    };
-  }
-
-  const facts: StickyFacts = {
-    goal,
-    constraints: [],
-    preferences: [],
-    decisions: [],
-    agreements: [],
-  };
-
-  for (const factKey of STICKY_LIST_KEYS) {
-    const raw = candidate[factKey];
-    if (!Array.isArray(raw)) {
-      return {
-        facts: null,
-        invalidReason: `${factKey} must be string[]`,
-        invalidKeys: [factKey],
-      };
-    }
-    if (!raw.every((item) => typeof item === "string")) {
-      return {
-        facts: null,
-        invalidReason: `${factKey} must contain only strings`,
-        invalidKeys: [factKey],
-      };
-    }
-    facts[factKey] = raw;
-  }
-
-  return {
-    facts,
-    invalidReason: null,
-    invalidKeys: [],
-  };
-};
-
-const parsePossiblyFencedJson = (value: string): unknown => {
-  const trimmed = value.trim();
-  const fencedMatch = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
-  const content = fencedMatch ? fencedMatch[1] : trimmed;
-  return parseJsonSafe(content);
-};
-
-const serializeStickyFactsForPrompt = (facts: StickyFacts): string => JSON.stringify(facts);
-const serializeContextMessagesForPrompt = (messages: Array<{ role: Role; content: string }>): string =>
-  JSON.stringify(messages);
-
-const buildStickyFactsInstructions = (params: {
-  systemPrompt: string;
-  facts: StickyFacts;
-}): string => {
-  const sections = [
-    params.systemPrompt?.trim() || "",
-    [
-      "Persistent memory facts for this conversation.",
-      "Treat them as source of truth unless the user overrides them in the current message.",
-      serializeStickyFactsForPrompt(params.facts),
-    ].join("\n"),
-  ].filter(Boolean);
-  return sections.join("\n\n");
 };
 
 const isContextOverflowError = (params: { code?: string; type?: string; message?: string }): boolean => {
@@ -662,141 +527,6 @@ const estimateCostBreakdownUsd = (model: string, usageSummary: UsageSummary): Co
   };
 };
 
-const extractFactsTextFromResponse = (response: unknown): string => {
-  if (!response || typeof response !== "object") {
-    return "";
-  }
-  const candidate = response as { output_text?: unknown };
-  if (typeof candidate.output_text === "string" && candidate.output_text.trim()) {
-    return candidate.output_text;
-  }
-  return extractCompletedText(response);
-};
-
-const extractStickyFactsWithModel = async (params: {
-  chatId: string;
-  systemPrompt: string;
-  contextMessages: Array<{ role: Role; content: string }>;
-  currentFacts: StickyFacts;
-  signal?: AbortSignal;
-}): Promise<StickyFacts | null> => {
-  const extractorBody = {
-    model: OPENAI_FACTS_MODEL,
-    stream: false,
-    truncation: "disabled",
-    instructions: [
-      "You are a conversation state update engine.",
-      "",
-      "Input:",
-      "1) conversation (recent messages, oldest to newest)",
-      "2) previous_facts (JSON object; may be empty {})",
-      "",
-      "Task:",
-      "Return updated facts as a FULL JSON object.",
-      "",
-      "Output rules (strict):",
-      "1) Return ONLY valid JSON.",
-      "2) Top-level keys must be EXACTLY:",
-      "   - goal",
-      "   - constraints",
-      "   - preferences",
-      "   - decisions",
-      "   - agreements",
-      "3) No extra keys. No markdown. No prose. No code fences.",
-      "4) Keep only stable, meaningful facts. Ignore temporary thoughts, brainstorming, and noise.",
-      "5) Add data only if clearly supported by conversation.",
-      "6) Update values when newer explicit information supersedes older information.",
-      "7) Remove data only when explicitly contradicted or explicitly cancelled.",
-      "8) If evidence is insufficient, keep previous value unchanged.",
-      "9) If no changes are needed, return previous_facts unchanged (same semantic content).",
-      "10) Keep items short, concrete, deduplicated, and language-aligned with the conversation.",
-      "",
-      "Field semantics:",
-      "- goal: main user objective; keep previous goal unless explicitly changed/invalidated; use null only if truly unknown.",
-      "- constraints/preferences/decisions/agreements: arrays of concise strings.",
-      "",
-      "Return format:",
-      '{',
-      '  "goal": string | null,',
-      '  "constraints": string[],',
-      '  "preferences": string[],',
-      '  "decisions": string[],',
-      '  "agreements": string[]',
-      "}",
-    ].join("\n"),
-    input: [
-      {
-        role: "user",
-        content: [
-          "Current facts JSON:",
-          serializeStickyFactsForPrompt(params.currentFacts),
-          "",
-          "System prompt:",
-          params.systemPrompt?.trim() || "(empty)",
-          "",
-          "Recent conversation messages JSON (oldest to newest):",
-          serializeContextMessagesForPrompt(params.contextMessages),
-        ].join("\n"),
-      },
-    ],
-  };
-
-  const response = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    signal: params.signal,
-    body: JSON.stringify(extractorBody),
-  });
-
-  if (!response.ok) {
-    const payloadText = await response.text();
-    throw new Error(`facts extractor failed (${response.status}): ${payloadText}`);
-  }
-
-  const payload = (await response.json()) as unknown;
-  const text = extractFactsTextFromResponse(payload);
-  if (!text.trim()) {
-    throw new Error("facts extractor returned empty response");
-  }
-  const parsed = parsePossiblyFencedJson(text);
-  const strictParsed = parseStrictStickyFacts(parsed);
-  if (!strictParsed.facts) {
-    app.log.warn(
-      {
-        chatId: params.chatId,
-        model: OPENAI_FACTS_MODEL,
-        contextMessageCount: params.contextMessages.length,
-        parsedType: Array.isArray(parsed) ? "array" : parsed === null ? "null" : typeof parsed,
-        parsedKeys:
-          parsed && typeof parsed === "object" && !Array.isArray(parsed)
-            ? Object.keys(parsed as Record<string, unknown>).slice(0, 8)
-            : [],
-        invalidReason: strictParsed.invalidReason,
-        invalidKeys: strictParsed.invalidKeys,
-      },
-      "facts extractor returned invalid structure"
-    );
-    return null;
-  }
-  app.log.debug(
-    {
-      chatId: params.chatId,
-      model: OPENAI_FACTS_MODEL,
-      contextMessageCount: params.contextMessages.length,
-      goalPresent: strictParsed.facts.goal !== null,
-      constraintsCount: strictParsed.facts.constraints.length,
-      preferencesCount: strictParsed.facts.preferences.length,
-      decisionsCount: strictParsed.facts.decisions.length,
-      agreementsCount: strictParsed.facts.agreements.length,
-    },
-    "facts extractor produced full sticky facts"
-  );
-  return strictParsed.facts;
-};
-
 const buildOpenAiRequestBody = (params: {
   model: string;
   systemPrompt: string;
@@ -823,17 +553,13 @@ const applyMemoryStrategy = (params: {
   messages: Array<{ role: Role; content: string }>;
   memoryStrategy: MemoryStrategy;
   slidingWindowSize: number;
-  stickyWindowSize: number;
 }): Array<{ role: Role; content: string }> => {
-  const { messages, memoryStrategy, slidingWindowSize, stickyWindowSize } = params;
+  const { messages, memoryStrategy, slidingWindowSize } = params;
   if (memoryStrategy === "none") {
     return messages;
   }
   if (memoryStrategy === "sliding_window") {
     return messages.slice(-slidingWindowSize);
-  }
-  if (memoryStrategy === "sticky_facts") {
-    return messages.slice(-stickyWindowSize);
   }
   if (memoryStrategy === "branching") {
     return messages;
@@ -849,7 +575,6 @@ const getChatStmt = db.prepare(`
     system_prompt AS systemPrompt,
     memory_strategy AS memoryStrategy,
     sliding_window_size AS slidingWindowSize,
-    sticky_window_size AS stickyWindowSize,
     branch_from_chat_id AS branchFromChatId,
     branch_from_chat_title AS branchFromChatTitle,
     branch_checkpoint_message_count AS branchCheckpointMessageCount,
@@ -867,7 +592,6 @@ const listChatsStmt = db.prepare(`
     c.system_prompt AS systemPrompt,
     c.memory_strategy AS memoryStrategy,
     c.sliding_window_size AS slidingWindowSize,
-    c.sticky_window_size AS stickyWindowSize,
     c.branch_from_chat_id AS branchFromChatId,
     c.branch_from_chat_title AS branchFromChatTitle,
     c.branch_checkpoint_message_count AS branchCheckpointMessageCount,
@@ -923,34 +647,17 @@ const listMessagesForBranchStmt = db.prepare(`
   ORDER BY created_at ASC
 `);
 
-const listChatFactsStmt = db.prepare(`
-  SELECT
-    fact_key AS factKey,
-    fact_value AS factValue
-  FROM chat_facts
-  WHERE chat_id = ?
-`);
-
-const upsertChatFactStmt = db.prepare(`
-  INSERT INTO chat_facts (chat_id, fact_key, fact_value, updated_at)
-  VALUES (?, ?, ?, ?)
-  ON CONFLICT (chat_id, fact_key)
-  DO UPDATE SET
-    fact_value = excluded.fact_value,
-    updated_at = excluded.updated_at
-`);
-
 const insertChatStmt = db.prepare(`
   INSERT INTO chats (
-    id, title, model, system_prompt, memory_strategy, sliding_window_size, sticky_window_size,
+    id, title, model, system_prompt, memory_strategy, sliding_window_size,
     branch_from_chat_id, branch_from_chat_title, branch_checkpoint_message_count, created_at, updated_at
   )
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateChatStmt = db.prepare(`
   UPDATE chats
-  SET title = ?, model = ?, system_prompt = ?, memory_strategy = ?, sliding_window_size = ?, sticky_window_size = ?,
+  SET title = ?, model = ?, system_prompt = ?, memory_strategy = ?, sliding_window_size = ?,
       branch_from_chat_id = ?, branch_from_chat_title = ?, branch_checkpoint_message_count = ?, updated_at = ?
   WHERE id = ?
 `);
@@ -968,52 +675,12 @@ const insertMessageStmt = db.prepare(`
 
 const updateChatUpdatedAtStmt = db.prepare(`UPDATE chats SET updated_at = ? WHERE id = ?`);
 
-const loadStickyFacts = (chatId: string): StickyFacts => {
-  const rows = listChatFactsStmt.all(chatId) as Array<{ factKey: string; factValue: string }>;
-  const facts = createEmptyStickyFacts();
-
-  for (const row of rows) {
-    const parsed = parseJsonSafe(row.factValue);
-    if (row.factKey === "goal") {
-      facts.goal = normalizeGoal(parsed);
-      continue;
-    }
-
-    if (row.factKey === "constraints") {
-      facts.constraints = normalizeStickyList(parsed);
-      continue;
-    }
-    if (row.factKey === "preferences") {
-      facts.preferences = normalizeStickyList(parsed);
-      continue;
-    }
-    if (row.factKey === "decisions") {
-      facts.decisions = normalizeStickyList(parsed);
-      continue;
-    }
-    if (row.factKey === "agreements") {
-      facts.agreements = normalizeStickyList(parsed);
-      continue;
-    }
-  }
-
-  return facts;
-};
-
-const saveStickyFacts = (chatId: string, facts: StickyFacts, updatedAt: number): void => {
-  const normalized = facts;
-  for (const factKey of STICKY_FACT_KEYS) {
-    upsertChatFactStmt.run(chatId, factKey, JSON.stringify(normalized[factKey]), updatedAt);
-  }
-};
-
 const createChat = (params?: {
   title?: string;
   model?: string;
   systemPrompt?: string;
   memoryStrategy?: string;
   slidingWindowSize?: number | string;
-  stickyWindowSize?: number | string;
   branchFromChatId?: string | null;
   branchFromChatTitle?: string | null;
   branchCheckpointMessageCount?: number | null;
@@ -1026,7 +693,6 @@ const createChat = (params?: {
   const memoryStrategy = parseMemoryStrategy(params?.memoryStrategy) ?? DEFAULT_MEMORY_STRATEGY;
   const slidingWindowSize =
     parseSlidingWindowSize(params?.slidingWindowSize) ?? DEFAULT_SLIDING_WINDOW_SIZE;
-  const stickyWindowSize = parseStickyWindowSize(params?.stickyWindowSize) ?? DEFAULT_STICKY_WINDOW_SIZE;
   const branchFromChatId =
     typeof params?.branchFromChatId === "string" && params.branchFromChatId.trim()
       ? params.branchFromChatId.trim()
@@ -1048,14 +714,12 @@ const createChat = (params?: {
     systemPrompt,
     memoryStrategy,
     slidingWindowSize,
-    stickyWindowSize,
     branchFromChatId,
     branchFromChatTitle,
     branchCheckpointMessageCount,
     now,
     now
   );
-  saveStickyFacts(id, EMPTY_STICKY_FACTS, now);
   return getChatStmt.get(id);
 };
 
@@ -1078,7 +742,7 @@ app.post<{ Body: CreateChatBody }>("/api/chats", async (request, reply) => {
   const requestedMemoryStrategy = parseMemoryStrategy(requestedMemoryStrategyRaw);
   if (requestedMemoryStrategyRaw !== undefined && requestedMemoryStrategy === undefined) {
     reply.code(400);
-    return { error: "memoryStrategy must be one of: none, sliding_window, sticky_facts, branching" };
+    return { error: "memoryStrategy must be one of: none, sliding_window, branching" };
   }
 
   const memoryStrategy = requestedMemoryStrategy ?? DEFAULT_MEMORY_STRATEGY;
@@ -1094,21 +758,13 @@ app.post<{ Body: CreateChatBody }>("/api/chats", async (request, reply) => {
     reply.code(400);
     return { error: "slidingWindowSize must be an integer >= 1" };
   }
-  const requestedStickyWindowSizeRaw = request.body?.stickyWindowSize;
-  const requestedStickyWindowSize = parseStickyWindowSize(requestedStickyWindowSizeRaw);
-  if (requestedStickyWindowSizeRaw !== undefined && requestedStickyWindowSize === undefined) {
-    reply.code(400);
-    return { error: "stickyWindowSize must be an integer >= 1" };
-  }
 
   const slidingWindowSize = requestedSlidingWindowSize ?? DEFAULT_SLIDING_WINDOW_SIZE;
-  const stickyWindowSize = requestedStickyWindowSize ?? DEFAULT_STICKY_WINDOW_SIZE;
   const chat = createChat({
     ...request.body,
     model: requestedModel,
     memoryStrategy,
     slidingWindowSize,
-    stickyWindowSize,
   });
   return { chat };
 });
@@ -1124,17 +780,6 @@ app.get<{ Params: { id: string } }>("/api/chats/:id/messages", async (request, r
   return { messages };
 });
 
-app.get<{ Params: { id: string } }>("/api/chats/:id/facts", async (request, reply) => {
-  const chatId = request.params.id;
-  const chat = getChatStmt.get(chatId);
-  if (!chat) {
-    reply.code(404);
-    return { error: "chat not found" };
-  }
-  const facts = loadStickyFacts(chatId);
-  return { facts };
-});
-
 app.patch<{ Params: { id: string }; Body: PatchChatBody }>("/api/chats/:id", async (request, reply) => {
   const chatId = request.params.id;
   const chat = getChatStmt.get(chatId) as
@@ -1145,7 +790,6 @@ app.patch<{ Params: { id: string }; Body: PatchChatBody }>("/api/chats/:id", asy
         systemPrompt: string;
         memoryStrategy: MemoryStrategy;
         slidingWindowSize: number;
-        stickyWindowSize: number;
         branchFromChatId: string | null;
         branchFromChatTitle: string | null;
         branchCheckpointMessageCount: number | null;
@@ -1171,7 +815,7 @@ app.patch<{ Params: { id: string }; Body: PatchChatBody }>("/api/chats/:id", asy
   const requestedMemoryStrategy = parseMemoryStrategy(requestedMemoryStrategyRaw);
   if (requestedMemoryStrategyRaw !== undefined && requestedMemoryStrategy === undefined) {
     reply.code(400);
-    return { error: "memoryStrategy must be one of: none, sliding_window, sticky_facts, branching" };
+    return { error: "memoryStrategy must be one of: none, sliding_window, branching" };
   }
   const persistedMemoryStrategy = parseMemoryStrategy(chat.memoryStrategy) ?? DEFAULT_MEMORY_STRATEGY;
   const memoryStrategy = requestedMemoryStrategy ?? persistedMemoryStrategy;
@@ -1189,15 +833,6 @@ app.patch<{ Params: { id: string }; Body: PatchChatBody }>("/api/chats/:id", asy
   const persistedSlidingWindowSize =
     parseSlidingWindowSize(chat.slidingWindowSize) ?? DEFAULT_SLIDING_WINDOW_SIZE;
   const slidingWindowSize = requestedSlidingWindowSize ?? persistedSlidingWindowSize;
-  const requestedStickyWindowSizeRaw = request.body?.stickyWindowSize;
-  const requestedStickyWindowSize = parseStickyWindowSize(requestedStickyWindowSizeRaw);
-  if (requestedStickyWindowSizeRaw !== undefined && requestedStickyWindowSize === undefined) {
-    reply.code(400);
-    return { error: "stickyWindowSize must be an integer >= 1" };
-  }
-  const persistedStickyWindowSize =
-    parseStickyWindowSize(chat.stickyWindowSize) ?? DEFAULT_STICKY_WINDOW_SIZE;
-  const stickyWindowSize = requestedStickyWindowSize ?? persistedStickyWindowSize;
 
   if (!ALLOWED_MODELS.has(model)) {
     reply.code(400);
@@ -1211,7 +846,6 @@ app.patch<{ Params: { id: string }; Body: PatchChatBody }>("/api/chats/:id", asy
     systemPrompt,
     memoryStrategy,
     slidingWindowSize,
-    stickyWindowSize,
     chat.branchFromChatId ?? null,
     chat.branchFromChatTitle ?? null,
     chat.branchCheckpointMessageCount ?? null,
@@ -1242,7 +876,6 @@ app.post<{ Params: { id: string } }>("/api/chats/:id/branch", async (request, re
         systemPrompt: string;
         memoryStrategy: MemoryStrategy;
         slidingWindowSize: number;
-        stickyWindowSize: number;
       }
     | undefined;
 
@@ -1275,7 +908,6 @@ app.post<{ Params: { id: string } }>("/api/chats/:id/branch", async (request, re
       systemPrompt: sourceChat.systemPrompt,
       memoryStrategy: sourceChat.memoryStrategy,
       slidingWindowSize: sourceChat.slidingWindowSize,
-      stickyWindowSize: sourceChat.stickyWindowSize,
       branchFromChatId: sourceChat.id,
       branchFromChatTitle: sourceChat.title,
       branchCheckpointMessageCount: sourceMessages.length,
@@ -1305,8 +937,6 @@ app.post<{ Params: { id: string } }>("/api/chats/:id/branch", async (request, re
       );
     });
 
-    const sourceFacts = loadStickyFacts(sourceChatId);
-    saveStickyFacts(createdChatId, sourceFacts, baseTimestamp);
     updateChatUpdatedAtStmt.run(baseTimestamp + sourceMessages.length, createdChatId);
     db.exec("COMMIT");
   } catch (error) {
@@ -1338,7 +968,6 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
         systemPrompt: string;
         memoryStrategy: MemoryStrategy;
         slidingWindowSize: number;
-        stickyWindowSize: number;
         branchFromChatId: string | null;
         branchFromChatTitle: string | null;
         branchCheckpointMessageCount: number | null;
@@ -1372,11 +1001,6 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
   const persistedSlidingWindowSize =
     parseSlidingWindowSize(existingChat.slidingWindowSize) ?? DEFAULT_SLIDING_WINDOW_SIZE;
   const slidingWindowSize = requestedSlidingWindowSize ?? persistedSlidingWindowSize;
-  const requestedStickyWindowSizeRaw = request.body?.stickyWindowSize;
-  const requestedStickyWindowSize = parseStickyWindowSize(requestedStickyWindowSizeRaw);
-  const persistedStickyWindowSize =
-    parseStickyWindowSize(existingChat.stickyWindowSize) ?? DEFAULT_STICKY_WINDOW_SIZE;
-  const stickyWindowSize = requestedStickyWindowSize ?? persistedStickyWindowSize;
   const startedAt = Date.now();
 
   if (!userPrompt) {
@@ -1393,7 +1017,7 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
 
   if (requestedMemoryStrategyRaw !== undefined && requestedMemoryStrategy === undefined) {
     reply.code(400);
-    return { error: "memoryStrategy must be one of: none, sliding_window, sticky_facts, branching" };
+    return { error: "memoryStrategy must be one of: none, sliding_window, branching" };
   }
   const memoryStrategyError = ensureImplementedMemoryStrategy(memoryStrategy);
   if (memoryStrategyError) {
@@ -1404,10 +1028,6 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
   if (requestedSlidingWindowSizeRaw !== undefined && requestedSlidingWindowSize === undefined) {
     reply.code(400);
     return { error: "slidingWindowSize must be an integer >= 1" };
-  }
-  if (requestedStickyWindowSizeRaw !== undefined && requestedStickyWindowSize === undefined) {
-    reply.code(400);
-    return { error: "stickyWindowSize must be an integer >= 1" };
   }
 
   if (requestedReasoningEffortRaw !== undefined && reasoningEffort === undefined) {
@@ -1428,56 +1048,11 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
     content: item.content,
   }));
   const memorySourceMessages = [...persistedMessages, { role: "user" as const, content: userPrompt }];
-  const existingFacts = loadStickyFacts(chatId);
-  let stickyFacts = existingFacts;
-  if (memoryStrategy === "sticky_facts") {
-    const factsContextMessages = memorySourceMessages.slice(-stickyWindowSize);
-    try {
-      const nextFacts = await extractStickyFactsWithModel({
-        chatId,
-        systemPrompt,
-        contextMessages: factsContextMessages,
-        currentFacts: existingFacts,
-      });
-      if (nextFacts) {
-        stickyFacts = nextFacts;
-        saveStickyFacts(chatId, stickyFacts, Date.now());
-        app.log.debug(
-          {
-            chatId,
-            stickyWindowSize,
-            contextMessageCount: factsContextMessages.length,
-            goalPresent: stickyFacts.goal !== null,
-            constraintsCount: stickyFacts.constraints.length,
-            preferencesCount: stickyFacts.preferences.length,
-            decisionsCount: stickyFacts.decisions.length,
-            agreementsCount: stickyFacts.agreements.length,
-          },
-          "facts extractor replaced sticky facts"
-        );
-      } else {
-        app.log.warn(
-          { chatId, stickyWindowSize, contextMessageCount: factsContextMessages.length },
-          "facts extractor returned invalid structure; using existing facts"
-        );
-      }
-    } catch (error) {
-      app.log.warn(
-        { err: error, chatId, stickyWindowSize, contextMessageCount: factsContextMessages.length },
-        "facts extractor failed; using existing facts"
-      );
-    }
-  }
   const inputMessages = applyMemoryStrategy({
     messages: memorySourceMessages,
     memoryStrategy,
     slidingWindowSize,
-    stickyWindowSize,
   });
-  const effectiveSystemPrompt =
-    memoryStrategy === "sticky_facts"
-      ? buildStickyFactsInstructions({ systemPrompt, facts: stickyFacts })
-      : systemPrompt;
 
   const now = Date.now();
   updateChatStmt.run(
@@ -1486,7 +1061,6 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
     systemPrompt,
     memoryStrategy,
     slidingWindowSize,
-    stickyWindowSize,
     existingChat.branchFromChatId ?? null,
     existingChat.branchFromChatTitle ?? null,
     existingChat.branchCheckpointMessageCount ?? null,
@@ -1502,7 +1076,6 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
       systemPrompt,
       memoryStrategy,
       slidingWindowSize,
-      stickyWindowSize,
       existingChat.branchFromChatId ?? null,
       existingChat.branchFromChatTitle ?? null,
       existingChat.branchCheckpointMessageCount ?? null,
@@ -1557,7 +1130,7 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
   try {
     const openaiRequestBody = buildOpenAiRequestBody({
       model,
-      systemPrompt: effectiveSystemPrompt,
+      systemPrompt,
       inputMessages,
       reasoningEffort,
     });

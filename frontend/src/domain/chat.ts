@@ -1,7 +1,7 @@
 export type Status = "idle" | "streaming" | "stopped" | "done" | "error";
 export type Role = "user" | "assistant";
 export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
-export type MemoryStrategy = "none" | "sliding_window" | "sticky_facts" | "branching";
+export type MemoryStrategy = "none" | "sliding_window" | "branching";
 
 export type ChatSummary = {
   id: string;
@@ -82,11 +82,6 @@ export const DEFAULT_SLIDING_WINDOW_SIZE = 6;
 export const MEMORY_STRATEGY_OPTIONS = [
   { value: "none", label: "None", implemented: true },
   { value: "sliding_window", label: "Sliding Window", implemented: true },
-  {
-    value: "sticky_facts",
-    label: "Sticky Facts / Key-Value Memory (not implemented yet)",
-    implemented: false,
-  },
   { value: "branching", label: "Branching", implemented: true },
 ] as const satisfies ReadonlyArray<{
   value: MemoryStrategy;
