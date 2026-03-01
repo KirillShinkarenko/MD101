@@ -1,4 +1,4 @@
-import type { ChatSummary, MemoryStrategy } from "../domain/chat";
+import type { ChatSummary, MemoryStrategy, StickyFacts } from "../domain/chat";
 import { DropdownSelect } from "./DropdownSelect";
 import { FormField } from "./ui/FormField";
 import { NumberStepperInput } from "./ui/NumberStepperInput";
@@ -13,6 +13,8 @@ type Props = {
   activeModelLabel: string;
   memoryStrategy: MemoryStrategy;
   slidingWindowSize: string;
+  stickyWindowSize: string;
+  facts: StickyFacts;
   isStreaming: boolean;
   memoryStrategyOptions: ReadonlyArray<{
     value: MemoryStrategy;
@@ -26,6 +28,7 @@ type Props = {
   onOpenModelSettings: () => void;
   onMemoryStrategyChange: (value: MemoryStrategy) => void;
   onSlidingWindowSizeChange: (value: string) => void;
+  onStickyWindowSizeChange: (value: string) => void;
   onBranchInNewChat: () => void;
 };
 
@@ -38,6 +41,8 @@ export function ChatSidebar(props: Props) {
     activeModelLabel,
     memoryStrategy,
     slidingWindowSize,
+    stickyWindowSize,
+    facts,
     isStreaming,
     memoryStrategyOptions,
     onCreateChat,
@@ -47,8 +52,17 @@ export function ChatSidebar(props: Props) {
     onOpenModelSettings,
     onMemoryStrategyChange,
     onSlidingWindowSizeChange,
+    onStickyWindowSizeChange,
     onBranchInNewChat,
   } = props;
+
+  const factRows: Array<{ label: string; value: string }> = [
+    { label: "Goal", value: facts.goal },
+    { label: "Constraints", value: facts.constraints },
+    { label: "Preferences", value: facts.preferences },
+    { label: "Decisions", value: facts.decisions },
+    { label: "Agreements", value: facts.agreements },
+  ];
 
   return (
     <aside className="sidebar left-col">
@@ -115,6 +129,30 @@ export function ChatSidebar(props: Props) {
                 disabled={isStreaming}
               />
             </FormField>
+          ) : null}
+          {memoryStrategy === "sticky_facts" ? (
+            <>
+              <FormField label="Sticky facts window size (N)" htmlFor="sticky-window-size-input">
+                <NumberStepperInput
+                  id="sticky-window-size-input"
+                  min={1}
+                  value={stickyWindowSize}
+                  onChange={onStickyWindowSizeChange}
+                  disabled={isStreaming}
+                />
+              </FormField>
+              <div className="facts-view">
+                <p className="facts-view-title">Facts</p>
+                <dl className="facts-list">
+                  {factRows.map((row) => (
+                    <div className="facts-row" key={row.label}>
+                      <dt>{row.label}</dt>
+                      <dd>{row.value.trim() || "—"}</dd>
+                    </div>
+                  ))}
+                </dl>
+              </div>
+            </>
           ) : null}
           {memoryStrategy === "none" ? (
             <p className="hint">History is sent in full.</p>

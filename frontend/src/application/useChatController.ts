@@ -1,10 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import {
   ACTIVE_CHAT_STORAGE_KEY,
+  DEFAULT_FACTS_MODEL,
   DEFAULT_MEMORY_STRATEGY,
   DEFAULT_MODEL,
   DEFAULT_SLIDING_WINDOW_SIZE,
+  DEFAULT_STICKY_WINDOW_SIZE,
   DEFAULT_SYSTEM_PROMPT,
+  EMPTY_STICKY_FACTS,
+  FACTS_MODEL_STORAGE_KEY,
   MODEL_CONTEXT_WINDOW,
   MODEL_OPTIONS,
   MODEL_REASONING_OPTIONS,
@@ -16,6 +20,7 @@ import {
   type MemoryStrategy,
   type ReasoningEffort,
   type RunMetrics,
+  type StickyFacts,
   type Status,
   type TurnGrowthRow,
 } from "../domain/chat";
@@ -37,6 +42,19 @@ const loadStoredSystemPrompt = (): string => {
   return normalized;
 };
 
+const MODEL_VALUES: Set<string> = new Set(MODEL_OPTIONS.map((option) => option.value));
+
+const loadStoredFactsModel = (): string => {
+  if (typeof window === "undefined") {
+    return DEFAULT_FACTS_MODEL;
+  }
+  const stored = localStorage.getItem(FACTS_MODEL_STORAGE_KEY)?.trim() ?? "";
+  if (!stored || !MODEL_VALUES.has(stored)) {
+    return DEFAULT_FACTS_MODEL;
+  }
+  return stored;
+};
+
 const parseSlidingWindowSizeInput = (value: string): { value?: number; error?: string } => {
   const trimmed = value.trim();
   if (!trimmed) {
@@ -46,6 +64,20 @@ const parseSlidingWindowSizeInput = (value: string): { value?: number; error?: s
   const parsed = Number(trimmed);
   if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 1) {
     return { error: "Sliding window size must be an integer >= 1." };
+  }
+
+  return { value: parsed };
+};
+
+const parseStickyWindowSizeInput = (value: string): { value?: number; error?: string } => {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return { error: "Sticky facts window size is required." };
+  }
+
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 1) {
+    return { error: "Sticky facts window size must be an integer >= 1." };
   }
 
   return { value: parsed };
@@ -87,6 +119,9 @@ export function useChatController() {
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("low");
   const [memoryStrategy, setMemoryStrategy] = useState<MemoryStrategy>(DEFAULT_MEMORY_STRATEGY);
   const [slidingWindowSize, setSlidingWindowSize] = useState(String(DEFAULT_SLIDING_WINDOW_SIZE));
+  const [stickyWindowSize, setStickyWindowSize] = useState(String(DEFAULT_STICKY_WINDOW_SIZE));
+  const [facts, setFacts] = useState<StickyFacts>({ ...EMPTY_STICKY_FACTS });
+  const [factsModel, setFactsModel] = useState(loadStoredFactsModel);
 
   const [metrics, setMetrics] = useState<RunMetrics | null>(null);
   const [requestRaw, setRequestRaw] = useState("");
@@ -220,9 +255,10 @@ export function useChatController() {
 
   const loadMessages = useCallback(
     async (chatId: string) => {
-      const { messages: nextMessages, isNotFound } = await chatApi.getMessages(chatId);
+      const { messages: nextMessages, facts: nextFacts, isNotFound } = await chatApi.getMessages(chatId);
       if (isNotFound) {
         setMessages([]);
+        setFacts({ ...EMPTY_STICKY_FACTS });
         setRequestRaw("");
         setResponseRaw("");
         setOverflowErrorRaw("");
@@ -230,6 +266,7 @@ export function useChatController() {
         return;
       }
       hydrateMessages(nextMessages);
+      setFacts(nextFacts);
     },
     [hydrateMessages]
   );
@@ -244,6 +281,7 @@ export function useChatController() {
       setModel(created.model);
       setMemoryStrategy(created.memoryStrategy);
       setSlidingWindowSize(String(created.slidingWindowSize));
+      setStickyWindowSize(String(created.stickyWindowSize));
       await loadMessages(created.id);
       return;
     }
@@ -261,6 +299,7 @@ export function useChatController() {
     setModel(selected.model);
     setMemoryStrategy(selected.memoryStrategy);
     setSlidingWindowSize(String(selected.slidingWindowSize));
+    setStickyWindowSize(String(selected.stickyWindowSize));
     await loadMessages(selected.id);
   }, [activeChatId, loadMessages, selectChat]);
 
@@ -276,6 +315,8 @@ export function useChatController() {
     setModel(chat.model);
     setMemoryStrategy(chat.memoryStrategy);
     setSlidingWindowSize(String(chat.slidingWindowSize));
+    setStickyWindowSize(String(chat.stickyWindowSize));
+    setFacts({ ...EMPTY_STICKY_FACTS });
   }, [model, selectChat]);
 
   const deleteChat = useCallback(
@@ -298,6 +339,7 @@ export function useChatController() {
       setModel(branched.model);
       setMemoryStrategy(branched.memoryStrategy);
       setSlidingWindowSize(String(branched.slidingWindowSize));
+      setStickyWindowSize(String(branched.stickyWindowSize));
       setErrorText("");
       setStatus("idle");
       await loadMessages(branched.id);
@@ -333,6 +375,7 @@ export function useChatController() {
         model: string;
         memoryStrategy: MemoryStrategy;
         slidingWindowSize: number;
+        stickyWindowSize: number;
       }>
     ) => {
       const updated = await chatApi.updateChat(chatId, body);
@@ -399,6 +442,39 @@ export function useChatController() {
     [activeChatId, patchChat]
   );
 
+  const handleStickyWindowSizeChange = useCallback(
+    async (nextStickyWindowSize: string) => {
+      setStickyWindowSize(nextStickyWindowSize);
+      const parsed = parseStickyWindowSizeInput(nextStickyWindowSize);
+      if (parsed.error) {
+        setErrorText(parsed.error);
+        setStatus("error");
+        return;
+      }
+      if (parsed.value === undefined) {
+        return;
+      }
+      if (!activeChatId) {
+        return;
+      }
+      try {
+        await patchChat(activeChatId, { stickyWindowSize: parsed.value });
+        setErrorText("");
+      } catch (error) {
+        setErrorText(error instanceof Error ? error.message : "Failed to update sticky facts window size");
+        setStatus("error");
+      }
+    },
+    [activeChatId, patchChat]
+  );
+
+  const handleFactsModelChange = useCallback((nextFactsModel: string) => {
+    if (!MODEL_VALUES.has(nextFactsModel)) {
+      return;
+    }
+    setFactsModel(nextFactsModel);
+  }, []);
+
   const stopStreaming = useCallback(() => {
     controllerRef.current?.abort();
     controllerRef.current = null;
@@ -421,6 +497,19 @@ export function useChatController() {
         return;
       }
       nextSlidingWindowSize = parsedSlidingWindowSize.value;
+    }
+    let nextStickyWindowSize: number | undefined;
+    if (memoryStrategy === "sticky_facts") {
+      const parsedStickyWindowSize = parseStickyWindowSizeInput(stickyWindowSize);
+      if (parsedStickyWindowSize.error) {
+        setErrorText(parsedStickyWindowSize.error);
+        setStatus("error");
+        return;
+      }
+      if (parsedStickyWindowSize.value === undefined) {
+        return;
+      }
+      nextStickyWindowSize = parsedStickyWindowSize.value;
     }
 
     setStatus("streaming");
@@ -478,6 +567,8 @@ export function useChatController() {
           reasoningEffort: isReasoningSupported ? reasoningEffort : undefined,
           memoryStrategy,
           slidingWindowSize: nextSlidingWindowSize,
+          stickyWindowSize: nextStickyWindowSize,
+          factsModel,
         },
         controller.signal
       );
@@ -706,7 +797,9 @@ export function useChatController() {
     memoryStrategy,
     systemPrompt,
     slidingWindowSize,
+    stickyWindowSize,
     userPrompt,
+    factsModel,
   ]);
 
   const handleMainAction = useCallback(() => {
@@ -746,6 +839,7 @@ export function useChatController() {
     setModel(activeChat.model);
     setMemoryStrategy(activeChat.memoryStrategy);
     setSlidingWindowSize(String(activeChat.slidingWindowSize));
+    setStickyWindowSize(String(activeChat.stickyWindowSize));
     if (isReasoningSupported && !reasoningOptions.includes(reasoningEffort)) {
       setReasoningEffort(reasoningOptions[0] ?? "low");
     }
@@ -754,6 +848,10 @@ export function useChatController() {
   useEffect(() => {
     localStorage.setItem(SYSTEM_PROMPT_STORAGE_KEY, systemPrompt);
   }, [systemPrompt]);
+
+  useEffect(() => {
+    localStorage.setItem(FACTS_MODEL_STORAGE_KEY, factsModel);
+  }, [factsModel]);
 
   useEffect(() => {
     if (!activeChatId) {
@@ -778,6 +876,9 @@ export function useChatController() {
       reasoningEffort,
       memoryStrategy,
       slidingWindowSize,
+      stickyWindowSize,
+      facts,
+      factsModel,
       branchFromChatId: activeChat?.branchFromChatId ?? null,
       branchFromChatTitle: activeChat?.branchFromChatTitle ?? null,
       branchCheckpointMessageCount: activeChat?.branchCheckpointMessageCount ?? null,
@@ -805,8 +906,10 @@ export function useChatController() {
       setUserPrompt,
       setSystemPrompt,
       setReasoningEffort,
+      handleFactsModelChange,
       handleMemoryStrategyChange,
       handleSlidingWindowSizeChange,
+      handleStickyWindowSizeChange,
       setIsModelSettingsOpen,
       setIsSystemPromptOpen,
       setIsConversationInfoOpen,

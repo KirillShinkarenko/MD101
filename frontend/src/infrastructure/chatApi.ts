@@ -1,4 +1,10 @@
-import type { ChatMessage, ChatSummary, MemoryStrategy } from "../domain/chat";
+import {
+  EMPTY_STICKY_FACTS,
+  type ChatMessage,
+  type ChatSummary,
+  type MemoryStrategy,
+  type StickyFacts,
+} from "../domain/chat";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "";
 
@@ -51,6 +57,7 @@ export const chatApi = {
       systemPrompt: string;
       memoryStrategy: MemoryStrategy;
       slidingWindowSize: number;
+      stickyWindowSize: number;
     }>
   ): Promise<ChatSummary> {
     const response = await fetch(`${API_BASE}/api/chats`, {
@@ -86,19 +93,24 @@ export const chatApi = {
     }
   },
 
-  async getMessages(chatId: string): Promise<{ messages: ChatMessage[]; isNotFound: boolean }> {
+  async getMessages(
+    chatId: string
+  ): Promise<{ messages: ChatMessage[]; facts: StickyFacts; isNotFound: boolean }> {
     const response = await fetch(`${API_BASE}/api/chats/${chatId}/messages`);
-    const payload = await readJson<{ messages?: ChatMessage[]; error?: string }>(response);
+    const payload = await readJson<{ messages?: ChatMessage[]; facts?: StickyFacts; error?: string }>(
+      response
+    );
 
     if (!response.ok) {
       if (response.status === 404) {
-        return { messages: [], isNotFound: true };
+        return { messages: [], facts: { ...EMPTY_STICKY_FACTS }, isNotFound: true };
       }
       throw extractError(payload, "Failed to load messages");
     }
 
     return {
       messages: payload?.messages ?? [],
+      facts: payload?.facts ?? { ...EMPTY_STICKY_FACTS },
       isNotFound: false,
     };
   },
@@ -111,6 +123,7 @@ export const chatApi = {
       systemPrompt: string;
       memoryStrategy: MemoryStrategy;
       slidingWindowSize: number;
+      stickyWindowSize: number;
     }>
   ): Promise<ChatSummary> {
     const response = await fetch(`${API_BASE}/api/chats/${chatId}`, {
@@ -134,6 +147,8 @@ export const chatApi = {
       reasoningEffort?: string;
       memoryStrategy?: MemoryStrategy;
       slidingWindowSize?: number;
+      stickyWindowSize?: number;
+      factsModel?: string;
     },
     signal: AbortSignal
   ): Promise<Response> {

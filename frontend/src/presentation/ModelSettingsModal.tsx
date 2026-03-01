@@ -6,6 +6,7 @@ import { ModalShell } from "./ui/ModalShell";
 type Props = {
   isOpen: boolean;
   model: string;
+  factsModel: string;
   reasoningEffort: ReasoningEffort;
   isStreaming: boolean;
   isReasoningSupported: boolean;
@@ -13,6 +14,7 @@ type Props = {
   modelOptions: Array<{ value: string; label: string }>;
   onClose: () => void;
   onModelChange: (value: string) => void;
+  onFactsModelChange: (value: string) => void;
   onReasoningEffortChange: (value: ReasoningEffort) => void;
 };
 
@@ -20,6 +22,7 @@ export function ModelSettingsModal(props: Props) {
   const {
     isOpen,
     model,
+    factsModel,
     reasoningEffort,
     isStreaming,
     isReasoningSupported,
@@ -27,6 +30,7 @@ export function ModelSettingsModal(props: Props) {
     modelOptions,
     onClose,
     onModelChange,
+    onFactsModelChange,
     onReasoningEffortChange,
   } = props;
 
@@ -41,6 +45,18 @@ export function ModelSettingsModal(props: Props) {
           id="modal-model"
           value={model}
           onChange={onModelChange}
+          disabled={isStreaming}
+          options={modelOptions.map((option) => ({
+            value: option.value,
+            label: option.label,
+          }))}
+        />
+      </FormField>
+      <FormField label="Facts model" htmlFor="modal-facts-model">
+        <DropdownSelect
+          id="modal-facts-model"
+          value={factsModel}
+          onChange={onFactsModelChange}
           disabled={isStreaming}
           options={modelOptions.map((option) => ({
             value: option.value,

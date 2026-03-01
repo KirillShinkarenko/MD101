@@ -1,7 +1,16 @@
 export type Status = "idle" | "streaming" | "stopped" | "done" | "error";
 export type Role = "user" | "assistant";
 export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
-export type MemoryStrategy = "none" | "sliding_window" | "branching";
+export type MemoryStrategy = "none" | "sliding_window" | "branching" | "sticky_facts";
+
+export type StickyFacts = {
+  goal: string;
+  constraints: string;
+  preferences: string;
+  decisions: string;
+  agreements: string;
+  updatedAt: number | null;
+};
 
 export type ChatSummary = {
   id: string;
@@ -10,6 +19,7 @@ export type ChatSummary = {
   systemPrompt: string;
   memoryStrategy: MemoryStrategy;
   slidingWindowSize: number;
+  stickyWindowSize: number;
   branchFromChatId: string | null;
   branchFromChatTitle: string | null;
   branchCheckpointMessageCount: number | null;
@@ -78,11 +88,22 @@ export const DEFAULT_MODEL = "gpt-5-mini";
 export const DEFAULT_SYSTEM_PROMPT = "";
 export const DEFAULT_MEMORY_STRATEGY: MemoryStrategy = "none";
 export const DEFAULT_SLIDING_WINDOW_SIZE = 6;
+export const DEFAULT_STICKY_WINDOW_SIZE = 6;
+export const DEFAULT_FACTS_MODEL = "gpt-4.1-nano";
+export const EMPTY_STICKY_FACTS: StickyFacts = {
+  goal: "",
+  constraints: "",
+  preferences: "",
+  decisions: "",
+  agreements: "",
+  updatedAt: null,
+};
 
 export const MEMORY_STRATEGY_OPTIONS = [
   { value: "none", label: "None", implemented: true },
   { value: "sliding_window", label: "Sliding Window", implemented: true },
   { value: "branching", label: "Branching", implemented: true },
+  { value: "sticky_facts", label: "Sticky Facts", implemented: true },
 ] as const satisfies ReadonlyArray<{
   value: MemoryStrategy;
   label: string;
@@ -107,3 +128,4 @@ export const MODEL_CONTEXT_WINDOW: Record<string, number> = {
 
 export const ACTIVE_CHAT_STORAGE_KEY = "md.activeChatId";
 export const SYSTEM_PROMPT_STORAGE_KEY = "md.globalSystemPrompt";
+export const FACTS_MODEL_STORAGE_KEY = "md.factsModel";

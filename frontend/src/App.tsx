@@ -21,6 +21,8 @@ function App() {
         activeModelLabel={view.activeModelLabel}
         memoryStrategy={view.memoryStrategy}
         slidingWindowSize={view.slidingWindowSize}
+        stickyWindowSize={view.stickyWindowSize}
+        facts={view.facts}
         isStreaming={view.isStreaming}
         memoryStrategyOptions={MEMORY_STRATEGY_OPTIONS}
         onCreateChat={() => void actions.createChat()}
@@ -30,6 +32,7 @@ function App() {
         onOpenModelSettings={() => actions.setIsModelSettingsOpen(true)}
         onMemoryStrategyChange={(value) => void actions.handleMemoryStrategyChange(value)}
         onSlidingWindowSizeChange={(value) => void actions.handleSlidingWindowSizeChange(value)}
+        onStickyWindowSizeChange={(value) => void actions.handleStickyWindowSizeChange(value)}
         onBranchInNewChat={() => void actions.branchInNewChat()}
       />
 
@@ -64,6 +67,7 @@ function App() {
       <ModelSettingsModal
         isOpen={view.isModelSettingsOpen}
         model={view.model}
+        factsModel={view.factsModel}
         reasoningEffort={view.reasoningEffort}
         isStreaming={view.isStreaming}
         isReasoningSupported={view.isReasoningSupported}
@@ -71,6 +75,7 @@ function App() {
         modelOptions={[...MODEL_OPTIONS]}
         onClose={() => actions.setIsModelSettingsOpen(false)}
         onModelChange={(value) => void actions.handleModelChange(value)}
+        onFactsModelChange={actions.handleFactsModelChange}
         onReasoningEffortChange={actions.setReasoningEffort}
       />
 

@@ -11,6 +11,7 @@
 - стратегии памяти (пер-чат): переключатель в левой панели
   - `None` (по умолчанию): в OpenAI отправляется полная история
   - `Sliding Window` (реализовано): в OpenAI отправляются только последние `N` сообщений
+  - `Sticky Facts` (реализовано): в OpenAI отправляются `facts + последние N сообщений`
 - `Branching` (реализовано): в runtime используется полная история, а ветка создается через `Branch in new chat`
 - ответвление чата: кнопка `Branch in new chat` создает полную копию диалога с заголовком `Ветка - ...`
   - в новом чате хранится checkpoint ветвления, разделитель `Ответвление от [название]` показывается в точке ветвления и ведет в исходный чат
@@ -101,19 +102,23 @@ npm run dev
 - `GET /health`
 - `GET /api/chats` - список чатов
 - `POST /api/chats` - создать чат
-- опциональные поля: `memoryStrategy`, `slidingWindowSize`
-- `GET /api/chats/:id/messages` - история сообщений
-- `PATCH /api/chats/:id` - обновить чат (`title`, `model`, `systemPrompt`, `memoryStrategy`, `slidingWindowSize`)
+- опциональные поля: `memoryStrategy`, `slidingWindowSize`, `stickyWindowSize`
+- `GET /api/chats/:id/messages` - история сообщений + `facts`
+- `PATCH /api/chats/:id` - обновить чат (`title`, `model`, `systemPrompt`, `memoryStrategy`, `slidingWindowSize`, `stickyWindowSize`)
 - `DELETE /api/chats/:id` - удалить чат
 - `POST /api/chats/:id/branch` - создать новую ветку как копию чата
 - `POST /api/chats/:id/stream` - отправить сообщение и получить streaming-ответ
-  - опциональные поля: `memoryStrategy`, `slidingWindowSize`
+  - опциональные поля: `memoryStrategy`, `slidingWindowSize`, `stickyWindowSize`, `factsModel`
 
 Примечание по стратегиям памяти:
 - по умолчанию используется `memoryStrategy=none` (полная история)
-- сейчас поддерживаются `none`, `sliding_window`, `branching`
+- сейчас поддерживаются `none`, `sliding_window`, `branching`, `sticky_facts`
 - `branching` в runtime эквивалентен полной истории (как `none`)
-- допустимые значения `memoryStrategy`: `none`, `sliding_window`, `branching`
+- `sticky_facts`:
+  - `facts` обновляются отдельным LLM-запросом до основного ответа
+  - в основной запрос уходит `systemPrompt + facts` и последние `N` сообщений (`stickyWindowSize`)
+  - если обновление `facts` не удалось, используется предыдущий snapshot
+- допустимые значения `memoryStrategy`: `none`, `sliding_window`, `branching`, `sticky_facts`
 
 SSE-события stream endpoint:
 
