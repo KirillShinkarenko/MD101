@@ -120,7 +120,7 @@ export function ChatMainPanel(props: Props) {
       <PanelHeader
         as="h1"
         variant="panel"
-        title="День 10. Управление контекстом: разные стратегии"
+        title="День 11. Модель памяти ассистента"
         titleClassName="day-task-heading"
         actions={
           <>

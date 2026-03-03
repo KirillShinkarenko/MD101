@@ -1,4 +1,4 @@
-import { MEMORY_STRATEGY_OPTIONS, MODEL_OPTIONS } from "./domain/chat";
+import { MODEL_OPTIONS } from "./domain/chat";
 import { useChatController } from "./application/useChatController";
 import { ChatSidebar } from "./presentation/ChatSidebar";
 import { ChatMainPanel } from "./presentation/ChatMainPanel";
@@ -19,20 +19,13 @@ function App() {
         isModelSettingsOpen={view.isModelSettingsOpen}
         isSystemPromptOpen={view.isSystemPromptOpen}
         activeModelLabel={view.activeModelLabel}
-        memoryStrategy={view.memoryStrategy}
-        slidingWindowSize={view.slidingWindowSize}
-        stickyWindowSize={view.stickyWindowSize}
-        facts={view.facts}
         isStreaming={view.isStreaming}
-        memoryStrategyOptions={MEMORY_STRATEGY_OPTIONS}
+        isBranchAvailable={Boolean(view.activeChatId)}
         onCreateChat={() => void actions.createChat()}
         onSelectChat={actions.selectChat}
         onDeleteChat={(chatId) => void actions.deleteChat(chatId)}
         onOpenSystemPrompt={() => actions.setIsSystemPromptOpen(true)}
         onOpenModelSettings={() => actions.setIsModelSettingsOpen(true)}
-        onMemoryStrategyChange={(value) => void actions.handleMemoryStrategyChange(value)}
-        onSlidingWindowSizeChange={(value) => void actions.handleSlidingWindowSizeChange(value)}
-        onStickyWindowSizeChange={(value) => void actions.handleStickyWindowSizeChange(value)}
         onBranchInNewChat={() => void actions.branchInNewChat()}
       />
 
@@ -59,15 +52,22 @@ function App() {
       <InspectorPanel
         requestRaw={view.requestRaw}
         responseRaw={view.responseRaw}
+        memory={view.memory}
+        effectiveMemoryBlock={view.effectiveMemoryBlock}
         errorText={view.errorText}
+        isStreaming={view.isStreaming}
         onOpenFullScreenRequest={() => actions.setFullScreenView("request")}
         onOpenFullScreenResponse={() => actions.setFullScreenView("response")}
+        onSaveWorking={actions.saveWorkingMemory}
+        onSaveLongTerm={actions.saveLongTermMemory}
+        onApproveCandidate={actions.approveCandidate}
+        onRejectCandidate={actions.rejectCandidate}
       />
 
       <ModelSettingsModal
         isOpen={view.isModelSettingsOpen}
         model={view.model}
-        factsModel={view.factsModel}
+        memoryModel={view.memoryModel}
         reasoningEffort={view.reasoningEffort}
         isStreaming={view.isStreaming}
         isReasoningSupported={view.isReasoningSupported}
@@ -75,7 +75,7 @@ function App() {
         modelOptions={[...MODEL_OPTIONS]}
         onClose={() => actions.setIsModelSettingsOpen(false)}
         onModelChange={(value) => void actions.handleModelChange(value)}
-        onFactsModelChange={actions.handleFactsModelChange}
+        onMemoryModelChange={actions.handleMemoryModelChange}
         onReasoningEffortChange={actions.setReasoningEffort}
       />
 

@@ -1,15 +1,47 @@
 export type Status = "idle" | "streaming" | "stopped" | "done" | "error";
 export type Role = "user" | "assistant";
 export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
-export type MemoryStrategy = "none" | "sliding_window" | "branching" | "sticky_facts";
 
-export type StickyFacts = {
+export type ShortTermMemory = {
+  rollingSummary: string;
+  lastProcessedMessageCount: number;
+  updatedAt: number;
+};
+
+export type WorkingMemory = {
   goal: string;
   constraints: string;
+  status: string;
+  nextSteps: string;
+  updatedBy: "auto" | "manual";
+  updatedAt: number;
+};
+
+export type LongTermMemory = {
+  profile: string;
   preferences: string;
   decisions: string;
-  agreements: string;
-  updatedAt: number | null;
+  knowledge: string;
+  updatedBy: "auto" | "manual";
+  updatedAt: number;
+};
+
+export type LongTermCandidate = {
+  id: string;
+  chatId: string;
+  targetField: "profile" | "preferences" | "decisions" | "knowledge";
+  value: string;
+  reason: string;
+  status: "pending" | "approved" | "rejected";
+  createdAt: number;
+  resolvedAt: number | null;
+};
+
+export type ChatMemorySnapshot = {
+  shortTerm: ShortTermMemory;
+  working: WorkingMemory;
+  longTerm: LongTermMemory;
+  pendingCandidates: LongTermCandidate[];
 };
 
 export type ChatSummary = {
@@ -17,9 +49,6 @@ export type ChatSummary = {
   title: string;
   model: string;
   systemPrompt: string;
-  memoryStrategy: MemoryStrategy;
-  slidingWindowSize: number;
-  stickyWindowSize: number;
   branchFromChatId: string | null;
   branchFromChatTitle: string | null;
   branchCheckpointMessageCount: number | null;
@@ -86,29 +115,32 @@ export const MODEL_OPTIONS = [
 
 export const DEFAULT_MODEL = "gpt-5-mini";
 export const DEFAULT_SYSTEM_PROMPT = "";
-export const DEFAULT_MEMORY_STRATEGY: MemoryStrategy = "none";
-export const DEFAULT_SLIDING_WINDOW_SIZE = 6;
-export const DEFAULT_STICKY_WINDOW_SIZE = 6;
-export const DEFAULT_FACTS_MODEL = "gpt-4.1-nano";
-export const EMPTY_STICKY_FACTS: StickyFacts = {
-  goal: "",
-  constraints: "",
-  preferences: "",
-  decisions: "",
-  agreements: "",
-  updatedAt: null,
-};
+export const DEFAULT_MEMORY_MODEL = "gpt-4.1-nano";
 
-export const MEMORY_STRATEGY_OPTIONS = [
-  { value: "none", label: "None", implemented: true },
-  { value: "sliding_window", label: "Sliding Window", implemented: true },
-  { value: "branching", label: "Branching", implemented: true },
-  { value: "sticky_facts", label: "Sticky Facts", implemented: true },
-] as const satisfies ReadonlyArray<{
-  value: MemoryStrategy;
-  label: string;
-  implemented: boolean;
-}>;
+export const EMPTY_MEMORY_SNAPSHOT: ChatMemorySnapshot = {
+  shortTerm: {
+    rollingSummary: "",
+    lastProcessedMessageCount: 0,
+    updatedAt: Date.now(),
+  },
+  working: {
+    goal: "",
+    constraints: "",
+    status: "",
+    nextSteps: "",
+    updatedBy: "auto",
+    updatedAt: Date.now(),
+  },
+  longTerm: {
+    profile: "",
+    preferences: "",
+    decisions: "",
+    knowledge: "",
+    updatedBy: "auto",
+    updatedAt: Date.now(),
+  },
+  pendingCandidates: [],
+};
 
 export const MODEL_REASONING_OPTIONS: Record<string, ReasoningEffort[]> = {
   "gpt-3.5-turbo": [],
@@ -128,4 +160,4 @@ export const MODEL_CONTEXT_WINDOW: Record<string, number> = {
 
 export const ACTIVE_CHAT_STORAGE_KEY = "md.activeChatId";
 export const SYSTEM_PROMPT_STORAGE_KEY = "md.globalSystemPrompt";
-export const FACTS_MODEL_STORAGE_KEY = "md.factsModel";
+export const MEMORY_MODEL_STORAGE_KEY = "md.memoryModel";

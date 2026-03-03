@@ -1,7 +1,6 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import dotenv from "dotenv";
-import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -16,63 +15,41 @@ await app.register(cors, {
 });
 
 type Role = "user" | "assistant";
-type MemoryStrategy = "none" | "sliding_window" | "branching" | "sticky_facts";
-type StickyFacts = {
-  goal: string;
-  constraints: string;
-  preferences: string;
-  decisions: string;
-  agreements: string;
-  updatedAt: number;
-};
-type StickyFactsCore = Omit<StickyFacts, "updatedAt">;
-
-const DEFAULT_MEMORY_STRATEGY: MemoryStrategy = "none";
-const DEFAULT_SLIDING_WINDOW_SIZE = 6;
-const DEFAULT_STICKY_WINDOW_SIZE = 6;
-const DEFAULT_FACTS_MODEL = "gpt-4.1-nano";
-const BRANCH_CHAT_TITLE_PREFIX = "Ветка - ";
-const STICKY_FACTS_FIELDS = ["goal", "constraints", "preferences", "decisions", "agreements"] as const;
-const STICKY_FACTS_MAX_LENGTH: Record<keyof StickyFactsCore, number> = {
-  goal: 180,
-  constraints: 180,
-  preferences: 180,
-  decisions: 320,
-  agreements: 180,
-};
-const DECISION_UNCERTAINTY_PATTERNS = [
-  /\?/i,
-  /\b(maybe|perhaps|possibly|consider|tbd|todo|pending|unsure|uncertain)\b/i,
-  /\b(возможно|может быть|подумаем|обсудим|обсудить|под вопросом|не уверен|неопредел)\b/i,
-];
+type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+type LongTermField = "profile" | "preferences" | "decisions" | "knowledge";
 
 type ChatBody = {
   userPrompt?: string;
   model?: string;
   reasoningEffort?: string;
   systemPrompt?: string;
-  memoryStrategy?: string;
-  slidingWindowSize?: number | string;
-  stickyWindowSize?: number | string;
-  factsModel?: string;
+  memoryModel?: string;
 };
 
 type CreateChatBody = {
   title?: string;
   model?: string;
   systemPrompt?: string;
-  memoryStrategy?: string;
-  slidingWindowSize?: number | string;
-  stickyWindowSize?: number | string;
 };
 
 type PatchChatBody = {
   title?: string;
   model?: string;
   systemPrompt?: string;
-  memoryStrategy?: string;
-  slidingWindowSize?: number | string;
-  stickyWindowSize?: number | string;
+};
+
+type WorkingMemoryPatchBody = {
+  goal?: string;
+  constraints?: string;
+  status?: string;
+  nextSteps?: string;
+};
+
+type LongTermMemoryPatchBody = {
+  profile?: string;
+  preferences?: string;
+  decisions?: string;
+  knowledge?: string;
 };
 
 type UsageSummary = {
@@ -88,10 +65,114 @@ type CostBreakdownUsd = {
 };
 
 type ModelApiProfile = {
-  reasoningEfforts: Array<"none" | "minimal" | "low" | "medium" | "high" | "xhigh">;
+  reasoningEfforts: ReasoningEffort[];
+};
+
+type ShortTermMemoryRow = {
+  chatId: string;
+  rollingSummary: string;
+  lastProcessedMessageCount: number;
+  updatedAt: number;
+};
+
+type WorkingMemoryRow = {
+  chatId: string;
+  goal: string;
+  constraints: string;
+  status: string;
+  nextSteps: string;
+  manualLockGoal: number;
+  manualLockConstraints: number;
+  manualLockStatus: number;
+  manualLockNextSteps: number;
+  updatedBy: "auto" | "manual";
+  updatedAt: number;
+};
+
+type LongTermMemoryRow = {
+  scopeId: "global";
+  profile: string;
+  preferences: string;
+  decisions: string;
+  knowledge: string;
+  manualLockProfile: number;
+  manualLockPreferences: number;
+  manualLockDecisions: number;
+  manualLockKnowledge: number;
+  updatedBy: "auto" | "manual";
+  updatedAt: number;
+};
+
+type LongTermCandidateRow = {
+  id: string;
+  chatId: string;
+  targetField: LongTermField;
+  value: string;
+  reason: string;
+  status: "pending" | "approved" | "rejected";
+  createdAt: number;
+  resolvedAt: number | null;
+};
+
+type ChatMemorySnapshot = {
+  shortTerm: {
+    rollingSummary: string;
+    lastProcessedMessageCount: number;
+    updatedAt: number;
+  };
+  working: {
+    goal: string;
+    constraints: string;
+    status: string;
+    nextSteps: string;
+    updatedBy: "auto" | "manual";
+    updatedAt: number;
+  };
+  longTerm: {
+    profile: string;
+    preferences: string;
+    decisions: string;
+    knowledge: string;
+    updatedBy: "auto" | "manual";
+    updatedAt: number;
+  };
+  pendingCandidates: Array<{
+    id: string;
+    chatId: string;
+    targetField: LongTermField;
+    value: string;
+    reason: string;
+    status: "pending" | "approved" | "rejected";
+    createdAt: number;
+    resolvedAt: number | null;
+  }>;
+};
+
+type MemoryUpdaterOutput = {
+  shortTerm: {
+    rollingSummary: string;
+  };
+  working: {
+    goal: string;
+    constraints: string;
+    status: string;
+    nextSteps: string;
+  };
+  longTermCandidates: Array<{
+    targetField: LongTermField;
+    value: string;
+    reason: string;
+  }>;
 };
 
 const DEFAULT_MODEL = process.env.OPENAI_MODEL?.trim() || "gpt-5-mini";
+const DEFAULT_MEMORY_MODEL = "gpt-4.1-nano";
+const BRANCH_CHAT_TITLE_PREFIX = "Ветка - ";
+const GLOBAL_LONG_TERM_SCOPE_ID = "global" as const;
+const SHORT_TERM_MAX_LENGTH = 1800;
+const WORKING_FIELD_MAX_LENGTH = 320;
+const LONG_TERM_FIELD_MAX_LENGTH = 600;
+const CANDIDATE_VALUE_MAX_LENGTH = 320;
 const NETWORK_ERROR_HINTS: Record<string, string> = {
   ENOTFOUND: "DNS lookup failed. Check internet connection or DNS settings.",
   ECONNRESET: "Network connection was reset while calling OpenAI.",
@@ -128,19 +209,11 @@ const MODEL_API_PROFILES: Record<string, ModelApiProfile> = {
 
 const ALLOWED_MODELS = new Set(Object.keys(MODEL_API_PROFILES));
 const EFFECTIVE_DEFAULT_MODEL = ALLOWED_MODELS.has(DEFAULT_MODEL) ? DEFAULT_MODEL : "gpt-5-mini";
-const EFFECTIVE_DEFAULT_FACTS_MODEL = ALLOWED_MODELS.has(DEFAULT_FACTS_MODEL)
-  ? DEFAULT_FACTS_MODEL
+const EFFECTIVE_DEFAULT_MEMORY_MODEL = ALLOWED_MODELS.has(DEFAULT_MEMORY_MODEL)
+  ? DEFAULT_MEMORY_MODEL
   : EFFECTIVE_DEFAULT_MODEL;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const MODEL_VALIDATION_ERROR = `model must be one of: ${Array.from(ALLOWED_MODELS).join(", ")}`;
-
-const parseAllowedModel = (value: unknown): string | undefined => {
-  const parsed = parseModel(value);
-  if (!parsed) {
-    return undefined;
-  }
-  return ALLOWED_MODELS.has(parsed) ? parsed : undefined;
-};
 
 if (!OPENAI_API_KEY) {
   app.log.warn("OPENAI_API_KEY is not set. Requests will fail until it is configured.");
@@ -192,37 +265,62 @@ CREATE TABLE IF NOT EXISTS messages (
   FOREIGN KEY (chat_id) REFERENCES chats (id) ON DELETE CASCADE
 );
 
-CREATE TABLE IF NOT EXISTS chat_facts (
+CREATE TABLE IF NOT EXISTS chat_short_memory (
   chat_id TEXT PRIMARY KEY,
-  goal TEXT NOT NULL DEFAULT '',
-  constraints TEXT NOT NULL DEFAULT '',
-  preferences TEXT NOT NULL DEFAULT '',
-  decisions TEXT NOT NULL DEFAULT '',
-  agreements TEXT NOT NULL DEFAULT '',
+  rolling_summary TEXT NOT NULL DEFAULT '',
+  last_processed_message_count INTEGER NOT NULL DEFAULT 0,
   updated_at INTEGER NOT NULL,
   FOREIGN KEY (chat_id) REFERENCES chats (id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS chat_working_memory (
+  chat_id TEXT PRIMARY KEY,
+  goal TEXT NOT NULL DEFAULT '',
+  constraints TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT '',
+  next_steps TEXT NOT NULL DEFAULT '',
+  manual_lock_goal INTEGER NOT NULL DEFAULT 0,
+  manual_lock_constraints INTEGER NOT NULL DEFAULT 0,
+  manual_lock_status INTEGER NOT NULL DEFAULT 0,
+  manual_lock_next_steps INTEGER NOT NULL DEFAULT 0,
+  updated_by TEXT NOT NULL DEFAULT 'auto',
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY (chat_id) REFERENCES chats (id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS global_long_term_memory (
+  scope_id TEXT PRIMARY KEY,
+  profile TEXT NOT NULL DEFAULT '',
+  preferences TEXT NOT NULL DEFAULT '',
+  decisions TEXT NOT NULL DEFAULT '',
+  knowledge TEXT NOT NULL DEFAULT '',
+  manual_lock_profile INTEGER NOT NULL DEFAULT 0,
+  manual_lock_preferences INTEGER NOT NULL DEFAULT 0,
+  manual_lock_decisions INTEGER NOT NULL DEFAULT 0,
+  manual_lock_knowledge INTEGER NOT NULL DEFAULT 0,
+  updated_by TEXT NOT NULL DEFAULT 'auto',
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS long_term_candidates (
+  id TEXT PRIMARY KEY,
+  chat_id TEXT NOT NULL,
+  target_field TEXT NOT NULL,
+  value TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at INTEGER NOT NULL,
+  resolved_at INTEGER,
+  FOREIGN KEY (chat_id) REFERENCES chats (id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_chat_id_created_at ON messages (chat_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_long_term_candidates_chat_status_created_at
+  ON long_term_candidates (chat_id, status, created_at);
 `);
 
-const chatColumns = db.prepare("PRAGMA table_info(chats)").all() as Array<{ name: string }>;
-const chatColumnNames = new Set(chatColumns.map((column) => column.name));
-
-if (!chatColumnNames.has("memory_strategy")) {
-  db.exec(
-    `ALTER TABLE chats ADD COLUMN memory_strategy TEXT NOT NULL DEFAULT '${DEFAULT_MEMORY_STRATEGY}'`
-  );
-}
-if (!chatColumnNames.has("sliding_window_size")) {
-  db.exec(
-    `ALTER TABLE chats ADD COLUMN sliding_window_size INTEGER NOT NULL DEFAULT ${DEFAULT_SLIDING_WINDOW_SIZE}`
-  );
-}
-if (!chatColumnNames.has("sticky_window_size")) {
-  db.exec(
-    `ALTER TABLE chats ADD COLUMN sticky_window_size INTEGER NOT NULL DEFAULT ${DEFAULT_STICKY_WINDOW_SIZE}`
-  );
-}
+const chatsColumns = db.prepare("PRAGMA table_info(chats)").all() as Array<{ name: string }>;
+const chatColumnNames = new Set(chatsColumns.map((column) => column.name));
 if (!chatColumnNames.has("branch_from_chat_id")) {
   db.exec("ALTER TABLE chats ADD COLUMN branch_from_chat_id TEXT");
 }
@@ -232,32 +330,24 @@ if (!chatColumnNames.has("branch_from_chat_title")) {
 if (!chatColumnNames.has("branch_checkpoint_message_count")) {
   db.exec("ALTER TABLE chats ADD COLUMN branch_checkpoint_message_count INTEGER");
 }
-const chatFactsColumns = db.prepare("PRAGMA table_info(chat_facts)").all() as Array<{ name: string }>;
-const chatFactsColumnNames = new Set(chatFactsColumns.map((column) => column.name));
-if (!chatFactsColumnNames.has("goal")) {
-  db.exec(`ALTER TABLE chat_facts ADD COLUMN goal TEXT NOT NULL DEFAULT ''`);
-}
-if (!chatFactsColumnNames.has("constraints")) {
-  db.exec(`ALTER TABLE chat_facts ADD COLUMN constraints TEXT NOT NULL DEFAULT ''`);
-}
-if (!chatFactsColumnNames.has("preferences")) {
-  db.exec(`ALTER TABLE chat_facts ADD COLUMN preferences TEXT NOT NULL DEFAULT ''`);
-}
-if (!chatFactsColumnNames.has("decisions")) {
-  db.exec(`ALTER TABLE chat_facts ADD COLUMN decisions TEXT NOT NULL DEFAULT ''`);
-}
-if (!chatFactsColumnNames.has("agreements")) {
-  db.exec(`ALTER TABLE chat_facts ADD COLUMN agreements TEXT NOT NULL DEFAULT ''`);
-}
-if (!chatFactsColumnNames.has("updated_at")) {
-  db.exec(`ALTER TABLE chat_facts ADD COLUMN updated_at INTEGER NOT NULL DEFAULT ${Date.now()}`);
-}
-db.exec("UPDATE chat_facts SET goal = '' WHERE goal IS NULL");
-db.exec("UPDATE chat_facts SET constraints = '' WHERE constraints IS NULL");
-db.exec("UPDATE chat_facts SET preferences = '' WHERE preferences IS NULL");
-db.exec("UPDATE chat_facts SET decisions = '' WHERE decisions IS NULL");
-db.exec("UPDATE chat_facts SET agreements = '' WHERE agreements IS NULL");
-db.exec(`UPDATE chat_facts SET updated_at = ${Date.now()} WHERE updated_at IS NULL OR updated_at <= 0`);
+
+const ensureGlobalLongTermMemoryStmt = db.prepare(`
+  INSERT INTO global_long_term_memory (
+    scope_id,
+    profile,
+    preferences,
+    decisions,
+    knowledge,
+    manual_lock_profile,
+    manual_lock_preferences,
+    manual_lock_decisions,
+    manual_lock_knowledge,
+    updated_by,
+    updated_at
+  ) VALUES ('global', '', '', '', '', 0, 0, 0, 0, 'auto', ?)
+  ON CONFLICT(scope_id) DO NOTHING
+`);
+ensureGlobalLongTermMemoryStmt.run(Date.now());
 
 const parseModel = (value: unknown): string | undefined => {
   if (typeof value !== "string") {
@@ -267,67 +357,15 @@ const parseModel = (value: unknown): string | undefined => {
   return trimmed || undefined;
 };
 
-const buildBranchChatTitle = (sourceTitle: string): string => {
-  const normalizedSource = sourceTitle.trim() || "New chat";
-  return `${BRANCH_CHAT_TITLE_PREFIX}${normalizedSource}`;
-};
-
-const parseMemoryStrategy = (value: unknown): MemoryStrategy | undefined => {
-  if (typeof value !== "string") {
+const parseAllowedModel = (value: unknown): string | undefined => {
+  const parsed = parseModel(value);
+  if (!parsed) {
     return undefined;
   }
-  const trimmed = value.trim().toLowerCase();
-  if (
-    trimmed === "none" ||
-    trimmed === "sliding_window" ||
-    trimmed === "branching" ||
-    trimmed === "sticky_facts"
-  ) {
-    return trimmed;
-  }
-  return undefined;
+  return ALLOWED_MODELS.has(parsed) ? parsed : undefined;
 };
 
-const parsePositiveInt = (value: unknown): number | undefined => {
-  if (value === undefined || value === null) {
-    return undefined;
-  }
-  let parsed: number | undefined;
-  if (typeof value === "number") {
-    parsed = Number.isFinite(value) ? value : undefined;
-  } else if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (!trimmed) {
-      return undefined;
-    }
-    const nextParsed = Number(trimmed);
-    parsed = Number.isFinite(nextParsed) ? nextParsed : undefined;
-  }
-
-  if (parsed === undefined || !Number.isInteger(parsed) || parsed < 1) {
-    return undefined;
-  }
-  return parsed;
-};
-
-const parseSlidingWindowSize = (value: unknown): number | undefined => parsePositiveInt(value);
-const parseStickyWindowSize = (value: unknown): number | undefined => parsePositiveInt(value);
-
-const ensureImplementedMemoryStrategy = (strategy: MemoryStrategy): string | null => {
-  if (
-    strategy !== "none" &&
-    strategy !== "sliding_window" &&
-    strategy !== "branching" &&
-    strategy !== "sticky_facts"
-  ) {
-    return `memoryStrategy '${strategy}' not implemented yet`;
-  }
-  return null;
-};
-
-const parseReasoningEffort = (
-  value: unknown
-): "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | undefined => {
+const parseReasoningEffort = (value: unknown): ReasoningEffort | undefined => {
   if (typeof value !== "string") {
     return undefined;
   }
@@ -343,6 +381,14 @@ const parseReasoningEffort = (
     return trimmed;
   }
   return undefined;
+};
+
+const parseJsonSafe = (value: string): unknown => {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
 };
 
 const normalizeErrorCode = (value: unknown): string | undefined => {
@@ -380,14 +426,6 @@ const formatUpstreamError = (
     cause,
     hint,
   };
-};
-
-const parseJsonSafe = (value: string): unknown => {
-  try {
-    return JSON.parse(value);
-  } catch {
-    return null;
-  }
 };
 
 const isContextOverflowError = (params: { code?: string; type?: string; message?: string }): boolean => {
@@ -548,11 +586,151 @@ const estimateCostBreakdownUsd = (model: string, usageSummary: UsageSummary): Co
   };
 };
 
+const compactWhitespace = (value: string): string => value.replace(/\s+/g, " ").trim();
+
+const splitSegments = (value: string): string[] => {
+  const normalized = value
+    .replace(/\r/g, "\n")
+    .replace(/[•·▪●]/g, ";")
+    .replace(/\n+/g, ";")
+    .split(";")
+    .map((segment) => segment.trim().replace(/^[-*]\s+/, ""))
+    .map((segment) => segment.replace(/^\d+[.)]\s+/, ""))
+    .map((segment) => compactWhitespace(segment))
+    .filter(Boolean);
+  return normalized;
+};
+
+const compactFactText = (value: string): string => splitSegments(value).join("; ");
+
+const clampWithEllipsis = (value: string, maxLength: number): string => {
+  if (value.length <= maxLength) {
+    return value;
+  }
+  if (maxLength <= 1) {
+    return value.slice(0, maxLength);
+  }
+  return `${value.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+};
+
+const normalizeTextField = (value: unknown, maxLength: number): string => {
+  if (typeof value !== "string") {
+    return "";
+  }
+  const compact = compactFactText(value);
+  if (!compact) {
+    return "";
+  }
+  return clampWithEllipsis(compact, maxLength);
+};
+
+const normalizeShortSummary = (value: unknown): string => normalizeTextField(value, SHORT_TERM_MAX_LENGTH);
+const normalizeWorkingField = (value: unknown): string => normalizeTextField(value, WORKING_FIELD_MAX_LENGTH);
+const normalizeLongTermField = (value: unknown): string => normalizeTextField(value, LONG_TERM_FIELD_MAX_LENGTH);
+const normalizeCandidateValue = (value: unknown): string => normalizeTextField(value, CANDIDATE_VALUE_MAX_LENGTH);
+
+const extractJsonObject = (value: string): string | null => {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const withoutFence = trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  if (withoutFence.startsWith("{") && withoutFence.endsWith("}")) {
+    return withoutFence;
+  }
+
+  const first = withoutFence.indexOf("{");
+  const last = withoutFence.lastIndexOf("}");
+  if (first < 0 || last <= first) {
+    return null;
+  }
+  return withoutFence.slice(first, last + 1);
+};
+
+const parseMemoryUpdaterOutput = (value: string): MemoryUpdaterOutput | null => {
+  const jsonText = extractJsonObject(value);
+  if (!jsonText) {
+    return null;
+  }
+  const parsed = parseJsonSafe(jsonText);
+  if (!parsed || typeof parsed !== "object") {
+    return null;
+  }
+
+  const candidate = parsed as {
+    shortTerm?: { rollingSummary?: unknown };
+    working?: { goal?: unknown; constraints?: unknown; status?: unknown; nextSteps?: unknown };
+    longTermCandidates?: Array<{ targetField?: unknown; value?: unknown; reason?: unknown }>;
+  };
+
+  const fields = new Set<LongTermField>(["profile", "preferences", "decisions", "knowledge"]);
+  const longTermCandidates = Array.isArray(candidate.longTermCandidates)
+    ? candidate.longTermCandidates
+        .map((item) => {
+          const targetField =
+            typeof item?.targetField === "string" && fields.has(item.targetField as LongTermField)
+              ? (item.targetField as LongTermField)
+              : null;
+          const value = normalizeCandidateValue(item?.value);
+          const reason = normalizeTextField(item?.reason, 240);
+          if (!targetField || !value) {
+            return null;
+          }
+          return {
+            targetField,
+            value,
+            reason,
+          };
+        })
+        .filter((item): item is NonNullable<typeof item> => Boolean(item))
+    : [];
+
+  return {
+    shortTerm: {
+      rollingSummary: normalizeShortSummary(candidate.shortTerm?.rollingSummary),
+    },
+    working: {
+      goal: normalizeWorkingField(candidate.working?.goal),
+      constraints: normalizeWorkingField(candidate.working?.constraints),
+      status: normalizeWorkingField(candidate.working?.status),
+      nextSteps: normalizeWorkingField(candidate.working?.nextSteps),
+    },
+    longTermCandidates,
+  };
+};
+
+const dedupeSegments = (segments: string[]): string[] => {
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const segment of segments) {
+    const key = segment.trim().toLowerCase();
+    if (!key || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    unique.push(segment.trim());
+  }
+  return unique;
+};
+
+const mergeLongTermFieldValue = (current: string, incoming: string): string => {
+  const currentSegments = splitSegments(current);
+  const incomingSegments = splitSegments(incoming);
+  const merged = dedupeSegments([...currentSegments, ...incomingSegments]).join("; ");
+  return clampWithEllipsis(merged, LONG_TERM_FIELD_MAX_LENGTH);
+};
+
+const buildBranchChatTitle = (sourceTitle: string): string => {
+  const normalizedSource = sourceTitle.trim() || "New chat";
+  return `${BRANCH_CHAT_TITLE_PREFIX}${normalizedSource}`;
+};
+
 const buildOpenAiRequestBody = (params: {
   model: string;
   systemPrompt: string;
   inputMessages: Array<{ role: Role; content: string }>;
-  reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  reasoningEffort?: ReasoningEffort;
 }): Record<string, unknown> => {
   const { model, systemPrompt, inputMessages, reasoningEffort } = params;
   const body: Record<string, unknown> = {
@@ -570,40 +748,43 @@ const buildOpenAiRequestBody = (params: {
   return body;
 };
 
-const buildFactsUpdateRequestBody = (params: {
-  factsModel: string;
-  currentFacts: StickyFactsCore;
-  recentMessages: Array<{ role: Role; content: string }>;
+const buildMemoryUpdateRequestBody = (params: {
+  memoryModel: string;
+  previousSummary: string;
+  working: { goal: string; constraints: string; status: string; nextSteps: string };
+  longTerm: { profile: string; preferences: string; decisions: string; knowledge: string };
+  newMessages: Array<{ role: Role; content: string }>;
   latestUserPrompt: string;
 }): Record<string, unknown> => {
-  const { factsModel, currentFacts, recentMessages, latestUserPrompt } = params;
+  const { memoryModel, previousSummary, working, longTerm, newMessages, latestUserPrompt } = params;
   return {
-    model: factsModel,
+    model: memoryModel,
     stream: false,
     truncation: "disabled",
     instructions: [
-      "You update sticky conversation facts for a chat assistant.",
-      "Return only a JSON object with exactly these keys:",
-      "goal, constraints, preferences, decisions, agreements.",
-      "Each value must be a plain string.",
-      "Keep existing facts if not contradicted by new evidence.",
-      "Use the same language as the conversation.",
-      "Be compact and precise.",
-      "For each field use short phrases separated by '; '.",
-      "Avoid long narrative sentences and explanations.",
-      "Character limits: goal<=180, constraints<=180, preferences<=180, decisions<=320, agreements<=180.",
-      "For decisions include only confirmed decisions with concrete values/options.",
-      "Do not include questions, tentative ideas, or unresolved options in decisions.",
-      "If a field has no clear information, return an empty string.",
+      "Ты обновляешь слои памяти ассистента.",
+      "Верни строго один JSON-объект без markdown и пояснений.",
+      "Формат:",
+      '{"shortTerm":{"rollingSummary":""},"working":{"goal":"","constraints":"","status":"","nextSteps":""},"longTermCandidates":[{"targetField":"profile|preferences|decisions|knowledge","value":"","reason":""}]}',
+      "Правила:",
+      "1) shortTerm.rollingSummary: обнови накопительное саммари диалога (прошлое саммари + новые сообщения).",
+      "2) working: только текущее состояние задачи (goal, constraints, status, nextSteps).",
+      "3) longTermCandidates: только потенциально долговременные факты. Не переноси ничего напрямую в long-term.",
+      "4) Не дублируй одинаковые кандидаты.",
+      "5) Пиши компактно, короткими фразами через '; '.",
+      "6) Если данных нет, используй пустую строку.",
+      "7) Лимиты символов: rollingSummary<=1800, working fields<=320, candidate value<=320, reason<=240.",
     ].join("\n"),
     input: [
       {
         role: "user",
         content: JSON.stringify(
           {
-            currentFacts,
+            previousSummary,
+            working,
+            longTerm,
             latestUserPrompt,
-            recentMessages,
+            newMessages,
           },
           null,
           2
@@ -613,14 +794,16 @@ const buildFactsUpdateRequestBody = (params: {
   };
 };
 
-const updateStickyFactsViaModel = async (params: {
-  factsModel: string;
-  currentFacts: StickyFactsCore;
-  recentMessages: Array<{ role: Role; content: string }>;
+const updateMemoryViaModel = async (params: {
+  memoryModel: string;
+  previousSummary: string;
+  working: { goal: string; constraints: string; status: string; nextSteps: string };
+  longTerm: { profile: string; preferences: string; decisions: string; knowledge: string };
+  newMessages: Array<{ role: Role; content: string }>;
   latestUserPrompt: string;
   signal: AbortSignal;
-}): Promise<StickyFacts> => {
-  const requestBody = buildFactsUpdateRequestBody(params);
+}): Promise<MemoryUpdaterOutput> => {
+  const requestBody = buildMemoryUpdateRequestBody(params);
   const upstream = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: {
@@ -633,7 +816,7 @@ const updateStickyFactsViaModel = async (params: {
 
   if (!upstream.ok) {
     const payloadText = await upstream.text();
-    throw new Error(`facts updater failed (${upstream.status}): ${payloadText}`);
+    throw new Error(`memory updater failed (${upstream.status}): ${payloadText}`);
   }
 
   const responseText = await upstream.text();
@@ -643,40 +826,49 @@ const updateStickyFactsViaModel = async (params: {
       }
     | null;
   if (!payload || typeof payload !== "object") {
-    throw new Error("facts updater returned invalid JSON envelope");
+    throw new Error("memory updater returned invalid JSON envelope");
   }
 
   const completedText =
     extractCompletedText(payload) ||
     (typeof payload.output_text === "string" ? payload.output_text : "");
-  const parsedFacts = parseStickyFactsFromText(completedText);
-  if (!parsedFacts || typeof parsedFacts !== "object") {
-    throw new Error("facts updater returned invalid facts object");
+  const parsed = parseMemoryUpdaterOutput(completedText);
+  if (!parsed) {
+    throw new Error("memory updater returned invalid JSON object");
   }
 
-  return createStickyFacts(sanitizeStickyFacts(parsedFacts, params.currentFacts), Date.now());
+  return parsed;
 };
 
-const applyMemoryStrategy = (params: {
-  messages: Array<{ role: Role; content: string }>;
-  memoryStrategy: MemoryStrategy;
-  slidingWindowSize: number;
-  stickyWindowSize: number;
-}): Array<{ role: Role; content: string }> => {
-  const { messages, memoryStrategy, slidingWindowSize, stickyWindowSize } = params;
-  if (memoryStrategy === "none") {
-    return messages;
+const buildMemoryBlock = (params: {
+  shortTerm: { rollingSummary: string };
+  working: { goal: string; constraints: string; status: string; nextSteps: string };
+  longTerm: { profile: string; preferences: string; decisions: string; knowledge: string };
+}): string => {
+  const { shortTerm, working, longTerm } = params;
+  return [
+    "MEMORY_LAYERS",
+    "SHORT_TERM:",
+    `- rolling_summary: ${shortTerm.rollingSummary || "(empty)"}`,
+    "WORKING_MEMORY:",
+    `- goal: ${working.goal || "(empty)"}`,
+    `- constraints: ${working.constraints || "(empty)"}`,
+    `- status: ${working.status || "(empty)"}`,
+    `- next_steps: ${working.nextSteps || "(empty)"}`,
+    "LONG_TERM_MEMORY:",
+    `- profile: ${longTerm.profile || "(empty)"}`,
+    `- preferences: ${longTerm.preferences || "(empty)"}`,
+    `- decisions: ${longTerm.decisions || "(empty)"}`,
+    `- knowledge: ${longTerm.knowledge || "(empty)"}`,
+  ].join("\n");
+};
+
+const mergeSystemPromptWithMemory = (systemPrompt: string, memoryBlock: string): string => {
+  const normalizedPrompt = systemPrompt.trim();
+  if (!normalizedPrompt) {
+    return memoryBlock;
   }
-  if (memoryStrategy === "sliding_window") {
-    return messages.slice(-slidingWindowSize);
-  }
-  if (memoryStrategy === "sticky_facts") {
-    return messages.slice(-stickyWindowSize);
-  }
-  if (memoryStrategy === "branching") {
-    return messages;
-  }
-  throw new Error(`Unsupported memoryStrategy '${memoryStrategy}'`);
+  return `${normalizedPrompt}\n\n${memoryBlock}`;
 };
 
 const getChatStmt = db.prepare(`
@@ -743,6 +935,15 @@ const listMessagesStmt = db.prepare(`
   ORDER BY created_at ASC
 `);
 
+const listMessagesForMemoryStmt = db.prepare(`
+  SELECT
+    role,
+    content
+  FROM messages
+  WHERE chat_id = ?
+  ORDER BY created_at ASC
+`);
+
 const listMessagesForBranchStmt = db.prepare(`
   SELECT
     role,
@@ -788,266 +989,399 @@ const insertMessageStmt = db.prepare(`
 `);
 
 const updateChatUpdatedAtStmt = db.prepare(`UPDATE chats SET updated_at = ? WHERE id = ?`);
-const getChatFactsStmt = db.prepare(`
+
+const getShortMemoryStmt = db.prepare(`
   SELECT
-    goal,
-    constraints,
-    preferences,
-    decisions,
-    agreements,
+    chat_id AS chatId,
+    rolling_summary AS rollingSummary,
+    last_processed_message_count AS lastProcessedMessageCount,
     updated_at AS updatedAt
-  FROM chat_facts
+  FROM chat_short_memory
   WHERE chat_id = ?
 `);
-const upsertChatFactsStmt = db.prepare(`
-  INSERT INTO chat_facts (chat_id, goal, constraints, preferences, decisions, agreements, updated_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?)
+
+const upsertShortMemoryStmt = db.prepare(`
+  INSERT INTO chat_short_memory (chat_id, rolling_summary, last_processed_message_count, updated_at)
+  VALUES (?, ?, ?, ?)
   ON CONFLICT(chat_id) DO UPDATE SET
-    goal = excluded.goal,
-    constraints = excluded.constraints,
-    preferences = excluded.preferences,
-    decisions = excluded.decisions,
-    agreements = excluded.agreements,
+    rolling_summary = excluded.rolling_summary,
+    last_processed_message_count = excluded.last_processed_message_count,
     updated_at = excluded.updated_at
 `);
 
-const emptyStickyFactsCore = (): StickyFactsCore => ({
+const getWorkingMemoryStmt = db.prepare(`
+  SELECT
+    chat_id AS chatId,
+    goal,
+    constraints,
+    status,
+    next_steps AS nextSteps,
+    manual_lock_goal AS manualLockGoal,
+    manual_lock_constraints AS manualLockConstraints,
+    manual_lock_status AS manualLockStatus,
+    manual_lock_next_steps AS manualLockNextSteps,
+    updated_by AS updatedBy,
+    updated_at AS updatedAt
+  FROM chat_working_memory
+  WHERE chat_id = ?
+`);
+
+const upsertWorkingMemoryStmt = db.prepare(`
+  INSERT INTO chat_working_memory (
+    chat_id,
+    goal,
+    constraints,
+    status,
+    next_steps,
+    manual_lock_goal,
+    manual_lock_constraints,
+    manual_lock_status,
+    manual_lock_next_steps,
+    updated_by,
+    updated_at
+  )
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  ON CONFLICT(chat_id) DO UPDATE SET
+    goal = excluded.goal,
+    constraints = excluded.constraints,
+    status = excluded.status,
+    next_steps = excluded.next_steps,
+    manual_lock_goal = excluded.manual_lock_goal,
+    manual_lock_constraints = excluded.manual_lock_constraints,
+    manual_lock_status = excluded.manual_lock_status,
+    manual_lock_next_steps = excluded.manual_lock_next_steps,
+    updated_by = excluded.updated_by,
+    updated_at = excluded.updated_at
+`);
+
+const getLongTermMemoryStmt = db.prepare(`
+  SELECT
+    scope_id AS scopeId,
+    profile,
+    preferences,
+    decisions,
+    knowledge,
+    manual_lock_profile AS manualLockProfile,
+    manual_lock_preferences AS manualLockPreferences,
+    manual_lock_decisions AS manualLockDecisions,
+    manual_lock_knowledge AS manualLockKnowledge,
+    updated_by AS updatedBy,
+    updated_at AS updatedAt
+  FROM global_long_term_memory
+  WHERE scope_id = ?
+`);
+
+const upsertLongTermMemoryStmt = db.prepare(`
+  INSERT INTO global_long_term_memory (
+    scope_id,
+    profile,
+    preferences,
+    decisions,
+    knowledge,
+    manual_lock_profile,
+    manual_lock_preferences,
+    manual_lock_decisions,
+    manual_lock_knowledge,
+    updated_by,
+    updated_at
+  )
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  ON CONFLICT(scope_id) DO UPDATE SET
+    profile = excluded.profile,
+    preferences = excluded.preferences,
+    decisions = excluded.decisions,
+    knowledge = excluded.knowledge,
+    manual_lock_profile = excluded.manual_lock_profile,
+    manual_lock_preferences = excluded.manual_lock_preferences,
+    manual_lock_decisions = excluded.manual_lock_decisions,
+    manual_lock_knowledge = excluded.manual_lock_knowledge,
+    updated_by = excluded.updated_by,
+    updated_at = excluded.updated_at
+`);
+
+const listPendingCandidatesByChatStmt = db.prepare(`
+  SELECT
+    id,
+    chat_id AS chatId,
+    target_field AS targetField,
+    value,
+    reason,
+    status,
+    created_at AS createdAt,
+    resolved_at AS resolvedAt
+  FROM long_term_candidates
+  WHERE chat_id = ? AND status = 'pending'
+  ORDER BY created_at ASC
+`);
+
+const getCandidateByIdStmt = db.prepare(`
+  SELECT
+    id,
+    chat_id AS chatId,
+    target_field AS targetField,
+    value,
+    reason,
+    status,
+    created_at AS createdAt,
+    resolved_at AS resolvedAt
+  FROM long_term_candidates
+  WHERE id = ?
+`);
+
+const findPendingDuplicateCandidateStmt = db.prepare(`
+  SELECT id
+  FROM long_term_candidates
+  WHERE chat_id = ? AND target_field = ? AND lower(value) = lower(?) AND status = 'pending'
+  LIMIT 1
+`);
+
+const insertLongTermCandidateStmt = db.prepare(`
+  INSERT INTO long_term_candidates (
+    id,
+    chat_id,
+    target_field,
+    value,
+    reason,
+    status,
+    created_at,
+    resolved_at
+  )
+  VALUES (?, ?, ?, ?, ?, 'pending', ?, NULL)
+`);
+
+const resolveCandidateStmt = db.prepare(`
+  UPDATE long_term_candidates
+  SET status = ?, resolved_at = ?
+  WHERE id = ?
+`);
+
+const createDefaultShortMemory = (chatId: string, now = Date.now()): ShortTermMemoryRow => ({
+  chatId,
+  rollingSummary: "",
+  lastProcessedMessageCount: 0,
+  updatedAt: now,
+});
+
+const createDefaultWorkingMemory = (chatId: string, now = Date.now()): WorkingMemoryRow => ({
+  chatId,
   goal: "",
   constraints: "",
+  status: "",
+  nextSteps: "",
+  manualLockGoal: 0,
+  manualLockConstraints: 0,
+  manualLockStatus: 0,
+  manualLockNextSteps: 0,
+  updatedBy: "auto",
+  updatedAt: now,
+});
+
+const createDefaultLongTermMemory = (now = Date.now()): LongTermMemoryRow => ({
+  scopeId: GLOBAL_LONG_TERM_SCOPE_ID,
+  profile: "",
   preferences: "",
   decisions: "",
-  agreements: "",
+  knowledge: "",
+  manualLockProfile: 0,
+  manualLockPreferences: 0,
+  manualLockDecisions: 0,
+  manualLockKnowledge: 0,
+  updatedBy: "auto",
+  updatedAt: now,
 });
 
-const createStickyFacts = (core?: Partial<StickyFactsCore>, updatedAt = Date.now()): StickyFacts => ({
-  ...emptyStickyFactsCore(),
-  ...core,
-  updatedAt,
-});
-
-const clampFactLength = (value: string, maxLength: number): string => {
-  if (value.length <= maxLength) {
-    return value;
-  }
-  const clipped = value.slice(0, Math.max(0, maxLength - 1)).trimEnd();
-  return `${clipped}…`;
-};
-
-const splitFactSegments = (value: string): string[] => {
-  const withUnifiedSeparators = value
-    .replace(/\r/g, "\n")
-    .replace(/[•·▪●]/g, ";")
-    .replace(/\n+/g, ";");
-  return withUnifiedSeparators
-    .split(";")
-    .map((segment) => segment.trim().replace(/^[-*]\s+/, ""))
-    .map((segment) => segment.replace(/^\d+[.)]\s+/, ""))
-    .map((segment) => segment.replace(/\s+/g, " ").trim())
-    .filter(Boolean);
-};
-
-const compactFactText = (value: string): string => splitFactSegments(value).join("; ");
-
-const isUncertainDecisionSegment = (segment: string): boolean =>
-  DECISION_UNCERTAINTY_PATTERNS.some((pattern) => pattern.test(segment));
-
-const normalizeStickyFactValue = (
-  key: keyof StickyFactsCore,
-  value: unknown,
-  fallbackNormalized: string
-): string => {
-  if (typeof value !== "string") {
-    return fallbackNormalized;
-  }
-
-  const compact = compactFactText(value);
-  if (!compact) {
-    return "";
-  }
-
-  if (key === "decisions") {
-    const confirmedSegments = splitFactSegments(compact).filter(
-      (segment) => !isUncertainDecisionSegment(segment)
-    );
-    if (confirmedSegments.length === 0) {
-      return fallbackNormalized || "";
-    }
-    return clampFactLength(confirmedSegments.join("; "), STICKY_FACTS_MAX_LENGTH[key]);
-  }
-
-  return clampFactLength(compact, STICKY_FACTS_MAX_LENGTH[key]);
-};
-
-const sanitizeStickyFacts = (candidate: unknown, fallback: StickyFactsCore): StickyFactsCore => {
-  const objectCandidate =
-    candidate && typeof candidate === "object" ? (candidate as Record<string, unknown>) : undefined;
-  const fallbackNormalized = STICKY_FACTS_FIELDS.reduce<StickyFactsCore>((acc, key) => {
-    const normalized = compactFactText(fallback[key]);
-    acc[key] = normalized ? clampFactLength(normalized, STICKY_FACTS_MAX_LENGTH[key]) : "";
-    return acc;
-  }, emptyStickyFactsCore());
-  const nextFacts: StickyFactsCore = { ...fallbackNormalized };
-
-  for (const key of STICKY_FACTS_FIELDS) {
-    nextFacts[key] = normalizeStickyFactValue(
-      key,
-      objectCandidate?.[key],
-      fallbackNormalized[key]
-    );
-  }
-
-  return nextFacts;
-};
-
-const extractJsonObject = (value: string): string | null => {
-  const trimmed = value.trim();
-  if (!trimmed) {
-    return null;
-  }
-
-  const withoutFence = trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
-  if (withoutFence.startsWith("{") && withoutFence.endsWith("}")) {
-    return withoutFence;
-  }
-
-  const first = withoutFence.indexOf("{");
-  const last = withoutFence.lastIndexOf("}");
-  if (first < 0 || last <= first) {
-    return null;
-  }
-  return withoutFence.slice(first, last + 1);
-};
-
-const parseStickyFactsFromText = (value: string): unknown => {
-  const jsonText = extractJsonObject(value);
-  if (!jsonText) {
-    return null;
-  }
-  return parseJsonSafe(jsonText);
-};
-
-const runStickyFactsSelfChecks = (): void => {
-  assert.equal(compactFactText("  alpha \n- beta\n3) gamma  "), "alpha; beta; gamma");
-  assert.equal(clampFactLength("abcdef", 4), "abc…");
-
-  const fallback: StickyFactsCore = {
-    goal: "Ship beta",
-    constraints: "",
-    preferences: "Short replies",
-    decisions: "Use gpt-4.1-nano",
-    agreements: "",
-  };
-
-  const normalized = sanitizeStickyFacts(
-    {
-      goal: "  Launch   web   app  \nwith analytics ",
-      decisions: "Choose plan A; maybe plan B?; Set N=6",
-      agreements: "Weekly sync \n Friday",
-    },
-    fallback
-  );
-  assert.equal(normalized.goal, "Launch web app; with analytics");
-  assert.equal(normalized.decisions, "Choose plan A; Set N=6");
-  assert.equal(normalized.agreements, "Weekly sync; Friday");
-
-  const uncertainOnly = sanitizeStickyFacts(
-    {
-      decisions: "Maybe use another model?; TBD",
-    },
-    fallback
-  );
-  assert.equal(uncertainOnly.decisions, "Use gpt-4.1-nano");
-
-  const emptyField = sanitizeStickyFacts(
-    {
-      goal: " \n ",
-    },
-    fallback
-  );
-  assert.equal(emptyField.goal, "");
-
-  const invalidValues = sanitizeStickyFacts(
-    {
-      goal: 42,
-      agreements: null,
-    },
-    fallback
-  );
-  assert.equal(invalidValues.goal, "Ship beta");
-  assert.equal(invalidValues.agreements, "");
-
-  const longFacts = sanitizeStickyFacts(
-    {
-      goal: "g".repeat(500),
-      decisions: "d".repeat(700),
-    },
-    fallback
-  );
-  assert.equal(longFacts.goal.length, 180);
-  assert.equal(longFacts.decisions.length, 320);
-  assert.equal(longFacts.goal.endsWith("…"), true);
-  assert.equal(longFacts.decisions.endsWith("…"), true);
-};
-
-runStickyFactsSelfChecks();
-
-const buildStickyFactsBlock = (facts: StickyFactsCore): string =>
-  [
-    "Sticky facts:",
-    `goal: ${facts.goal || "(empty)"}`,
-    `constraints: ${facts.constraints || "(empty)"}`,
-    `preferences: ${facts.preferences || "(empty)"}`,
-    `decisions: ${facts.decisions || "(empty)"}`,
-    `agreements: ${facts.agreements || "(empty)"}`,
-  ].join("\n");
-
-const mergeSystemPromptWithFacts = (systemPrompt: string, facts: StickyFactsCore): string => {
-  const normalizedPrompt = systemPrompt.trim();
-  const stickyFactsBlock = buildStickyFactsBlock(facts);
-  if (!normalizedPrompt) {
-    return stickyFactsBlock;
-  }
-  return `${normalizedPrompt}\n\n${stickyFactsBlock}`;
-};
-
-const getOrCreateChatFacts = (chatId: string): StickyFacts => {
-  const existing = getChatFactsStmt.get(chatId) as StickyFacts | undefined;
+const getOrCreateShortMemory = (chatId: string): ShortTermMemoryRow => {
+  const existing = getShortMemoryStmt.get(chatId) as ShortTermMemoryRow | undefined;
   if (existing) {
-    return createStickyFacts(existing, existing.updatedAt);
+    return existing;
   }
-  const created = createStickyFacts();
-  upsertChatFactsStmt.run(
-    chatId,
-    created.goal,
-    created.constraints,
-    created.preferences,
-    created.decisions,
-    created.agreements,
+  const created = createDefaultShortMemory(chatId);
+  upsertShortMemoryStmt.run(
+    created.chatId,
+    created.rollingSummary,
+    created.lastProcessedMessageCount,
     created.updatedAt
   );
   return created;
 };
 
-const saveChatFacts = (chatId: string, facts: StickyFacts): StickyFacts => {
-  upsertChatFactsStmt.run(
-    chatId,
-    facts.goal,
-    facts.constraints,
-    facts.preferences,
-    facts.decisions,
-    facts.agreements,
-    facts.updatedAt
+const getOrCreateWorkingMemory = (chatId: string): WorkingMemoryRow => {
+  const existing = getWorkingMemoryStmt.get(chatId) as WorkingMemoryRow | undefined;
+  if (existing) {
+    return existing;
+  }
+  const created = createDefaultWorkingMemory(chatId);
+  upsertWorkingMemoryStmt.run(
+    created.chatId,
+    created.goal,
+    created.constraints,
+    created.status,
+    created.nextSteps,
+    created.manualLockGoal,
+    created.manualLockConstraints,
+    created.manualLockStatus,
+    created.manualLockNextSteps,
+    created.updatedBy,
+    created.updatedAt
   );
-  return facts;
+  return created;
+};
+
+const getOrCreateLongTermMemory = (): LongTermMemoryRow => {
+  const existing = getLongTermMemoryStmt.get(GLOBAL_LONG_TERM_SCOPE_ID) as LongTermMemoryRow | undefined;
+  if (existing) {
+    return existing;
+  }
+  const created = createDefaultLongTermMemory();
+  upsertLongTermMemoryStmt.run(
+    created.scopeId,
+    created.profile,
+    created.preferences,
+    created.decisions,
+    created.knowledge,
+    created.manualLockProfile,
+    created.manualLockPreferences,
+    created.manualLockDecisions,
+    created.manualLockKnowledge,
+    created.updatedBy,
+    created.updatedAt
+  );
+  return created;
+};
+
+const persistShortMemory = (memory: ShortTermMemoryRow): ShortTermMemoryRow => {
+  upsertShortMemoryStmt.run(
+    memory.chatId,
+    memory.rollingSummary,
+    memory.lastProcessedMessageCount,
+    memory.updatedAt
+  );
+  return memory;
+};
+
+const persistWorkingMemory = (memory: WorkingMemoryRow): WorkingMemoryRow => {
+  upsertWorkingMemoryStmt.run(
+    memory.chatId,
+    memory.goal,
+    memory.constraints,
+    memory.status,
+    memory.nextSteps,
+    memory.manualLockGoal,
+    memory.manualLockConstraints,
+    memory.manualLockStatus,
+    memory.manualLockNextSteps,
+    memory.updatedBy,
+    memory.updatedAt
+  );
+  return memory;
+};
+
+const persistLongTermMemory = (memory: LongTermMemoryRow): LongTermMemoryRow => {
+  upsertLongTermMemoryStmt.run(
+    memory.scopeId,
+    memory.profile,
+    memory.preferences,
+    memory.decisions,
+    memory.knowledge,
+    memory.manualLockProfile,
+    memory.manualLockPreferences,
+    memory.manualLockDecisions,
+    memory.manualLockKnowledge,
+    memory.updatedBy,
+    memory.updatedAt
+  );
+  return memory;
+};
+
+const toSnapshot = (
+  shortTerm: ShortTermMemoryRow,
+  working: WorkingMemoryRow,
+  longTerm: LongTermMemoryRow,
+  pendingCandidates: LongTermCandidateRow[]
+): ChatMemorySnapshot => ({
+  shortTerm: {
+    rollingSummary: shortTerm.rollingSummary,
+    lastProcessedMessageCount: shortTerm.lastProcessedMessageCount,
+    updatedAt: shortTerm.updatedAt,
+  },
+  working: {
+    goal: working.goal,
+    constraints: working.constraints,
+    status: working.status,
+    nextSteps: working.nextSteps,
+    updatedBy: working.updatedBy,
+    updatedAt: working.updatedAt,
+  },
+  longTerm: {
+    profile: longTerm.profile,
+    preferences: longTerm.preferences,
+    decisions: longTerm.decisions,
+    knowledge: longTerm.knowledge,
+    updatedBy: longTerm.updatedBy,
+    updatedAt: longTerm.updatedAt,
+  },
+  pendingCandidates: pendingCandidates.map((candidate) => ({
+    id: candidate.id,
+    chatId: candidate.chatId,
+    targetField: candidate.targetField,
+    value: candidate.value,
+    reason: candidate.reason,
+    status: candidate.status,
+    createdAt: candidate.createdAt,
+    resolvedAt: candidate.resolvedAt,
+  })),
+});
+
+const getMemorySnapshotForChat = (chatId: string): ChatMemorySnapshot => {
+  const shortTerm = getOrCreateShortMemory(chatId);
+  const working = getOrCreateWorkingMemory(chatId);
+  const longTerm = getOrCreateLongTermMemory();
+  const pending = listPendingCandidatesByChatStmt.all(chatId) as LongTermCandidateRow[];
+  return toSnapshot(shortTerm, working, longTerm, pending);
+};
+
+const applyAutoWorkingUpdate = (
+  current: WorkingMemoryRow,
+  incoming: MemoryUpdaterOutput["working"],
+  now = Date.now()
+): WorkingMemoryRow => {
+  const next: WorkingMemoryRow = {
+    ...current,
+    goal: current.manualLockGoal ? current.goal : incoming.goal,
+    constraints: current.manualLockConstraints ? current.constraints : incoming.constraints,
+    status: current.manualLockStatus ? current.status : incoming.status,
+    nextSteps: current.manualLockNextSteps ? current.nextSteps : incoming.nextSteps,
+    updatedBy: "auto",
+    updatedAt: now,
+  };
+  return next;
+};
+
+const insertPendingCandidates = (chatId: string, candidates: MemoryUpdaterOutput["longTermCandidates"], now: number) => {
+  for (const candidate of candidates) {
+    const duplicate = findPendingDuplicateCandidateStmt.get(
+      chatId,
+      candidate.targetField,
+      candidate.value
+    ) as { id: string } | undefined;
+    if (duplicate) {
+      continue;
+    }
+    insertLongTermCandidateStmt.run(
+      createId(),
+      chatId,
+      candidate.targetField,
+      candidate.value,
+      candidate.reason,
+      now
+    );
+  }
 };
 
 const createChat = (params?: {
   title?: string;
   model?: string;
   systemPrompt?: string;
-  memoryStrategy?: string;
-  slidingWindowSize?: number | string;
-  stickyWindowSize?: number | string;
   branchFromChatId?: string | null;
   branchFromChatTitle?: string | null;
   branchCheckpointMessageCount?: number | null;
@@ -1057,10 +1391,6 @@ const createChat = (params?: {
   const title = params?.title?.trim() || "New chat";
   const model = parseAllowedModel(params?.model) ?? EFFECTIVE_DEFAULT_MODEL;
   const systemPrompt = params?.systemPrompt?.trim() ?? "";
-  const memoryStrategy = parseMemoryStrategy(params?.memoryStrategy) ?? DEFAULT_MEMORY_STRATEGY;
-  const slidingWindowSize =
-    parseSlidingWindowSize(params?.slidingWindowSize) ?? DEFAULT_SLIDING_WINDOW_SIZE;
-  const stickyWindowSize = parseStickyWindowSize(params?.stickyWindowSize) ?? DEFAULT_STICKY_WINDOW_SIZE;
   const branchFromChatId =
     typeof params?.branchFromChatId === "string" && params.branchFromChatId.trim()
       ? params.branchFromChatId.trim()
@@ -1075,21 +1405,26 @@ const createChat = (params?: {
     params.branchCheckpointMessageCount >= 0
       ? params.branchCheckpointMessageCount
       : null;
+
   insertChatStmt.run(
     id,
     title,
     model,
     systemPrompt,
-    memoryStrategy,
-    slidingWindowSize,
-    stickyWindowSize,
+    "none",
+    6,
+    6,
     branchFromChatId,
     branchFromChatTitle,
     branchCheckpointMessageCount,
     now,
     now
   );
-  saveChatFacts(id, createStickyFacts(undefined, now));
+
+  persistShortMemory(createDefaultShortMemory(id, now));
+  persistWorkingMemory(createDefaultWorkingMemory(id, now));
+  getOrCreateLongTermMemory();
+
   return getChatStmt.get(id);
 };
 
@@ -1108,41 +1443,9 @@ app.post<{ Body: CreateChatBody }>("/api/chats", async (request, reply) => {
     return { error: MODEL_VALIDATION_ERROR };
   }
 
-  const requestedMemoryStrategyRaw = request.body?.memoryStrategy;
-  const requestedMemoryStrategy = parseMemoryStrategy(requestedMemoryStrategyRaw);
-  if (requestedMemoryStrategyRaw !== undefined && requestedMemoryStrategy === undefined) {
-    reply.code(400);
-    return { error: "memoryStrategy must be one of: none, sliding_window, branching, sticky_facts" };
-  }
-
-  const memoryStrategy = requestedMemoryStrategy ?? DEFAULT_MEMORY_STRATEGY;
-  const memoryStrategyError = ensureImplementedMemoryStrategy(memoryStrategy);
-  if (memoryStrategyError) {
-    reply.code(400);
-    return { error: memoryStrategyError };
-  }
-
-  const requestedSlidingWindowSizeRaw = request.body?.slidingWindowSize;
-  const requestedSlidingWindowSize = parseSlidingWindowSize(requestedSlidingWindowSizeRaw);
-  if (requestedSlidingWindowSizeRaw !== undefined && requestedSlidingWindowSize === undefined) {
-    reply.code(400);
-    return { error: "slidingWindowSize must be an integer >= 1" };
-  }
-  const requestedStickyWindowSizeRaw = request.body?.stickyWindowSize;
-  const requestedStickyWindowSize = parseStickyWindowSize(requestedStickyWindowSizeRaw);
-  if (requestedStickyWindowSizeRaw !== undefined && requestedStickyWindowSize === undefined) {
-    reply.code(400);
-    return { error: "stickyWindowSize must be an integer >= 1" };
-  }
-
-  const slidingWindowSize = requestedSlidingWindowSize ?? DEFAULT_SLIDING_WINDOW_SIZE;
-  const stickyWindowSize = requestedStickyWindowSize ?? DEFAULT_STICKY_WINDOW_SIZE;
   const chat = createChat({
     ...request.body,
     model: requestedModel,
-    memoryStrategy,
-    slidingWindowSize,
-    stickyWindowSize,
   });
   return { chat };
 });
@@ -1155,8 +1458,19 @@ app.get<{ Params: { id: string } }>("/api/chats/:id/messages", async (request, r
     return { error: "chat not found" };
   }
   const messages = listMessagesStmt.all(chatId);
-  const facts = getOrCreateChatFacts(chatId);
-  return { messages, facts };
+  return { messages };
+});
+
+app.get<{ Params: { id: string } }>("/api/chats/:id/memory", async (request, reply) => {
+  const chatId = request.params.id;
+  const chat = getChatStmt.get(chatId);
+  if (!chat) {
+    reply.code(404);
+    return { error: "chat not found" };
+  }
+
+  const snapshot = getMemorySnapshotForChat(chatId);
+  return snapshot;
 });
 
 app.patch<{ Params: { id: string }; Body: PatchChatBody }>("/api/chats/:id", async (request, reply) => {
@@ -1167,7 +1481,7 @@ app.patch<{ Params: { id: string }; Body: PatchChatBody }>("/api/chats/:id", asy
         title: string;
         model: string;
         systemPrompt: string;
-        memoryStrategy: MemoryStrategy;
+        memoryStrategy: string;
         slidingWindowSize: number;
         stickyWindowSize: number;
         branchFromChatId: string | null;
@@ -1188,60 +1502,193 @@ app.patch<{ Params: { id: string }; Body: PatchChatBody }>("/api/chats/:id", asy
     reply.code(400);
     return { error: MODEL_VALIDATION_ERROR };
   }
+
   const model = requestedModel ?? chat.model;
   const systemPrompt =
     typeof request.body?.systemPrompt === "string" ? request.body.systemPrompt : chat.systemPrompt;
-  const requestedMemoryStrategyRaw = request.body?.memoryStrategy;
-  const requestedMemoryStrategy = parseMemoryStrategy(requestedMemoryStrategyRaw);
-  if (requestedMemoryStrategyRaw !== undefined && requestedMemoryStrategy === undefined) {
-    reply.code(400);
-    return { error: "memoryStrategy must be one of: none, sliding_window, branching, sticky_facts" };
-  }
-  const persistedMemoryStrategy = parseMemoryStrategy(chat.memoryStrategy) ?? DEFAULT_MEMORY_STRATEGY;
-  const memoryStrategy = requestedMemoryStrategy ?? persistedMemoryStrategy;
-  const memoryStrategyError = ensureImplementedMemoryStrategy(memoryStrategy);
-  if (memoryStrategyError) {
-    reply.code(400);
-    return { error: memoryStrategyError };
-  }
-  const requestedSlidingWindowSizeRaw = request.body?.slidingWindowSize;
-  const requestedSlidingWindowSize = parseSlidingWindowSize(requestedSlidingWindowSizeRaw);
-  if (requestedSlidingWindowSizeRaw !== undefined && requestedSlidingWindowSize === undefined) {
-    reply.code(400);
-    return { error: "slidingWindowSize must be an integer >= 1" };
-  }
-  const persistedSlidingWindowSize =
-    parseSlidingWindowSize(chat.slidingWindowSize) ?? DEFAULT_SLIDING_WINDOW_SIZE;
-  const slidingWindowSize = requestedSlidingWindowSize ?? persistedSlidingWindowSize;
-  const requestedStickyWindowSizeRaw = request.body?.stickyWindowSize;
-  const requestedStickyWindowSize = parseStickyWindowSize(requestedStickyWindowSizeRaw);
-  if (requestedStickyWindowSizeRaw !== undefined && requestedStickyWindowSize === undefined) {
-    reply.code(400);
-    return { error: "stickyWindowSize must be an integer >= 1" };
-  }
-  const persistedStickyWindowSize = parseStickyWindowSize(chat.stickyWindowSize) ?? DEFAULT_STICKY_WINDOW_SIZE;
-  const stickyWindowSize = requestedStickyWindowSize ?? persistedStickyWindowSize;
 
-  if (!ALLOWED_MODELS.has(model)) {
-    reply.code(400);
-    return { error: MODEL_VALIDATION_ERROR };
-  }
-
-  const nextTitle = title || "New chat";
   updateChatStmt.run(
-    nextTitle,
+    title || "New chat",
     model,
     systemPrompt,
-    memoryStrategy,
-    slidingWindowSize,
-    stickyWindowSize,
+    chat.memoryStrategy,
+    chat.slidingWindowSize,
+    chat.stickyWindowSize,
     chat.branchFromChatId ?? null,
     chat.branchFromChatTitle ?? null,
     chat.branchCheckpointMessageCount ?? null,
     Date.now(),
     chatId
   );
+
   return { chat: getChatStmt.get(chatId) };
+});
+
+app.patch<{ Params: { id: string }; Body: WorkingMemoryPatchBody }>(
+  "/api/chats/:id/memory/working",
+  async (request, reply) => {
+    const chatId = request.params.id;
+    const chat = getChatStmt.get(chatId);
+    if (!chat) {
+      reply.code(404);
+      return { error: "chat not found" };
+    }
+
+    const existing = getOrCreateWorkingMemory(chatId);
+    const now = Date.now();
+    let hasChanges = false;
+
+    const next: WorkingMemoryRow = {
+      ...existing,
+      updatedBy: "manual",
+      updatedAt: now,
+    };
+
+    if (request.body?.goal !== undefined) {
+      next.goal = normalizeWorkingField(request.body.goal);
+      next.manualLockGoal = 1;
+      hasChanges = true;
+    }
+    if (request.body?.constraints !== undefined) {
+      next.constraints = normalizeWorkingField(request.body.constraints);
+      next.manualLockConstraints = 1;
+      hasChanges = true;
+    }
+    if (request.body?.status !== undefined) {
+      next.status = normalizeWorkingField(request.body.status);
+      next.manualLockStatus = 1;
+      hasChanges = true;
+    }
+    if (request.body?.nextSteps !== undefined) {
+      next.nextSteps = normalizeWorkingField(request.body.nextSteps);
+      next.manualLockNextSteps = 1;
+      hasChanges = true;
+    }
+
+    if (!hasChanges) {
+      reply.code(400);
+      return { error: "At least one working memory field is required" };
+    }
+
+    persistWorkingMemory(next);
+    const snapshot = getMemorySnapshotForChat(chatId);
+    return { working: snapshot.working };
+  }
+);
+
+app.patch<{ Body: LongTermMemoryPatchBody }>("/api/memory/long-term", async (request, reply) => {
+  const existing = getOrCreateLongTermMemory();
+  const now = Date.now();
+  let hasChanges = false;
+
+  const next: LongTermMemoryRow = {
+    ...existing,
+    updatedBy: "manual",
+    updatedAt: now,
+  };
+
+  if (request.body?.profile !== undefined) {
+    next.profile = normalizeLongTermField(request.body.profile);
+    next.manualLockProfile = 1;
+    hasChanges = true;
+  }
+  if (request.body?.preferences !== undefined) {
+    next.preferences = normalizeLongTermField(request.body.preferences);
+    next.manualLockPreferences = 1;
+    hasChanges = true;
+  }
+  if (request.body?.decisions !== undefined) {
+    next.decisions = normalizeLongTermField(request.body.decisions);
+    next.manualLockDecisions = 1;
+    hasChanges = true;
+  }
+  if (request.body?.knowledge !== undefined) {
+    next.knowledge = normalizeLongTermField(request.body.knowledge);
+    next.manualLockKnowledge = 1;
+    hasChanges = true;
+  }
+
+  if (!hasChanges) {
+    reply.code(400);
+    return { error: "At least one long-term field is required" };
+  }
+
+  persistLongTermMemory(next);
+  return {
+    longTerm: {
+      profile: next.profile,
+      preferences: next.preferences,
+      decisions: next.decisions,
+      knowledge: next.knowledge,
+      updatedBy: next.updatedBy,
+      updatedAt: next.updatedAt,
+    },
+  };
+});
+
+app.post<{ Params: { id: string } }>("/api/memory/candidates/:id/approve", async (request, reply) => {
+  const candidateId = request.params.id;
+  const candidate = getCandidateByIdStmt.get(candidateId) as LongTermCandidateRow | undefined;
+  if (!candidate) {
+    reply.code(404);
+    return { error: "candidate not found" };
+  }
+  if (candidate.status !== "pending") {
+    reply.code(400);
+    return { error: "candidate is already resolved" };
+  }
+
+  const longTerm = getOrCreateLongTermMemory();
+  const now = Date.now();
+  const next: LongTermMemoryRow = {
+    ...longTerm,
+    updatedBy: "manual",
+    updatedAt: now,
+  };
+
+  if (candidate.targetField === "profile") {
+    next.profile = mergeLongTermFieldValue(longTerm.profile, candidate.value);
+  }
+  if (candidate.targetField === "preferences") {
+    next.preferences = mergeLongTermFieldValue(longTerm.preferences, candidate.value);
+  }
+  if (candidate.targetField === "decisions") {
+    next.decisions = mergeLongTermFieldValue(longTerm.decisions, candidate.value);
+  }
+  if (candidate.targetField === "knowledge") {
+    next.knowledge = mergeLongTermFieldValue(longTerm.knowledge, candidate.value);
+  }
+
+  persistLongTermMemory(next);
+  resolveCandidateStmt.run("approved", now, candidateId);
+
+  const snapshot = getMemorySnapshotForChat(candidate.chatId);
+  return {
+    ok: true,
+    longTerm: snapshot.longTerm,
+    pendingCandidates: snapshot.pendingCandidates,
+  };
+});
+
+app.post<{ Params: { id: string } }>("/api/memory/candidates/:id/reject", async (request, reply) => {
+  const candidateId = request.params.id;
+  const candidate = getCandidateByIdStmt.get(candidateId) as LongTermCandidateRow | undefined;
+  if (!candidate) {
+    reply.code(404);
+    return { error: "candidate not found" };
+  }
+  if (candidate.status !== "pending") {
+    reply.code(400);
+    return { error: "candidate is already resolved" };
+  }
+
+  const now = Date.now();
+  resolveCandidateStmt.run("rejected", now, candidateId);
+  const snapshot = getMemorySnapshotForChat(candidate.chatId);
+  return {
+    ok: true,
+    pendingCandidates: snapshot.pendingCandidates,
+  };
 });
 
 app.delete<{ Params: { id: string } }>("/api/chats/:id", async (request, reply) => {
@@ -1263,9 +1710,6 @@ app.post<{ Params: { id: string } }>("/api/chats/:id/branch", async (request, re
         title: string;
         model: string;
         systemPrompt: string;
-        memoryStrategy: MemoryStrategy;
-        slidingWindowSize: number;
-        stickyWindowSize: number;
       }
     | undefined;
 
@@ -1288,17 +1732,18 @@ app.post<{ Params: { id: string } }>("/api/chats/:id/branch", async (request, re
     outputCostUsd: number | null;
   }>;
 
+  const sourceShort = getOrCreateShortMemory(sourceChatId);
+  const sourceWorking = getOrCreateWorkingMemory(sourceChatId);
   const baseTimestamp = Date.now();
   let createdChatId = "";
+
   try {
     db.exec("BEGIN");
+
     const created = createChat({
       title: buildBranchChatTitle(sourceChat.title),
       model: sourceChat.model,
       systemPrompt: sourceChat.systemPrompt,
-      memoryStrategy: sourceChat.memoryStrategy,
-      slidingWindowSize: sourceChat.slidingWindowSize,
-      stickyWindowSize: sourceChat.stickyWindowSize,
       branchFromChatId: sourceChat.id,
       branchFromChatTitle: sourceChat.title,
       branchCheckpointMessageCount: sourceMessages.length,
@@ -1309,6 +1754,7 @@ app.post<{ Params: { id: string } }>("/api/chats/:id/branch", async (request, re
     }
 
     createdChatId = created.id;
+
     sourceMessages.forEach((message, index) => {
       insertMessageStmt.run(
         createId(),
@@ -1328,8 +1774,16 @@ app.post<{ Params: { id: string } }>("/api/chats/:id/branch", async (request, re
       );
     });
 
-    const sourceFacts = getOrCreateChatFacts(sourceChatId);
-    saveChatFacts(createdChatId, createStickyFacts(sourceFacts, sourceFacts.updatedAt));
+    persistShortMemory({
+      ...sourceShort,
+      chatId: createdChatId,
+      updatedAt: baseTimestamp + sourceMessages.length,
+    });
+    persistWorkingMemory({
+      ...sourceWorking,
+      chatId: createdChatId,
+      updatedAt: baseTimestamp + sourceMessages.length,
+    });
 
     updateChatUpdatedAtStmt.run(baseTimestamp + sourceMessages.length, createdChatId);
     db.exec("COMMIT");
@@ -1360,7 +1814,7 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
         title: string;
         model: string;
         systemPrompt: string;
-        memoryStrategy: MemoryStrategy;
+        memoryStrategy: string;
         slidingWindowSize: number;
         stickyWindowSize: number;
         branchFromChatId: string | null;
@@ -1381,76 +1835,41 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
     reply.code(400);
     return { error: MODEL_VALIDATION_ERROR };
   }
+
   const model = requestedModel ?? existingChat.model;
-  const requestedReasoningEffortRaw = request.body?.reasoningEffort;
-  const reasoningEffort = parseReasoningEffort(requestedReasoningEffortRaw);
-  const systemPrompt =
-    typeof request.body?.systemPrompt === "string" ? request.body.systemPrompt : existingChat.systemPrompt;
-  const requestedMemoryStrategyRaw = request.body?.memoryStrategy;
-  const requestedMemoryStrategy = parseMemoryStrategy(requestedMemoryStrategyRaw);
-  const persistedMemoryStrategy =
-    parseMemoryStrategy(existingChat.memoryStrategy) ?? DEFAULT_MEMORY_STRATEGY;
-  const memoryStrategy = requestedMemoryStrategy ?? persistedMemoryStrategy;
-  const requestedSlidingWindowSizeRaw = request.body?.slidingWindowSize;
-  const requestedSlidingWindowSize = parseSlidingWindowSize(requestedSlidingWindowSizeRaw);
-  const persistedSlidingWindowSize =
-    parseSlidingWindowSize(existingChat.slidingWindowSize) ?? DEFAULT_SLIDING_WINDOW_SIZE;
-  const slidingWindowSize = requestedSlidingWindowSize ?? persistedSlidingWindowSize;
-  const requestedStickyWindowSizeRaw = request.body?.stickyWindowSize;
-  const requestedStickyWindowSize = parseStickyWindowSize(requestedStickyWindowSizeRaw);
-  const persistedStickyWindowSize =
-    parseStickyWindowSize(existingChat.stickyWindowSize) ?? DEFAULT_STICKY_WINDOW_SIZE;
-  const stickyWindowSize = requestedStickyWindowSize ?? persistedStickyWindowSize;
-  const requestedFactsModelRaw = request.body?.factsModel;
-  const requestedFactsModel = parseAllowedModel(requestedFactsModelRaw);
-  const factsModel = requestedFactsModel ?? EFFECTIVE_DEFAULT_FACTS_MODEL;
-  const startedAt = Date.now();
-
-  if (!userPrompt) {
-    reply.code(400);
-    return { error: "userPrompt is required" };
-  }
-
   if (!ALLOWED_MODELS.has(model)) {
     reply.code(400);
     return { error: MODEL_VALIDATION_ERROR };
   }
 
-  const modelProfile = MODEL_API_PROFILES[model];
-
-  if (requestedMemoryStrategyRaw !== undefined && requestedMemoryStrategy === undefined) {
-    reply.code(400);
-    return { error: "memoryStrategy must be one of: none, sliding_window, branching, sticky_facts" };
-  }
-  const memoryStrategyError = ensureImplementedMemoryStrategy(memoryStrategy);
-  if (memoryStrategyError) {
-    reply.code(400);
-    return { error: memoryStrategyError };
-  }
-
-  if (requestedSlidingWindowSizeRaw !== undefined && requestedSlidingWindowSize === undefined) {
-    reply.code(400);
-    return { error: "slidingWindowSize must be an integer >= 1" };
-  }
-  if (requestedStickyWindowSizeRaw !== undefined && requestedStickyWindowSize === undefined) {
-    reply.code(400);
-    return { error: "stickyWindowSize must be an integer >= 1" };
-  }
-  if (requestedFactsModelRaw !== undefined && requestedFactsModel === undefined) {
-    reply.code(400);
-    return { error: MODEL_VALIDATION_ERROR };
-  }
-
+  const requestedReasoningEffortRaw = request.body?.reasoningEffort;
+  const reasoningEffort = parseReasoningEffort(requestedReasoningEffortRaw);
   if (requestedReasoningEffortRaw !== undefined && reasoningEffort === undefined) {
     reply.code(400);
     return { error: "reasoningEffort must be one of: none, minimal, low, medium, high, xhigh" };
   }
 
+  const modelProfile = MODEL_API_PROFILES[model];
   if (reasoningEffort !== undefined && !modelProfile.reasoningEfforts.includes(reasoningEffort)) {
     reply.code(400);
     return {
       error: `reasoningEffort for ${model} must be one of: ${modelProfile.reasoningEfforts.join(", ")}`,
     };
+  }
+
+  const memoryModelRaw = request.body?.memoryModel;
+  const memoryModel = parseAllowedModel(memoryModelRaw) ?? EFFECTIVE_DEFAULT_MEMORY_MODEL;
+  if (memoryModelRaw !== undefined && parseAllowedModel(memoryModelRaw) === undefined) {
+    reply.code(400);
+    return { error: MODEL_VALIDATION_ERROR };
+  }
+
+  const systemPrompt =
+    typeof request.body?.systemPrompt === "string" ? request.body.systemPrompt : existingChat.systemPrompt;
+
+  if (!userPrompt) {
+    reply.code(400);
+    return { error: "userPrompt is required" };
   }
 
   const abortController = new AbortController();
@@ -1466,60 +1885,16 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
     abortController.abort();
   });
 
-  const persistedMessagesRaw = listMessagesStmt.all(chatId) as Array<{ role: Role; content: string }>;
-  const persistedMessages = persistedMessagesRaw.map((item) => ({
-    role: item.role,
-    content: item.content,
-  }));
-  const memorySourceMessages = [...persistedMessages, { role: "user" as const, content: userPrompt }];
-
-  let stickyFacts = getOrCreateChatFacts(chatId);
-  if (memoryStrategy === "sticky_facts") {
-    const currentFactsCore: StickyFactsCore = {
-      goal: stickyFacts.goal,
-      constraints: stickyFacts.constraints,
-      preferences: stickyFacts.preferences,
-      decisions: stickyFacts.decisions,
-      agreements: stickyFacts.agreements,
-    };
-    try {
-      const updatedFacts = await updateStickyFactsViaModel({
-        factsModel,
-        currentFacts: currentFactsCore,
-        latestUserPrompt: userPrompt,
-        recentMessages: memorySourceMessages.slice(-stickyWindowSize),
-        signal: abortController.signal,
-      });
-      stickyFacts = saveChatFacts(chatId, updatedFacts);
-    } catch (error) {
-      app.log.warn({ err: error, chatId, factsModel }, "failed to update sticky facts, using previous snapshot");
-    }
-  }
-
-  if (abortController.signal.aborted) {
-    reply.raw.end();
-    return;
-  }
-
-  const inputMessages = applyMemoryStrategy({
-    messages: memorySourceMessages,
-    memoryStrategy,
-    slidingWindowSize,
-    stickyWindowSize,
-  });
-  const effectiveSystemPrompt =
-    memoryStrategy === "sticky_facts"
-      ? mergeSystemPromptWithFacts(systemPrompt, stickyFacts)
-      : systemPrompt;
-
+  const startedAt = Date.now();
   const now = Date.now();
+
   updateChatStmt.run(
     existingChat.title,
     model,
     systemPrompt,
-    memoryStrategy,
-    slidingWindowSize,
-    stickyWindowSize,
+    existingChat.memoryStrategy,
+    existingChat.slidingWindowSize,
+    existingChat.stickyWindowSize,
     existingChat.branchFromChatId ?? null,
     existingChat.branchFromChatTitle ?? null,
     existingChat.branchCheckpointMessageCount ?? null,
@@ -1527,15 +1902,15 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
     chatId
   );
 
-  if (existingChat.title === "New chat") {
-    const nextTitle = userPrompt.slice(0, 42).trim() || "New chat";
+  const effectiveTitle = existingChat.title === "New chat" ? userPrompt.slice(0, 42).trim() || "New chat" : existingChat.title;
+  if (effectiveTitle !== existingChat.title) {
     updateChatStmt.run(
-      nextTitle,
+      effectiveTitle,
       model,
       systemPrompt,
-      memoryStrategy,
-      slidingWindowSize,
-      stickyWindowSize,
+      existingChat.memoryStrategy,
+      existingChat.slidingWindowSize,
+      existingChat.stickyWindowSize,
       existingChat.branchFromChatId ?? null,
       existingChat.branchFromChatTitle ?? null,
       existingChat.branchCheckpointMessageCount ?? null,
@@ -1563,6 +1938,81 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
   );
   updateChatUpdatedAtStmt.run(now, chatId);
 
+  const persistedMessagesRaw = listMessagesForMemoryStmt.all(chatId) as Array<{ role: Role; content: string }>;
+
+  let shortTerm = getOrCreateShortMemory(chatId);
+  let working = getOrCreateWorkingMemory(chatId);
+  let longTerm = getOrCreateLongTermMemory();
+
+  const fromIndex = Math.min(
+    Math.max(shortTerm.lastProcessedMessageCount, 0),
+    persistedMessagesRaw.length
+  );
+  const newMessagesForUpdater = persistedMessagesRaw.slice(fromIndex);
+
+  let memoryUpdaterDiagnostics: { status: "ok" | "error"; message?: string } = { status: "ok" };
+
+  try {
+    const updaterOutput = await updateMemoryViaModel({
+      memoryModel,
+      previousSummary: shortTerm.rollingSummary,
+      working: {
+        goal: working.goal,
+        constraints: working.constraints,
+        status: working.status,
+        nextSteps: working.nextSteps,
+      },
+      longTerm: {
+        profile: longTerm.profile,
+        preferences: longTerm.preferences,
+        decisions: longTerm.decisions,
+        knowledge: longTerm.knowledge,
+      },
+      newMessages: newMessagesForUpdater,
+      latestUserPrompt: userPrompt,
+      signal: abortController.signal,
+    });
+
+    const memoryUpdatedAt = Date.now();
+    shortTerm = persistShortMemory({
+      ...shortTerm,
+      rollingSummary: updaterOutput.shortTerm.rollingSummary,
+      lastProcessedMessageCount: persistedMessagesRaw.length,
+      updatedAt: memoryUpdatedAt,
+    });
+
+    working = persistWorkingMemory(
+      applyAutoWorkingUpdate(working, updaterOutput.working, memoryUpdatedAt)
+    );
+
+    insertPendingCandidates(chatId, updaterOutput.longTermCandidates, memoryUpdatedAt);
+  } catch (error) {
+    const formatted = formatUpstreamError(error);
+    memoryUpdaterDiagnostics = {
+      status: "error",
+      message: formatted.message,
+    };
+    app.log.warn({ err: error, chatId, memoryModel }, "failed to update memory layers, using previous snapshot");
+  }
+
+  const pendingCandidates = listPendingCandidatesByChatStmt.all(chatId) as LongTermCandidateRow[];
+  const memorySnapshot = toSnapshot(shortTerm, working, longTerm, pendingCandidates);
+  const memoryBlock = buildMemoryBlock({
+    shortTerm: { rollingSummary: shortTerm.rollingSummary },
+    working: {
+      goal: working.goal,
+      constraints: working.constraints,
+      status: working.status,
+      nextSteps: working.nextSteps,
+    },
+    longTerm: {
+      profile: longTerm.profile,
+      preferences: longTerm.preferences,
+      decisions: longTerm.decisions,
+      knowledge: longTerm.knowledge,
+    },
+  });
+
   reply.raw.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache, no-transform",
@@ -1574,11 +2024,17 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
     reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
   };
 
+  sendSse("debug_memory", {
+    snapshot: memorySnapshot,
+    memoryBlock,
+    updater: memoryUpdaterDiagnostics,
+  });
+
   try {
     const openaiRequestBody = buildOpenAiRequestBody({
       model,
-      systemPrompt: effectiveSystemPrompt,
-      inputMessages,
+      systemPrompt: mergeSystemPromptWithMemory(systemPrompt, memoryBlock),
+      inputMessages: persistedMessagesRaw,
       reasoningEffort,
     });
 

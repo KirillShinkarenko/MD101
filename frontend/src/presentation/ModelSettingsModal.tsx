@@ -6,7 +6,7 @@ import { ModalShell } from "./ui/ModalShell";
 type Props = {
   isOpen: boolean;
   model: string;
-  factsModel: string;
+  memoryModel: string;
   reasoningEffort: ReasoningEffort;
   isStreaming: boolean;
   isReasoningSupported: boolean;
@@ -14,7 +14,7 @@ type Props = {
   modelOptions: Array<{ value: string; label: string }>;
   onClose: () => void;
   onModelChange: (value: string) => void;
-  onFactsModelChange: (value: string) => void;
+  onMemoryModelChange: (value: string) => void;
   onReasoningEffortChange: (value: ReasoningEffort) => void;
 };
 
@@ -22,7 +22,7 @@ export function ModelSettingsModal(props: Props) {
   const {
     isOpen,
     model,
-    factsModel,
+    memoryModel,
     reasoningEffort,
     isStreaming,
     isReasoningSupported,
@@ -30,7 +30,7 @@ export function ModelSettingsModal(props: Props) {
     modelOptions,
     onClose,
     onModelChange,
-    onFactsModelChange,
+    onMemoryModelChange,
     onReasoningEffortChange,
   } = props;
 
@@ -52,11 +52,11 @@ export function ModelSettingsModal(props: Props) {
           }))}
         />
       </FormField>
-      <FormField label="Facts model" htmlFor="modal-facts-model">
+      <FormField label="Memory updater model" htmlFor="modal-memory-model">
         <DropdownSelect
-          id="modal-facts-model"
-          value={factsModel}
-          onChange={onFactsModelChange}
+          id="modal-memory-model"
+          value={memoryModel}
+          onChange={onMemoryModelChange}
           disabled={isStreaming}
           options={modelOptions.map((option) => ({
             value: option.value,

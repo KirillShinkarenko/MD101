@@ -1,9 +1,10 @@
 import {
-  EMPTY_STICKY_FACTS,
+  EMPTY_MEMORY_SNAPSHOT,
+  type ChatMemorySnapshot,
   type ChatMessage,
   type ChatSummary,
-  type MemoryStrategy,
-  type StickyFacts,
+  type LongTermMemory,
+  type WorkingMemory,
 } from "../domain/chat";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "";
@@ -55,9 +56,6 @@ export const chatApi = {
       title: string;
       model: string;
       systemPrompt: string;
-      memoryStrategy: MemoryStrategy;
-      slidingWindowSize: number;
-      stickyWindowSize: number;
     }>
   ): Promise<ChatSummary> {
     const response = await fetch(`${API_BASE}/api/chats`, {
@@ -93,24 +91,36 @@ export const chatApi = {
     }
   },
 
-  async getMessages(
-    chatId: string
-  ): Promise<{ messages: ChatMessage[]; facts: StickyFacts; isNotFound: boolean }> {
+  async getMessages(chatId: string): Promise<{ messages: ChatMessage[]; isNotFound: boolean }> {
     const response = await fetch(`${API_BASE}/api/chats/${chatId}/messages`);
-    const payload = await readJson<{ messages?: ChatMessage[]; facts?: StickyFacts; error?: string }>(
-      response
-    );
+    const payload = await readJson<{ messages?: ChatMessage[]; error?: string }>(response);
 
     if (!response.ok) {
       if (response.status === 404) {
-        return { messages: [], facts: { ...EMPTY_STICKY_FACTS }, isNotFound: true };
+        return { messages: [], isNotFound: true };
       }
       throw extractError(payload, "Failed to load messages");
     }
 
     return {
       messages: payload?.messages ?? [],
-      facts: payload?.facts ?? { ...EMPTY_STICKY_FACTS },
+      isNotFound: false,
+    };
+  },
+
+  async getMemory(chatId: string): Promise<{ memory: ChatMemorySnapshot; isNotFound: boolean }> {
+    const response = await fetch(`${API_BASE}/api/chats/${chatId}/memory`);
+    const payload = await readJson<ChatMemorySnapshot & { error?: string }>(response);
+
+    if (!response.ok) {
+      if (response.status === 404) {
+        return { memory: { ...EMPTY_MEMORY_SNAPSHOT }, isNotFound: true };
+      }
+      throw extractError(payload, "Failed to load memory");
+    }
+
+    return {
+      memory: payload ?? { ...EMPTY_MEMORY_SNAPSHOT },
       isNotFound: false,
     };
   },
@@ -121,9 +131,6 @@ export const chatApi = {
       title: string;
       model: string;
       systemPrompt: string;
-      memoryStrategy: MemoryStrategy;
-      slidingWindowSize: number;
-      stickyWindowSize: number;
     }>
   ): Promise<ChatSummary> {
     const response = await fetch(`${API_BASE}/api/chats/${chatId}`, {
@@ -138,6 +145,57 @@ export const chatApi = {
     return payload.chat;
   },
 
+  async patchWorkingMemory(
+    chatId: string,
+    body: Partial<Pick<WorkingMemory, "goal" | "constraints" | "status" | "nextSteps">>
+  ): Promise<WorkingMemory> {
+    const response = await fetch(`${API_BASE}/api/chats/${chatId}/memory/working`, {
+      method: "PATCH",
+      headers: jsonHeaders,
+      body: JSON.stringify(body),
+    });
+    const payload = await readJson<{ working?: WorkingMemory; error?: string }>(response);
+    if (!response.ok || !payload?.working) {
+      throw extractError(payload, "Failed to update working memory");
+    }
+    return payload.working;
+  },
+
+  async patchLongTermMemory(
+    body: Partial<Pick<LongTermMemory, "profile" | "preferences" | "decisions" | "knowledge">>
+  ): Promise<LongTermMemory> {
+    const response = await fetch(`${API_BASE}/api/memory/long-term`, {
+      method: "PATCH",
+      headers: jsonHeaders,
+      body: JSON.stringify(body),
+    });
+    const payload = await readJson<{ longTerm?: LongTermMemory; error?: string }>(response);
+    if (!response.ok || !payload?.longTerm) {
+      throw extractError(payload, "Failed to update long-term memory");
+    }
+    return payload.longTerm;
+  },
+
+  async approveCandidate(candidateId: string): Promise<void> {
+    const response = await fetch(`${API_BASE}/api/memory/candidates/${candidateId}/approve`, {
+      method: "POST",
+    });
+    const payload = await readJson<{ ok?: boolean; error?: string }>(response);
+    if (!response.ok) {
+      throw extractError(payload, "Failed to approve candidate");
+    }
+  },
+
+  async rejectCandidate(candidateId: string): Promise<void> {
+    const response = await fetch(`${API_BASE}/api/memory/candidates/${candidateId}/reject`, {
+      method: "POST",
+    });
+    const payload = await readJson<{ ok?: boolean; error?: string }>(response);
+    if (!response.ok) {
+      throw extractError(payload, "Failed to reject candidate");
+    }
+  },
+
   async streamChat(
     chatId: string,
     body: {
@@ -145,10 +203,7 @@ export const chatApi = {
       model: string;
       systemPrompt: string;
       reasoningEffort?: string;
-      memoryStrategy?: MemoryStrategy;
-      slidingWindowSize?: number;
-      stickyWindowSize?: number;
-      factsModel?: string;
+      memoryModel?: string;
     },
     signal: AbortSignal
   ): Promise<Response> {

@@ -8,11 +8,12 @@
 - автогенерация названия нового чата по первому сообщению
 - глобальный `System prompt` (модалка)
 - выбор модели и параметров (`reasoning effort`)
-- стратегии памяти (пер-чат): переключатель в левой панели
-  - `None` (по умолчанию): в OpenAI отправляется полная история
-  - `Sliding Window` (реализовано): в OpenAI отправляются только последние `N` сообщений
-  - `Sticky Facts` (реализовано): в OpenAI отправляются `facts + последние N сообщений`
-- `Branching` (реализовано): в runtime используется полная история, а ветка создается через `Branch in new chat`
+- выбор `Memory updater model` (модель, которая обновляет память перед основным ответом)
+- трёхслойная память:
+  - `Short-term` (пер-чат): накопительное саммари диалога (`rolling summary`)
+  - `Working` (пер-чат): `goal`, `constraints`, `status`, `next_steps` с ручным редактированием
+  - `Long-term` (глобальная): `profile`, `preferences`, `decisions`, `knowledge` с ручным редактированием
+- `Pending long-term candidates`: автопредложения на запись в long-term с `Approve/Reject`
 - ответвление чата: кнопка `Branch in new chat` создает полную копию диалога с заголовком `Ветка - ...`
   - в новом чате хранится checkpoint ветвления, разделитель `Ответвление от [название]` показывается в точке ветвления и ведет в исходный чат
 - чат с потоковым ответом (`Send` / `Stop`)
@@ -22,7 +23,9 @@
   - `Conversation total`
   - `Growth by turns`
 - инспектор справа:
-  - `Request` / `Response` JSON
+  - вкладки `Request` / `Response` / `Memory`
+  - просмотр и редактирование memory snapshot
+  - `Effective memory block` (какой блок памяти реально был подмешан в `systemPrompt`)
   - полноэкранный просмотр JSON
 
 ## Архитектура
@@ -37,11 +40,20 @@
   - `src/shared`
 - поток между frontend и backend: SSE (`POST /api/chats/:id/stream`)
 - backend обращается к OpenAI `v1/responses`
+- memory pipeline на backend:
+  - отдельный вызов memory-updater модели обновляет `short-term`, `working` и формирует кандидаты в `long-term`
+  - из snapshot строится `memory block`
+  - `memory block` добавляется в `systemPrompt` основного запроса
 
 ## Хранение данных
 
-- история чатов и сообщений хранится в SQLite
+- история чатов, сообщений и слоёв памяти хранится в SQLite
 - файл БД: `backend/data/md.sqlite`
+- основные таблицы памяти:
+  - `chat_short_memory`
+  - `chat_working_memory`
+  - `global_long_term_memory`
+  - `long_term_candidates`
 
 ## Переменные окружения
 
@@ -102,27 +114,24 @@ npm run dev
 - `GET /health`
 - `GET /api/chats` - список чатов
 - `POST /api/chats` - создать чат
-- опциональные поля: `memoryStrategy`, `slidingWindowSize`, `stickyWindowSize`
-- `GET /api/chats/:id/messages` - история сообщений + `facts`
-- `PATCH /api/chats/:id` - обновить чат (`title`, `model`, `systemPrompt`, `memoryStrategy`, `slidingWindowSize`, `stickyWindowSize`)
+  - опциональные поля: `title`, `model`, `systemPrompt`
+- `GET /api/chats/:id/messages` - история сообщений
+- `GET /api/chats/:id/memory` - получить snapshot памяти (`shortTerm`, `working`, `longTerm`, `pendingCandidates`)
+- `PATCH /api/chats/:id` - обновить чат (`title`, `model`, `systemPrompt`)
+- `PATCH /api/chats/:id/memory/working` - вручную обновить `goal`, `constraints`, `status`, `nextSteps`
+- `PATCH /api/memory/long-term` - вручную обновить `profile`, `preferences`, `decisions`, `knowledge`
+- `POST /api/memory/candidates/:id/approve` - принять кандидата в long-term
+- `POST /api/memory/candidates/:id/reject` - отклонить кандидата
 - `DELETE /api/chats/:id` - удалить чат
 - `POST /api/chats/:id/branch` - создать новую ветку как копию чата
 - `POST /api/chats/:id/stream` - отправить сообщение и получить streaming-ответ
-  - опциональные поля: `memoryStrategy`, `slidingWindowSize`, `stickyWindowSize`, `factsModel`
-
-Примечание по стратегиям памяти:
-- по умолчанию используется `memoryStrategy=none` (полная история)
-- сейчас поддерживаются `none`, `sliding_window`, `branching`, `sticky_facts`
-- `branching` в runtime эквивалентен полной истории (как `none`)
-- `sticky_facts`:
-  - `facts` обновляются отдельным LLM-запросом до основного ответа
-  - в основной запрос уходит `systemPrompt + facts` и последние `N` сообщений (`stickyWindowSize`)
-  - если обновление `facts` не удалось, используется предыдущий snapshot
-- допустимые значения `memoryStrategy`: `none`, `sliding_window`, `branching`, `sticky_facts`
+  - обязательное поле: `userPrompt`
+  - опциональные поля: `model`, `systemPrompt`, `reasoningEffort`, `memoryModel`
 
 SSE-события stream endpoint:
 
 - `delta`
+- `debug_memory`
 - `debug_request`
 - `debug_response_final`
 - `done`
