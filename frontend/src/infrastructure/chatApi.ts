@@ -4,6 +4,8 @@ import {
   type ChatMessage,
   type ChatSummary,
   type LongTermMemory,
+  type MemorySettings,
+  type UserProfile,
   type WorkingMemory,
 } from "../domain/chat";
 
@@ -176,6 +178,48 @@ export const chatApi = {
     return payload.longTerm;
   },
 
+  async getMemorySettings(): Promise<MemorySettings> {
+    const response = await fetch(`${API_BASE}/api/memory/settings`);
+    const payload = await readJson<MemorySettings & { error?: string }>(response);
+    if (!response.ok || !payload || typeof payload.longTermEnabled !== "boolean") {
+      throw extractError(payload, "Failed to load memory settings");
+    }
+    return {
+      shortTermEnabled:
+        typeof payload.shortTermEnabled === "boolean" ? payload.shortTermEnabled : true,
+      workingEnabled:
+        typeof payload.workingEnabled === "boolean" ? payload.workingEnabled : true,
+      longTermEnabled: payload.longTermEnabled,
+      updatedAt: typeof payload.updatedAt === "number" ? payload.updatedAt : Date.now(),
+    };
+  },
+
+  async patchMemorySettings(
+    body: { shortTermEnabled?: boolean; workingEnabled?: boolean; longTermEnabled?: boolean }
+  ): Promise<MemorySettings> {
+    const response = await fetch(`${API_BASE}/api/memory/settings`, {
+      method: "PATCH",
+      headers: jsonHeaders,
+      body: JSON.stringify(body),
+    });
+    const payload = await readJson<MemorySettings & { error?: string }>(response);
+    if (
+      !response.ok ||
+      !payload ||
+      typeof payload.shortTermEnabled !== "boolean" ||
+      typeof payload.workingEnabled !== "boolean" ||
+      typeof payload.longTermEnabled !== "boolean"
+    ) {
+      throw extractError(payload, "Failed to update memory settings");
+    }
+    return {
+      shortTermEnabled: payload.shortTermEnabled,
+      workingEnabled: payload.workingEnabled,
+      longTermEnabled: payload.longTermEnabled,
+      updatedAt: typeof payload.updatedAt === "number" ? payload.updatedAt : Date.now(),
+    };
+  },
+
   async approveCandidate(candidateId: string): Promise<void> {
     const response = await fetch(`${API_BASE}/api/memory/candidates/${candidateId}/approve`, {
       method: "POST",
@@ -194,6 +238,84 @@ export const chatApi = {
     if (!response.ok) {
       throw extractError(payload, "Failed to reject candidate");
     }
+  },
+
+  async listProfiles(): Promise<{ profiles: UserProfile[]; activeProfileId: string | null }> {
+    const response = await fetch(`${API_BASE}/api/profiles`);
+    const payload = await readJson<{
+      profiles?: UserProfile[];
+      activeProfileId?: string | null;
+      error?: string;
+    }>(response);
+    if (!response.ok) {
+      throw extractError(payload, "Failed to load profiles");
+    }
+    return {
+      profiles: payload?.profiles ?? [],
+      activeProfileId: typeof payload?.activeProfileId === "string" ? payload.activeProfileId : null,
+    };
+  },
+
+  async createProfile(name: string): Promise<{ profile: UserProfile; activeProfileId: string | null }> {
+    const response = await fetch(`${API_BASE}/api/profiles`, {
+      method: "POST",
+      headers: jsonHeaders,
+      body: JSON.stringify({ name }),
+    });
+    const payload = await readJson<{ profile?: UserProfile; activeProfileId?: string | null; error?: string }>(
+      response
+    );
+    if (!response.ok || !payload?.profile) {
+      throw extractError(payload, "Failed to create profile");
+    }
+    return {
+      profile: payload.profile,
+      activeProfileId: typeof payload.activeProfileId === "string" ? payload.activeProfileId : null,
+    };
+  },
+
+  async updateProfile(
+    profileId: string,
+    body: Partial<Pick<UserProfile, "name" | "style" | "outputFormat" | "constraints" | "notes">>
+  ): Promise<UserProfile> {
+    const response = await fetch(`${API_BASE}/api/profiles/${profileId}`, {
+      method: "PATCH",
+      headers: jsonHeaders,
+      body: JSON.stringify(body),
+    });
+    const payload = await readJson<{ profile?: UserProfile; error?: string }>(response);
+    if (!response.ok || !payload?.profile) {
+      throw extractError(payload, "Failed to update profile");
+    }
+    return payload.profile;
+  },
+
+  async deleteProfile(profileId: string): Promise<{ activeProfileId: string | null }> {
+    const response = await fetch(`${API_BASE}/api/profiles/${profileId}`, {
+      method: "DELETE",
+    });
+    const payload = await readJson<{ ok?: boolean; activeProfileId?: string | null; error?: string }>(response);
+    if (!response.ok) {
+      throw extractError(payload, "Failed to delete profile");
+    }
+    return {
+      activeProfileId: typeof payload?.activeProfileId === "string" ? payload.activeProfileId : null,
+    };
+  },
+
+  async setActiveProfile(profileId: string | null): Promise<{ activeProfileId: string | null }> {
+    const response = await fetch(`${API_BASE}/api/profiles/active`, {
+      method: "PUT",
+      headers: jsonHeaders,
+      body: JSON.stringify({ profileId }),
+    });
+    const payload = await readJson<{ activeProfileId?: string | null; error?: string }>(response);
+    if (!response.ok) {
+      throw extractError(payload, "Failed to set active profile");
+    }
+    return {
+      activeProfileId: typeof payload?.activeProfileId === "string" ? payload.activeProfileId : null,
+    };
   },
 
   async streamChat(

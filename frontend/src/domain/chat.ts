@@ -37,6 +37,24 @@ export type LongTermCandidate = {
   resolvedAt: number | null;
 };
 
+export type UserProfile = {
+  id: string;
+  name: string;
+  style: string;
+  outputFormat: string;
+  constraints: string;
+  notes: string;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type MemorySettings = {
+  shortTermEnabled: boolean;
+  workingEnabled: boolean;
+  longTermEnabled: boolean;
+  updatedAt: number;
+};
+
 export type ChatMemorySnapshot = {
   shortTerm: ShortTermMemory;
   working: WorkingMemory;

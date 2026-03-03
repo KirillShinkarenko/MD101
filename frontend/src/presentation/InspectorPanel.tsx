@@ -9,6 +9,9 @@ type Props = {
   requestRaw: string;
   responseRaw: string;
   memory: ChatMemorySnapshot;
+  shortTermEnabled: boolean;
+  workingEnabled: boolean;
+  longTermEnabled: boolean;
   effectiveMemoryBlock: string;
   errorText: string;
   isStreaming: boolean;
@@ -34,6 +37,9 @@ export function InspectorPanel(props: Props) {
     requestRaw,
     responseRaw,
     memory,
+    shortTermEnabled,
+    workingEnabled,
+    longTermEnabled,
     effectiveMemoryBlock,
     errorText,
     isStreaming,
@@ -93,6 +99,9 @@ export function InspectorPanel(props: Props) {
   );
 
   const handleSaveWorking = async () => {
+    if (!workingEnabled) {
+      return;
+    }
     setIsWorkingSaving(true);
     try {
       await onSaveWorking(workingDraft);
@@ -102,6 +111,9 @@ export function InspectorPanel(props: Props) {
   };
 
   const handleSaveLongTerm = async () => {
+    if (!longTermEnabled) {
+      return;
+    }
     setIsLongTermSaving(true);
     try {
       await onSaveLongTerm(longTermDraft);
@@ -194,6 +206,7 @@ export function InspectorPanel(props: Props) {
             <h4>Short-term</h4>
             <p className="hint"><strong>Updated:</strong> {formatTimestamp(memory.shortTerm.updatedAt)}</p>
             <pre>{memory.shortTerm.rollingSummary || "(empty)"}</pre>
+            {!shortTermEnabled ? <p className="hint">Short-term memory is disabled.</p> : null}
           </div>
 
           <div className="memory-card">
@@ -204,6 +217,7 @@ export function InspectorPanel(props: Props) {
               id="working-goal"
               rows={2}
               value={workingDraft.goal}
+              disabled={!workingEnabled}
               onChange={(event) => setWorkingDraft((prev) => ({ ...prev, goal: event.target.value }))}
             />
             <label className="memory-field-label" htmlFor="working-constraints">constraints</label>
@@ -211,6 +225,7 @@ export function InspectorPanel(props: Props) {
               id="working-constraints"
               rows={2}
               value={workingDraft.constraints}
+              disabled={!workingEnabled}
               onChange={(event) => setWorkingDraft((prev) => ({ ...prev, constraints: event.target.value }))}
             />
             <label className="memory-field-label" htmlFor="working-status">status</label>
@@ -218,6 +233,7 @@ export function InspectorPanel(props: Props) {
               id="working-status"
               rows={2}
               value={workingDraft.status}
+              disabled={!workingEnabled}
               onChange={(event) => setWorkingDraft((prev) => ({ ...prev, status: event.target.value }))}
             />
             <label className="memory-field-label" htmlFor="working-next-steps">next_steps</label>
@@ -225,15 +241,17 @@ export function InspectorPanel(props: Props) {
               id="working-next-steps"
               rows={2}
               value={workingDraft.nextSteps}
+              disabled={!workingEnabled}
               onChange={(event) => setWorkingDraft((prev) => ({ ...prev, nextSteps: event.target.value }))}
             />
             <UiButton
               size="sm"
               onClick={() => void handleSaveWorking()}
-              disabled={isStreaming || isWorkingSaving}
+              disabled={!workingEnabled || isStreaming || isWorkingSaving}
             >
               {isWorkingSaving ? "Saving..." : "Save working"}
             </UiButton>
+            {!workingEnabled ? <p className="hint">Working memory is disabled.</p> : null}
           </div>
 
           <div className="memory-card">
@@ -244,6 +262,7 @@ export function InspectorPanel(props: Props) {
               id="long-profile"
               rows={2}
               value={longTermDraft.profile}
+              disabled={!longTermEnabled}
               onChange={(event) => setLongTermDraft((prev) => ({ ...prev, profile: event.target.value }))}
             />
             <label className="memory-field-label" htmlFor="long-preferences">preferences</label>
@@ -251,6 +270,7 @@ export function InspectorPanel(props: Props) {
               id="long-preferences"
               rows={2}
               value={longTermDraft.preferences}
+              disabled={!longTermEnabled}
               onChange={(event) => setLongTermDraft((prev) => ({ ...prev, preferences: event.target.value }))}
             />
             <label className="memory-field-label" htmlFor="long-decisions">decisions</label>
@@ -258,6 +278,7 @@ export function InspectorPanel(props: Props) {
               id="long-decisions"
               rows={2}
               value={longTermDraft.decisions}
+              disabled={!longTermEnabled}
               onChange={(event) => setLongTermDraft((prev) => ({ ...prev, decisions: event.target.value }))}
             />
             <label className="memory-field-label" htmlFor="long-knowledge">knowledge</label>
@@ -265,46 +286,53 @@ export function InspectorPanel(props: Props) {
               id="long-knowledge"
               rows={2}
               value={longTermDraft.knowledge}
+              disabled={!longTermEnabled}
               onChange={(event) => setLongTermDraft((prev) => ({ ...prev, knowledge: event.target.value }))}
             />
             <UiButton
               size="sm"
               onClick={() => void handleSaveLongTerm()}
-              disabled={isStreaming || isLongTermSaving}
+              disabled={!longTermEnabled || isStreaming || isLongTermSaving}
             >
               {isLongTermSaving ? "Saving..." : "Save long-term"}
             </UiButton>
+            {!longTermEnabled ? <p className="hint">Long-term memory is disabled.</p> : null}
           </div>
 
           <div className="memory-card">
             <h4>Pending long-term candidates</h4>
-            {memory.pendingCandidates.length === 0 ? <p className="hint">No pending candidates.</p> : null}
-            <div className="candidate-list">
-              {memory.pendingCandidates.map((candidate) => (
-                <article className="candidate-item" key={candidate.id}>
-                  <p><strong>{candidate.targetField}</strong></p>
-                  <p>{candidate.value}</p>
-                  {candidate.reason ? <p className="hint">Reason: {candidate.reason}</p> : null}
-                  <div className="candidate-actions">
-                    <UiButton
-                      size="sm"
-                      onClick={() => void handleApprove(candidate.id)}
-                      disabled={busyCandidateId === candidate.id}
-                    >
-                      Approve
-                    </UiButton>
-                    <UiButton
-                      size="sm"
-                      variant="subtle"
-                      onClick={() => void handleReject(candidate.id)}
-                      disabled={busyCandidateId === candidate.id}
-                    >
-                      Reject
-                    </UiButton>
-                  </div>
-                </article>
-              ))}
-            </div>
+            {!longTermEnabled ? <p className="hint">Long-term memory is disabled.</p> : null}
+            {longTermEnabled ? (
+              <>
+                {memory.pendingCandidates.length === 0 ? <p className="hint">No pending candidates.</p> : null}
+                <div className="candidate-list">
+                  {memory.pendingCandidates.map((candidate) => (
+                    <article className="candidate-item" key={candidate.id}>
+                      <p><strong>{candidate.targetField}</strong></p>
+                      <p>{candidate.value}</p>
+                      {candidate.reason ? <p className="hint">Reason: {candidate.reason}</p> : null}
+                      <div className="candidate-actions">
+                        <UiButton
+                          size="sm"
+                          onClick={() => void handleApprove(candidate.id)}
+                          disabled={busyCandidateId === candidate.id}
+                        >
+                          Approve
+                        </UiButton>
+                        <UiButton
+                          size="sm"
+                          variant="subtle"
+                          onClick={() => void handleReject(candidate.id)}
+                          disabled={busyCandidateId === candidate.id}
+                        >
+                          Reject
+                        </UiButton>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              </>
+            ) : null}
           </div>
 
           <div className="memory-card">

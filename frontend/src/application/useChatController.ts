@@ -20,6 +20,7 @@ import {
   type RunMetrics,
   type Status,
   type TurnGrowthRow,
+  type UserProfile,
   type WorkingMemory,
 } from "../domain/chat";
 import { chatApi } from "../infrastructure/chatApi";
@@ -76,6 +77,22 @@ const extractRawApiPayload = (payload: unknown): unknown => {
 
 export type ChatController = ReturnType<typeof useChatController>;
 
+type ProfileDraft = {
+  name: string;
+  style: string;
+  outputFormat: string;
+  constraints: string;
+  notes: string;
+};
+
+const EMPTY_PROFILE_DRAFT: ProfileDraft = {
+  name: "",
+  style: "",
+  outputFormat: "",
+  constraints: "",
+  notes: "",
+};
+
 export function useChatController() {
   const [chats, setChats] = useState<ChatSummary[]>([]);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
@@ -98,8 +115,18 @@ export function useChatController() {
 
   const [isModelSettingsOpen, setIsModelSettingsOpen] = useState(false);
   const [isSystemPromptOpen, setIsSystemPromptOpen] = useState(false);
+  const [isProfilesOpen, setIsProfilesOpen] = useState(false);
   const [isConversationInfoOpen, setIsConversationInfoOpen] = useState(false);
   const [fullScreenView, setFullScreenView] = useState<FullScreenView>(null);
+  const [profiles, setProfiles] = useState<UserProfile[]>([]);
+  const [activeProfileId, setActiveProfileId] = useState<string | null>(null);
+  const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null);
+  const [profileDraft, setProfileDraft] = useState<ProfileDraft>({ ...EMPTY_PROFILE_DRAFT });
+  const [isProfilesSaving, setIsProfilesSaving] = useState(false);
+  const [shortTermEnabled, setShortTermEnabledState] = useState(true);
+  const [workingEnabled, setWorkingEnabledState] = useState(true);
+  const [longTermEnabled, setLongTermEnabledState] = useState(true);
+  const [isMemorySettingsSaving, setIsMemorySettingsSaving] = useState(false);
 
   const controllerRef = useRef<AbortController | null>(null);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
@@ -113,10 +140,18 @@ export function useChatController() {
     () => chats.find((chat) => chat.id === activeChatId) ?? null,
     [chats, activeChatId]
   );
+  const selectedProfile = useMemo(
+    () => profiles.find((profile) => profile.id === selectedProfileId) ?? null,
+    [profiles, selectedProfileId]
+  );
 
   const activeModelLabel = useMemo(
     () => MODEL_OPTIONS.find((option) => option.value === model)?.label ?? model,
     [model]
+  );
+  const activeProfileLabel = useMemo(
+    () => profiles.find((profile) => profile.id === activeProfileId)?.name ?? "Не выбран",
+    [profiles, activeProfileId]
   );
 
   const isStreaming = status === "streaming";
@@ -248,6 +283,28 @@ export function useChatController() {
     setMemory(nextMemory);
   }, []);
 
+  const loadProfiles = useCallback(async () => {
+    const payload = await chatApi.listProfiles();
+    setProfiles(payload.profiles);
+    setActiveProfileId(payload.activeProfileId);
+    setSelectedProfileId((prev) => {
+      if (prev && payload.profiles.some((profile) => profile.id === prev)) {
+        return prev;
+      }
+      if (payload.activeProfileId && payload.profiles.some((profile) => profile.id === payload.activeProfileId)) {
+        return payload.activeProfileId;
+      }
+      return payload.profiles[0]?.id ?? null;
+    });
+  }, []);
+
+  const loadMemorySettings = useCallback(async () => {
+    const settings = await chatApi.getMemorySettings();
+    setShortTermEnabledState(settings.shortTermEnabled);
+    setWorkingEnabledState(settings.workingEnabled);
+    setLongTermEnabledState(settings.longTermEnabled);
+  }, []);
+
   const loadChats = useCallback(async () => {
     const listed = await chatApi.listChats();
 
@@ -372,7 +429,7 @@ export function useChatController() {
 
   const saveWorkingMemory = useCallback(
     async (body: Partial<Pick<WorkingMemory, "goal" | "constraints" | "status" | "nextSteps">>) => {
-      if (!activeChatId) {
+      if (!activeChatId || !workingEnabled) {
         return;
       }
       try {
@@ -385,12 +442,12 @@ export function useChatController() {
         setStatus("error");
       }
     },
-    [activeChatId]
+    [activeChatId, workingEnabled]
   );
 
   const saveLongTermMemory = useCallback(
     async (body: Partial<Pick<LongTermMemory, "profile" | "preferences" | "decisions" | "knowledge">>) => {
-      if (!activeChatId) {
+      if (!activeChatId || !longTermEnabled) {
         return;
       }
       try {
@@ -403,8 +460,40 @@ export function useChatController() {
         setStatus("error");
       }
     },
-    [activeChatId]
+    [activeChatId, longTermEnabled]
   );
+
+  const updateMemorySettings = useCallback(
+    async (patch: { shortTermEnabled?: boolean; workingEnabled?: boolean; longTermEnabled?: boolean }) => {
+      setIsMemorySettingsSaving(true);
+      try {
+        const settings = await chatApi.patchMemorySettings(patch);
+        setShortTermEnabledState(settings.shortTermEnabled);
+        setWorkingEnabledState(settings.workingEnabled);
+        setLongTermEnabledState(settings.longTermEnabled);
+        setErrorText("");
+        setStatus("idle");
+      } catch (error) {
+        setErrorText(error instanceof Error ? error.message : "Failed to update memory settings");
+        setStatus("error");
+      } finally {
+        setIsMemorySettingsSaving(false);
+      }
+    },
+    []
+  );
+
+  const setShortTermEnabled = useCallback(async (nextValue: boolean) => {
+    await updateMemorySettings({ shortTermEnabled: nextValue });
+  }, [updateMemorySettings]);
+
+  const setWorkingEnabled = useCallback(async (nextValue: boolean) => {
+    await updateMemorySettings({ workingEnabled: nextValue });
+  }, [updateMemorySettings]);
+
+  const setLongTermEnabled = useCallback(async (nextValue: boolean) => {
+    await updateMemorySettings({ longTermEnabled: nextValue });
+  }, [updateMemorySettings]);
 
   const approveCandidate = useCallback(
     async (candidateId: string) => {
@@ -439,6 +528,101 @@ export function useChatController() {
     },
     [activeChatId]
   );
+
+  const openProfiles = useCallback(() => {
+    void loadProfiles().catch((error: unknown) => {
+      setErrorText(error instanceof Error ? error.message : "Failed to load profiles");
+      setStatus("error");
+    });
+    setIsProfilesOpen(true);
+    setSelectedProfileId((prev) => prev ?? activeProfileId ?? profiles[0]?.id ?? null);
+  }, [activeProfileId, loadProfiles, profiles]);
+
+  const closeProfiles = useCallback(() => {
+    setIsProfilesOpen(false);
+  }, []);
+
+  const selectProfile = useCallback((profileId: string) => {
+    setSelectedProfileId(profileId);
+  }, []);
+
+  const createProfile = useCallback(async () => {
+    setIsProfilesSaving(true);
+    try {
+      const { profile, activeProfileId: nextActiveProfileId } = await chatApi.createProfile("New profile");
+      setProfiles((prev) => [profile, ...prev.filter((item) => item.id !== profile.id)]);
+      setActiveProfileId(nextActiveProfileId);
+      setSelectedProfileId(profile.id);
+      setErrorText("");
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : "Failed to create profile");
+      setStatus("error");
+    } finally {
+      setIsProfilesSaving(false);
+    }
+  }, []);
+
+  const saveProfile = useCallback(async () => {
+    if (!selectedProfileId) {
+      return;
+    }
+    setIsProfilesSaving(true);
+    try {
+      const updated = await chatApi.updateProfile(selectedProfileId, profileDraft);
+      setProfiles((prev) => prev.map((profile) => (profile.id === updated.id ? updated : profile)));
+      setErrorText("");
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : "Failed to save profile");
+      setStatus("error");
+    } finally {
+      setIsProfilesSaving(false);
+    }
+  }, [profileDraft, selectedProfileId]);
+
+  const deleteProfile = useCallback(
+    async (profileId: string) => {
+      setIsProfilesSaving(true);
+      try {
+        const { activeProfileId: nextActiveProfileId } = await chatApi.deleteProfile(profileId);
+        setProfiles((prev) => prev.filter((profile) => profile.id !== profileId));
+        setActiveProfileId(nextActiveProfileId);
+        setSelectedProfileId((prev) => {
+          if (prev !== profileId) {
+            return prev;
+          }
+          if (nextActiveProfileId) {
+            return nextActiveProfileId;
+          }
+          const remaining = profiles.filter((profile) => profile.id !== profileId);
+          return remaining[0]?.id ?? null;
+        });
+        setErrorText("");
+      } catch (error) {
+        setErrorText(error instanceof Error ? error.message : "Failed to delete profile");
+        setStatus("error");
+      } finally {
+        setIsProfilesSaving(false);
+      }
+    },
+    [profiles]
+  );
+
+  const setActiveProfile = useCallback(async (profileId: string | null) => {
+    setIsProfilesSaving(true);
+    try {
+      const { activeProfileId: nextActiveProfileId } = await chatApi.setActiveProfile(profileId);
+      setActiveProfileId(nextActiveProfileId);
+      if (nextActiveProfileId) {
+        setSelectedProfileId(nextActiveProfileId);
+      }
+      setErrorText("");
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : "Failed to set active profile");
+      setStatus("error");
+    } finally {
+      setIsProfilesSaving(false);
+    }
+  }, []);
 
   const stopStreaming = useCallback(() => {
     controllerRef.current?.abort();
@@ -581,6 +765,15 @@ export function useChatController() {
               setMemory(nextMemory);
             }
             setEffectiveMemoryBlock(typeof payload.memoryBlock === "string" ? payload.memoryBlock : "");
+            if (typeof payload.shortTermEnabled === "boolean") {
+              setShortTermEnabledState(payload.shortTermEnabled);
+            }
+            if (typeof payload.workingEnabled === "boolean") {
+              setWorkingEnabledState(payload.workingEnabled);
+            }
+            if (typeof payload.longTermEnabled === "boolean") {
+              setLongTermEnabledState(payload.longTermEnabled);
+            }
           }
 
           if (eventName === "error") {
@@ -767,11 +960,11 @@ export function useChatController() {
   }, [messages]);
 
   useEffect(() => {
-    void loadChats().catch((error: unknown) => {
+    void Promise.all([loadChats(), loadProfiles(), loadMemorySettings()]).catch((error: unknown) => {
       setErrorText(error instanceof Error ? error.message : "Failed to initialize");
       setStatus("error");
     });
-  }, [loadChats]);
+  }, [loadChats, loadProfiles, loadMemorySettings]);
 
   useEffect(() => {
     if (!activeChat) {
@@ -782,6 +975,20 @@ export function useChatController() {
       setReasoningEffort(reasoningOptions[0] ?? "low");
     }
   }, [activeChat, isReasoningSupported, reasoningEffort, reasoningOptions]);
+
+  useEffect(() => {
+    if (!selectedProfile) {
+      setProfileDraft({ ...EMPTY_PROFILE_DRAFT });
+      return;
+    }
+    setProfileDraft({
+      name: selectedProfile.name,
+      style: selectedProfile.style,
+      outputFormat: selectedProfile.outputFormat,
+      constraints: selectedProfile.constraints,
+      notes: selectedProfile.notes,
+    });
+  }, [selectedProfile]);
 
   useEffect(() => {
     localStorage.setItem(SYSTEM_PROMPT_STORAGE_KEY, systemPrompt);
@@ -821,9 +1028,20 @@ export function useChatController() {
       overflowErrorRaw,
       isModelSettingsOpen,
       isSystemPromptOpen,
+      isProfilesOpen,
       isConversationInfoOpen,
       fullScreenView,
+      profiles,
+      activeProfileId,
+      selectedProfileId,
+      profileDraft,
+      isProfilesSaving,
+      shortTermEnabled,
+      workingEnabled,
+      longTermEnabled,
+      isMemorySettingsSaving,
       activeModelLabel,
+      activeProfileLabel,
       isStreaming,
       reasoningOptions,
       isReasoningSupported,
@@ -843,12 +1061,23 @@ export function useChatController() {
       setSystemPrompt,
       setReasoningEffort,
       handleMemoryModelChange,
+      setShortTermEnabled,
+      setWorkingEnabled,
+      setLongTermEnabled,
       saveWorkingMemory,
       saveLongTermMemory,
       approveCandidate,
       rejectCandidate,
       setIsModelSettingsOpen,
       setIsSystemPromptOpen,
+      openProfiles,
+      closeProfiles,
+      createProfile,
+      deleteProfile,
+      selectProfile,
+      setProfileDraft,
+      saveProfile,
+      setActiveProfile,
       setIsConversationInfoOpen,
       setFullScreenView,
       createChat,

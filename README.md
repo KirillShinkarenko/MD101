@@ -7,8 +7,14 @@
 - мультичат: список, создание, удаление, переключение
 - автогенерация названия нового чата по первому сообщению
 - глобальный `System prompt` (модалка)
+- профили персонализации: отдельная модалка `Profiles` (создание, удаление, редактирование, выбор активного)
+  - активный профиль автоматически подмешивается в `systemPrompt` каждого запроса
 - выбор модели и параметров (`reasoning effort`)
 - выбор `Memory updater model` (модель, которая обновляет память перед основным ответом)
+- глобальные переключатели памяти в `Model settings`:
+  - `Short-term memory` - при выключении short-term не обновляется и не подмешивается в prompt
+  - `Working memory` - при выключении working не обновляется, не подмешивается в prompt и недоступно ручное редактирование
+  - `Long-term memory` - при выключении long-term не подмешивается в prompt и не генерирует новые кандидаты
 - трёхслойная память:
   - `Short-term` (пер-чат): накопительное саммари диалога (`rolling summary`)
   - `Working` (пер-чат): `goal`, `constraints`, `status`, `next_steps` с ручным редактированием
@@ -41,9 +47,9 @@
 - поток между frontend и backend: SSE (`POST /api/chats/:id/stream`)
 - backend обращается к OpenAI `v1/responses`
 - memory pipeline на backend:
-  - отдельный вызов memory-updater модели обновляет `short-term`, `working` и формирует кандидаты в `long-term`
+  - отдельный вызов memory-updater модели обновляет только включенные слои (`short-term`, `working`) и формирует кандидаты в `long-term` только если long-term включен
   - из snapshot строится `memory block`
-  - `memory block` добавляется в `systemPrompt` основного запроса
+  - `memory block` добавляется в `systemPrompt` основного запроса только для включенных слоев памяти
 
 ## Хранение данных
 
@@ -54,6 +60,11 @@
   - `chat_working_memory`
   - `global_long_term_memory`
   - `long_term_candidates`
+- таблицы профилей:
+  - `user_profiles`
+  - `profile_settings`
+- таблица настроек памяти:
+  - `memory_settings`
 
 ## Переменные окружения
 
@@ -103,22 +114,35 @@ npm run dev
 
 ## Поддерживаемые модели
 
-- `gpt-3.5-turbo`
-- `gpt-4.1-nano`
-- `gpt-5-mini`
-- `gpt-5.1`
-- `gpt-5.2`
+- `gpt-3.5-turbo` (`reasoningEffort` не поддерживается)
+- `gpt-4.1-nano` (`reasoningEffort` не поддерживается)
+- `gpt-5-mini` (`minimal`, `low`, `medium`, `high`)
+- `gpt-5.1` (`none`, `low`, `medium`, `high`)
+- `gpt-5.2` (`none`, `low`, `medium`, `high`, `xhigh`)
+
+По умолчанию:
+
+- основная модель: `OPENAI_MODEL` из `.env` (fallback: `gpt-5-mini`)
+- `Memory updater model`: `gpt-4.1-nano` (если не передан `memoryModel` в stream-запросе)
 
 ## API backend
 
 - `GET /health`
 - `GET /api/chats` - список чатов
+- `GET /api/profiles` - список профилей и текущий активный профиль
+- `POST /api/profiles` - создать профиль (`name`)
+- `PATCH /api/profiles/:id` - обновить профиль (`name`, `style`, `outputFormat`, `constraints`, `notes`)
+- `DELETE /api/profiles/:id` - удалить профиль
+- `PUT /api/profiles/active` - выбрать активный профиль (`profileId` или `null`)
+- `GET /api/memory/settings` - получить глобальные настройки памяти (`shortTermEnabled`, `workingEnabled`, `longTermEnabled`, `updatedAt`)
+- `PATCH /api/memory/settings` - обновить глобальные настройки памяти (partial: `shortTermEnabled?`, `workingEnabled?`, `longTermEnabled?`)
 - `POST /api/chats` - создать чат
   - опциональные поля: `title`, `model`, `systemPrompt`
 - `GET /api/chats/:id/messages` - история сообщений
 - `GET /api/chats/:id/memory` - получить snapshot памяти (`shortTerm`, `working`, `longTerm`, `pendingCandidates`)
 - `PATCH /api/chats/:id` - обновить чат (`title`, `model`, `systemPrompt`)
 - `PATCH /api/chats/:id/memory/working` - вручную обновить `goal`, `constraints`, `status`, `nextSteps`
+  - при `workingEnabled=false` возвращает `409` (`working memory is disabled`)
 - `PATCH /api/memory/long-term` - вручную обновить `profile`, `preferences`, `decisions`, `knowledge`
 - `POST /api/memory/candidates/:id/approve` - принять кандидата в long-term
 - `POST /api/memory/candidates/:id/reject` - отклонить кандидата
@@ -137,10 +161,30 @@ SSE-события stream endpoint:
 - `done`
 - `error`
 
+`debug_response_final` содержит usage (`input/output/total tokens`) и оценку стоимости (`input/output/total cost usd`) для поддерживаемых моделей.
+
 ## Управление вводом
 
 - `Enter` - отправить сообщение
 - `Shift + Enter` - новая строка
+
+## Production
+
+Backend:
+
+```bash
+cd backend
+npm run build
+npm run start
+```
+
+Frontend:
+
+```bash
+cd frontend
+npm run build
+npm run preview
+```
 
 ## Безопасность
 

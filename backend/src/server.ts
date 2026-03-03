@@ -52,6 +52,28 @@ type LongTermMemoryPatchBody = {
   knowledge?: string;
 };
 
+type CreateProfileBody = {
+  name?: string;
+};
+
+type PatchProfileBody = {
+  name?: string;
+  style?: string;
+  outputFormat?: string;
+  constraints?: string;
+  notes?: string;
+};
+
+type SetActiveProfileBody = {
+  profileId?: string | null;
+};
+
+type MemorySettingsPatchBody = {
+  shortTermEnabled?: boolean;
+  workingEnabled?: boolean;
+  longTermEnabled?: boolean;
+};
+
 type UsageSummary = {
   inputTokens: number;
   outputTokens: number;
@@ -114,6 +136,31 @@ type LongTermCandidateRow = {
   resolvedAt: number | null;
 };
 
+type UserProfileRow = {
+  id: string;
+  name: string;
+  style: string;
+  outputFormat: string;
+  constraints: string;
+  notes: string;
+  createdAt: number;
+  updatedAt: number;
+};
+
+type ProfileSettingsRow = {
+  scopeId: "global";
+  activeProfileId: string | null;
+  updatedAt: number;
+};
+
+type MemorySettingsRow = {
+  scopeId: "global";
+  shortTermEnabled: number;
+  workingEnabled: number;
+  longTermEnabled: number;
+  updatedAt: number;
+};
+
 type ChatMemorySnapshot = {
   shortTerm: {
     rollingSummary: string;
@@ -169,10 +216,14 @@ const DEFAULT_MODEL = process.env.OPENAI_MODEL?.trim() || "gpt-5-mini";
 const DEFAULT_MEMORY_MODEL = "gpt-4.1-nano";
 const BRANCH_CHAT_TITLE_PREFIX = "Ветка - ";
 const GLOBAL_LONG_TERM_SCOPE_ID = "global" as const;
+const GLOBAL_PROFILE_SCOPE_ID = "global" as const;
+const GLOBAL_MEMORY_SETTINGS_SCOPE_ID = "global" as const;
 const SHORT_TERM_MAX_LENGTH = 1800;
 const WORKING_FIELD_MAX_LENGTH = 320;
 const LONG_TERM_FIELD_MAX_LENGTH = 600;
 const CANDIDATE_VALUE_MAX_LENGTH = 320;
+const PROFILE_FIELD_MAX_LENGTH = 600;
+const PROFILE_NAME_MAX_LENGTH = 64;
 const NETWORK_ERROR_HINTS: Record<string, string> = {
   ENOTFOUND: "DNS lookup failed. Check internet connection or DNS settings.",
   ECONNRESET: "Network connection was reset while calling OpenAI.",
@@ -314,9 +365,36 @@ CREATE TABLE IF NOT EXISTS long_term_candidates (
   FOREIGN KEY (chat_id) REFERENCES chats (id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS user_profiles (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  style TEXT NOT NULL DEFAULT '',
+  output_format TEXT NOT NULL DEFAULT '',
+  constraints TEXT NOT NULL DEFAULT '',
+  notes TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS profile_settings (
+  scope_id TEXT PRIMARY KEY,
+  active_profile_id TEXT,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY (active_profile_id) REFERENCES user_profiles (id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS memory_settings (
+  scope_id TEXT PRIMARY KEY,
+  short_term_enabled INTEGER NOT NULL DEFAULT 1,
+  working_enabled INTEGER NOT NULL DEFAULT 1,
+  long_term_enabled INTEGER NOT NULL DEFAULT 1,
+  updated_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_chat_id_created_at ON messages (chat_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_long_term_candidates_chat_status_created_at
   ON long_term_candidates (chat_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_user_profiles_updated_at ON user_profiles (updated_at DESC, created_at DESC);
 `);
 
 const chatsColumns = db.prepare("PRAGMA table_info(chats)").all() as Array<{ name: string }>;
@@ -329,6 +407,15 @@ if (!chatColumnNames.has("branch_from_chat_title")) {
 }
 if (!chatColumnNames.has("branch_checkpoint_message_count")) {
   db.exec("ALTER TABLE chats ADD COLUMN branch_checkpoint_message_count INTEGER");
+}
+
+const memorySettingsColumns = db.prepare("PRAGMA table_info(memory_settings)").all() as Array<{ name: string }>;
+const memorySettingsColumnNames = new Set(memorySettingsColumns.map((column) => column.name));
+if (!memorySettingsColumnNames.has("short_term_enabled")) {
+  db.exec("ALTER TABLE memory_settings ADD COLUMN short_term_enabled INTEGER NOT NULL DEFAULT 1");
+}
+if (!memorySettingsColumnNames.has("working_enabled")) {
+  db.exec("ALTER TABLE memory_settings ADD COLUMN working_enabled INTEGER NOT NULL DEFAULT 1");
 }
 
 const ensureGlobalLongTermMemoryStmt = db.prepare(`
@@ -348,6 +435,28 @@ const ensureGlobalLongTermMemoryStmt = db.prepare(`
   ON CONFLICT(scope_id) DO NOTHING
 `);
 ensureGlobalLongTermMemoryStmt.run(Date.now());
+
+const ensureProfileSettingsStmt = db.prepare(`
+  INSERT INTO profile_settings (
+    scope_id,
+    active_profile_id,
+    updated_at
+  ) VALUES ('global', NULL, ?)
+  ON CONFLICT(scope_id) DO NOTHING
+`);
+ensureProfileSettingsStmt.run(Date.now());
+
+const ensureMemorySettingsStmt = db.prepare(`
+  INSERT INTO memory_settings (
+    scope_id,
+    short_term_enabled,
+    working_enabled,
+    long_term_enabled,
+    updated_at
+  ) VALUES ('global', 1, 1, 1, ?)
+  ON CONFLICT(scope_id) DO NOTHING
+`);
+ensureMemorySettingsStmt.run(Date.now());
 
 const parseModel = (value: unknown): string | undefined => {
   if (typeof value !== "string") {
@@ -628,6 +737,18 @@ const normalizeShortSummary = (value: unknown): string => normalizeTextField(val
 const normalizeWorkingField = (value: unknown): string => normalizeTextField(value, WORKING_FIELD_MAX_LENGTH);
 const normalizeLongTermField = (value: unknown): string => normalizeTextField(value, LONG_TERM_FIELD_MAX_LENGTH);
 const normalizeCandidateValue = (value: unknown): string => normalizeTextField(value, CANDIDATE_VALUE_MAX_LENGTH);
+const normalizeProfileField = (value: unknown): string => normalizeTextField(value, PROFILE_FIELD_MAX_LENGTH);
+
+const parseProfileName = (value: unknown): string | null => {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const compact = compactWhitespace(value.trim());
+  if (!compact || compact.length > PROFILE_NAME_MAX_LENGTH) {
+    return null;
+  }
+  return compact;
+};
 
 const extractJsonObject = (value: string): string | null => {
   const trimmed = value.trim();
@@ -755,8 +876,30 @@ const buildMemoryUpdateRequestBody = (params: {
   longTerm: { profile: string; preferences: string; decisions: string; knowledge: string };
   newMessages: Array<{ role: Role; content: string }>;
   latestUserPrompt: string;
+  shortTermEnabled: boolean;
+  workingEnabled: boolean;
+  longTermEnabled: boolean;
 }): Record<string, unknown> => {
-  const { memoryModel, previousSummary, working, longTerm, newMessages, latestUserPrompt } = params;
+  const {
+    memoryModel,
+    previousSummary,
+    working,
+    longTerm,
+    newMessages,
+    latestUserPrompt,
+    shortTermEnabled,
+    workingEnabled,
+    longTermEnabled,
+  } = params;
+  const shortTermRule = shortTermEnabled
+    ? "1) shortTerm.rollingSummary: обнови накопительное саммари диалога (прошлое саммари + новые сообщения)."
+    : "1) shortTerm.rollingSummary: верни пустую строку.";
+  const workingRule = workingEnabled
+    ? "2) working: только текущее состояние задачи (goal, constraints, status, nextSteps)."
+    : "2) working: верни все поля пустыми строками.";
+  const longTermRule = longTermEnabled
+    ? "3) longTermCandidates: только потенциально долговременные факты. Не переноси ничего напрямую в long-term."
+    : "3) longTermCandidates: всегда возвращай пустой массив.";
   return {
     model: memoryModel,
     stream: false,
@@ -767,9 +910,9 @@ const buildMemoryUpdateRequestBody = (params: {
       "Формат:",
       '{"shortTerm":{"rollingSummary":""},"working":{"goal":"","constraints":"","status":"","nextSteps":""},"longTermCandidates":[{"targetField":"profile|preferences|decisions|knowledge","value":"","reason":""}]}',
       "Правила:",
-      "1) shortTerm.rollingSummary: обнови накопительное саммари диалога (прошлое саммари + новые сообщения).",
-      "2) working: только текущее состояние задачи (goal, constraints, status, nextSteps).",
-      "3) longTermCandidates: только потенциально долговременные факты. Не переноси ничего напрямую в long-term.",
+      shortTermRule,
+      workingRule,
+      longTermRule,
       "4) Не дублируй одинаковые кандидаты.",
       "5) Пиши компактно, короткими фразами через '; '.",
       "6) Если данных нет, используй пустую строку.",
@@ -801,6 +944,9 @@ const updateMemoryViaModel = async (params: {
   longTerm: { profile: string; preferences: string; decisions: string; knowledge: string };
   newMessages: Array<{ role: Role; content: string }>;
   latestUserPrompt: string;
+  shortTermEnabled: boolean;
+  workingEnabled: boolean;
+  longTermEnabled: boolean;
   signal: AbortSignal;
 }): Promise<MemoryUpdaterOutput> => {
   const requestBody = buildMemoryUpdateRequestBody(params);
@@ -844,31 +990,57 @@ const buildMemoryBlock = (params: {
   shortTerm: { rollingSummary: string };
   working: { goal: string; constraints: string; status: string; nextSteps: string };
   longTerm: { profile: string; preferences: string; decisions: string; knowledge: string };
+  shortTermEnabled: boolean;
+  workingEnabled: boolean;
+  longTermEnabled: boolean;
 }): string => {
-  const { shortTerm, working, longTerm } = params;
+  const { shortTerm, working, longTerm, shortTermEnabled, workingEnabled, longTermEnabled } = params;
+  const block = ["MEMORY_LAYERS"];
+  if (shortTermEnabled) {
+    block.push("SHORT_TERM:", `- rolling_summary: ${shortTerm.rollingSummary || "(empty)"}`);
+  }
+  if (workingEnabled) {
+    block.push(
+      "WORKING_MEMORY:",
+      `- goal: ${working.goal || "(empty)"}`,
+      `- constraints: ${working.constraints || "(empty)"}`,
+      `- status: ${working.status || "(empty)"}`,
+      `- next_steps: ${working.nextSteps || "(empty)"}`
+    );
+  }
+  if (longTermEnabled) {
+    block.push(
+      "LONG_TERM_MEMORY:",
+      `- profile: ${longTerm.profile || "(empty)"}`,
+      `- preferences: ${longTerm.preferences || "(empty)"}`,
+      `- decisions: ${longTerm.decisions || "(empty)"}`,
+      `- knowledge: ${longTerm.knowledge || "(empty)"}`
+    );
+  }
+  return block.join("\n");
+};
+
+const buildProfileBlock = (profile: UserProfileRow | null): string => {
+  if (!profile) {
+    return "";
+  }
   return [
-    "MEMORY_LAYERS",
-    "SHORT_TERM:",
-    `- rolling_summary: ${shortTerm.rollingSummary || "(empty)"}`,
-    "WORKING_MEMORY:",
-    `- goal: ${working.goal || "(empty)"}`,
-    `- constraints: ${working.constraints || "(empty)"}`,
-    `- status: ${working.status || "(empty)"}`,
-    `- next_steps: ${working.nextSteps || "(empty)"}`,
-    "LONG_TERM_MEMORY:",
-    `- profile: ${longTerm.profile || "(empty)"}`,
-    `- preferences: ${longTerm.preferences || "(empty)"}`,
-    `- decisions: ${longTerm.decisions || "(empty)"}`,
-    `- knowledge: ${longTerm.knowledge || "(empty)"}`,
+    "USER_PROFILE",
+    `- name: ${profile.name || "(empty)"}`,
+    `- style: ${profile.style || "(empty)"}`,
+    `- output_format: ${profile.outputFormat || "(empty)"}`,
+    `- constraints: ${profile.constraints || "(empty)"}`,
+    `- notes: ${profile.notes || "(empty)"}`,
   ].join("\n");
 };
 
-const mergeSystemPromptWithMemory = (systemPrompt: string, memoryBlock: string): string => {
-  const normalizedPrompt = systemPrompt.trim();
-  if (!normalizedPrompt) {
-    return memoryBlock;
-  }
-  return `${normalizedPrompt}\n\n${memoryBlock}`;
+const mergeSystemPromptWithContext = (
+  systemPrompt: string,
+  profileBlock: string,
+  memoryBlock: string
+): string => {
+  const chunks = [systemPrompt.trim(), profileBlock.trim(), memoryBlock.trim()].filter(Boolean);
+  return chunks.join("\n\n");
 };
 
 const getChatStmt = db.prepare(`
@@ -1099,6 +1271,107 @@ const upsertLongTermMemoryStmt = db.prepare(`
     updated_at = excluded.updated_at
 `);
 
+const listProfilesStmt = db.prepare(`
+  SELECT
+    id,
+    name,
+    style,
+    output_format AS outputFormat,
+    constraints,
+    notes,
+    created_at AS createdAt,
+    updated_at AS updatedAt
+  FROM user_profiles
+  ORDER BY updated_at DESC, created_at DESC
+`);
+
+const getProfileByIdStmt = db.prepare(`
+  SELECT
+    id,
+    name,
+    style,
+    output_format AS outputFormat,
+    constraints,
+    notes,
+    created_at AS createdAt,
+    updated_at AS updatedAt
+  FROM user_profiles
+  WHERE id = ?
+`);
+
+const insertProfileStmt = db.prepare(`
+  INSERT INTO user_profiles (
+    id,
+    name,
+    style,
+    output_format,
+    constraints,
+    notes,
+    created_at,
+    updated_at
+  )
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+`);
+
+const updateProfileStmt = db.prepare(`
+  UPDATE user_profiles
+  SET name = ?, style = ?, output_format = ?, constraints = ?, notes = ?, updated_at = ?
+  WHERE id = ?
+`);
+
+const deleteProfileStmt = db.prepare(`
+  DELETE FROM user_profiles
+  WHERE id = ?
+`);
+
+const getProfileSettingsStmt = db.prepare(`
+  SELECT
+    scope_id AS scopeId,
+    active_profile_id AS activeProfileId,
+    updated_at AS updatedAt
+  FROM profile_settings
+  WHERE scope_id = ?
+`);
+
+const upsertProfileSettingsStmt = db.prepare(`
+  INSERT INTO profile_settings (
+    scope_id,
+    active_profile_id,
+    updated_at
+  )
+  VALUES (?, ?, ?)
+  ON CONFLICT(scope_id) DO UPDATE SET
+    active_profile_id = excluded.active_profile_id,
+    updated_at = excluded.updated_at
+`);
+
+const getMemorySettingsStmt = db.prepare(`
+  SELECT
+    scope_id AS scopeId,
+    short_term_enabled AS shortTermEnabled,
+    working_enabled AS workingEnabled,
+    long_term_enabled AS longTermEnabled,
+    updated_at AS updatedAt
+  FROM memory_settings
+  WHERE scope_id = ?
+`);
+
+const upsertMemorySettingsStmt = db.prepare(`
+  INSERT INTO memory_settings (
+    scope_id,
+    short_term_enabled,
+    working_enabled,
+    long_term_enabled,
+    updated_at
+  )
+  VALUES (?, ?, ?, ?, ?)
+  ON CONFLICT(scope_id) DO UPDATE SET
+    short_term_enabled = excluded.short_term_enabled,
+    working_enabled = excluded.working_enabled,
+    long_term_enabled = excluded.long_term_enabled,
+    updated_at = excluded.updated_at
+`);
+
 const listPendingCandidatesByChatStmt = db.prepare(`
   SELECT
     id,
@@ -1249,6 +1522,42 @@ const getOrCreateLongTermMemory = (): LongTermMemoryRow => {
   return created;
 };
 
+const getOrCreateProfileSettings = (): ProfileSettingsRow => {
+  const existing = getProfileSettingsStmt.get(GLOBAL_PROFILE_SCOPE_ID) as ProfileSettingsRow | undefined;
+  if (existing) {
+    return existing;
+  }
+  const created: ProfileSettingsRow = {
+    scopeId: GLOBAL_PROFILE_SCOPE_ID,
+    activeProfileId: null,
+    updatedAt: Date.now(),
+  };
+  upsertProfileSettingsStmt.run(created.scopeId, created.activeProfileId, created.updatedAt);
+  return created;
+};
+
+const getOrCreateMemorySettings = (): MemorySettingsRow => {
+  const existing = getMemorySettingsStmt.get(GLOBAL_MEMORY_SETTINGS_SCOPE_ID) as MemorySettingsRow | undefined;
+  if (existing) {
+    return existing;
+  }
+  const created: MemorySettingsRow = {
+    scopeId: GLOBAL_MEMORY_SETTINGS_SCOPE_ID,
+    shortTermEnabled: 1,
+    workingEnabled: 1,
+    longTermEnabled: 1,
+    updatedAt: Date.now(),
+  };
+  upsertMemorySettingsStmt.run(
+    created.scopeId,
+    created.shortTermEnabled,
+    created.workingEnabled,
+    created.longTermEnabled,
+    created.updatedAt
+  );
+  return created;
+};
+
 const persistShortMemory = (memory: ShortTermMemoryRow): ShortTermMemoryRow => {
   upsertShortMemoryStmt.run(
     memory.chatId,
@@ -1291,6 +1600,38 @@ const persistLongTermMemory = (memory: LongTermMemoryRow): LongTermMemoryRow => 
     memory.updatedAt
   );
   return memory;
+};
+
+const persistProfileSettings = (activeProfileId: string | null, now = Date.now()): ProfileSettingsRow => {
+  upsertProfileSettingsStmt.run(GLOBAL_PROFILE_SCOPE_ID, activeProfileId, now);
+  return {
+    scopeId: GLOBAL_PROFILE_SCOPE_ID,
+    activeProfileId,
+    updatedAt: now,
+  };
+};
+
+const persistMemorySettings = (
+  settings: { shortTermEnabled: boolean; workingEnabled: boolean; longTermEnabled: boolean },
+  now = Date.now()
+): MemorySettingsRow => {
+  const encodedShort = settings.shortTermEnabled ? 1 : 0;
+  const encodedWorking = settings.workingEnabled ? 1 : 0;
+  const encodedLong = settings.longTermEnabled ? 1 : 0;
+  upsertMemorySettingsStmt.run(
+    GLOBAL_MEMORY_SETTINGS_SCOPE_ID,
+    encodedShort,
+    encodedWorking,
+    encodedLong,
+    now
+  );
+  return {
+    scopeId: GLOBAL_MEMORY_SETTINGS_SCOPE_ID,
+    shortTermEnabled: encodedShort,
+    workingEnabled: encodedWorking,
+    longTermEnabled: encodedLong,
+    updatedAt: now,
+  };
 };
 
 const toSnapshot = (
@@ -1430,6 +1771,211 @@ const createChat = (params?: {
 
 app.get("/health", async () => ({ ok: true }));
 
+app.get("/api/profiles", async () => {
+  const profiles = listProfilesStmt.all() as UserProfileRow[];
+  const settings = getOrCreateProfileSettings();
+  return {
+    profiles,
+    activeProfileId: settings.activeProfileId,
+  };
+});
+
+app.post<{ Body: CreateProfileBody }>("/api/profiles", async (request, reply) => {
+  const name = parseProfileName(request.body?.name);
+  if (!name) {
+    reply.code(400);
+    return { error: `name is required and must be 1-${PROFILE_NAME_MAX_LENGTH} characters` };
+  }
+
+  const now = Date.now();
+  const profileId = createId();
+  insertProfileStmt.run(profileId, name, "", "", "", "", now, now);
+
+  const profile = getProfileByIdStmt.get(profileId) as UserProfileRow | undefined;
+  if (!profile) {
+    reply.code(500);
+    return { error: "failed to create profile" };
+  }
+
+  const settings = getOrCreateProfileSettings();
+  const activeProfileId = settings.activeProfileId ?? profileId;
+  if (activeProfileId !== settings.activeProfileId) {
+    persistProfileSettings(activeProfileId, now);
+  }
+
+  return {
+    profile,
+    activeProfileId,
+  };
+});
+
+app.patch<{ Params: { id: string }; Body: PatchProfileBody }>(
+  "/api/profiles/:id",
+  async (request, reply) => {
+    const profileId = request.params.id;
+    const existing = getProfileByIdStmt.get(profileId) as UserProfileRow | undefined;
+    if (!existing) {
+      reply.code(404);
+      return { error: "profile not found" };
+    }
+
+    const next: UserProfileRow = {
+      ...existing,
+      updatedAt: Date.now(),
+    };
+    let hasChanges = false;
+
+    if (request.body?.name !== undefined) {
+      const name = parseProfileName(request.body.name);
+      if (!name) {
+        reply.code(400);
+        return { error: `name must be 1-${PROFILE_NAME_MAX_LENGTH} characters` };
+      }
+      next.name = name;
+      hasChanges = true;
+    }
+    if (request.body?.style !== undefined) {
+      next.style = normalizeProfileField(request.body.style);
+      hasChanges = true;
+    }
+    if (request.body?.outputFormat !== undefined) {
+      next.outputFormat = normalizeProfileField(request.body.outputFormat);
+      hasChanges = true;
+    }
+    if (request.body?.constraints !== undefined) {
+      next.constraints = normalizeProfileField(request.body.constraints);
+      hasChanges = true;
+    }
+    if (request.body?.notes !== undefined) {
+      next.notes = normalizeProfileField(request.body.notes);
+      hasChanges = true;
+    }
+
+    if (!hasChanges) {
+      reply.code(400);
+      return { error: "At least one profile field is required" };
+    }
+
+    updateProfileStmt.run(
+      next.name,
+      next.style,
+      next.outputFormat,
+      next.constraints,
+      next.notes,
+      next.updatedAt,
+      profileId
+    );
+
+    const updated = getProfileByIdStmt.get(profileId) as UserProfileRow | undefined;
+    if (!updated) {
+      reply.code(500);
+      return { error: "failed to update profile" };
+    }
+    return { profile: updated };
+  }
+);
+
+app.delete<{ Params: { id: string } }>("/api/profiles/:id", async (request, reply) => {
+  const profileId = request.params.id;
+  const existing = getProfileByIdStmt.get(profileId) as UserProfileRow | undefined;
+  if (!existing) {
+    reply.code(404);
+    return { error: "profile not found" };
+  }
+
+  deleteProfileStmt.run(profileId);
+
+  const settings = getOrCreateProfileSettings();
+  let activeProfileId = settings.activeProfileId;
+  if (settings.activeProfileId === profileId) {
+    activeProfileId = null;
+    persistProfileSettings(null, Date.now());
+  }
+
+  return {
+    ok: true,
+    activeProfileId,
+  };
+});
+
+app.put<{ Body: SetActiveProfileBody }>("/api/profiles/active", async (request, reply) => {
+  const profileId = request.body?.profileId;
+  if (profileId === undefined) {
+    reply.code(400);
+    return { error: "profileId is required" };
+  }
+
+  let nextActiveProfileId: string | null = null;
+  if (profileId === null) {
+    nextActiveProfileId = null;
+  } else if (typeof profileId === "string" && profileId.trim()) {
+    const normalizedId = profileId.trim();
+    const profile = getProfileByIdStmt.get(normalizedId) as UserProfileRow | undefined;
+    if (!profile) {
+      reply.code(404);
+      return { error: "profile not found" };
+    }
+    nextActiveProfileId = normalizedId;
+  } else {
+    reply.code(400);
+    return { error: "profileId must be a string or null" };
+  }
+
+  persistProfileSettings(nextActiveProfileId, Date.now());
+  return {
+    activeProfileId: nextActiveProfileId,
+  };
+});
+
+app.get("/api/memory/settings", async () => {
+  const settings = getOrCreateMemorySettings();
+  return {
+    shortTermEnabled: settings.shortTermEnabled === 1,
+    workingEnabled: settings.workingEnabled === 1,
+    longTermEnabled: settings.longTermEnabled === 1,
+    updatedAt: settings.updatedAt,
+  };
+});
+
+app.patch<{ Body: MemorySettingsPatchBody }>("/api/memory/settings", async (request, reply) => {
+  const body = request.body ?? {};
+  const hasShortTerm = body.shortTermEnabled !== undefined;
+  const hasWorking = body.workingEnabled !== undefined;
+  const hasLongTerm = body.longTermEnabled !== undefined;
+  if (!hasShortTerm && !hasWorking && !hasLongTerm) {
+    reply.code(400);
+    return { error: "At least one memory setting field is required" };
+  }
+  if (hasShortTerm && typeof body.shortTermEnabled !== "boolean") {
+    reply.code(400);
+    return { error: "shortTermEnabled must be boolean" };
+  }
+  if (hasWorking && typeof body.workingEnabled !== "boolean") {
+    reply.code(400);
+    return { error: "workingEnabled must be boolean" };
+  }
+  if (hasLongTerm && typeof body.longTermEnabled !== "boolean") {
+    reply.code(400);
+    return { error: "longTermEnabled must be boolean" };
+  }
+
+  const current = getOrCreateMemorySettings();
+  const next = persistMemorySettings(
+    {
+      shortTermEnabled: hasShortTerm ? (body.shortTermEnabled as boolean) : current.shortTermEnabled === 1,
+      workingEnabled: hasWorking ? (body.workingEnabled as boolean) : current.workingEnabled === 1,
+      longTermEnabled: hasLongTerm ? (body.longTermEnabled as boolean) : current.longTermEnabled === 1,
+    },
+    Date.now()
+  );
+  return {
+    shortTermEnabled: next.shortTermEnabled === 1,
+    workingEnabled: next.workingEnabled === 1,
+    longTermEnabled: next.longTermEnabled === 1,
+    updatedAt: next.updatedAt,
+  };
+});
+
 app.get("/api/chats", async () => {
   const chats = listChatsStmt.all();
   return { chats };
@@ -1532,6 +2078,11 @@ app.patch<{ Params: { id: string }; Body: WorkingMemoryPatchBody }>(
     if (!chat) {
       reply.code(404);
       return { error: "chat not found" };
+    }
+    const memorySettings = getOrCreateMemorySettings();
+    if (memorySettings.workingEnabled !== 1) {
+      reply.code(409);
+      return { error: "working memory is disabled" };
     }
 
     const existing = getOrCreateWorkingMemory(chatId);
@@ -1943,56 +2494,80 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
   let shortTerm = getOrCreateShortMemory(chatId);
   let working = getOrCreateWorkingMemory(chatId);
   let longTerm = getOrCreateLongTermMemory();
+  const memorySettings = getOrCreateMemorySettings();
+  const shortTermEnabled = memorySettings.shortTermEnabled === 1;
+  const workingEnabled = memorySettings.workingEnabled === 1;
+  const longTermEnabled = memorySettings.longTermEnabled === 1;
 
   const fromIndex = Math.min(
     Math.max(shortTerm.lastProcessedMessageCount, 0),
     persistedMessagesRaw.length
   );
   const newMessagesForUpdater = persistedMessagesRaw.slice(fromIndex);
+  const shouldRunMemoryUpdater = shortTermEnabled || workingEnabled || longTermEnabled;
 
   let memoryUpdaterDiagnostics: { status: "ok" | "error"; message?: string } = { status: "ok" };
 
-  try {
-    const updaterOutput = await updateMemoryViaModel({
-      memoryModel,
-      previousSummary: shortTerm.rollingSummary,
-      working: {
-        goal: working.goal,
-        constraints: working.constraints,
-        status: working.status,
-        nextSteps: working.nextSteps,
-      },
-      longTerm: {
-        profile: longTerm.profile,
-        preferences: longTerm.preferences,
-        decisions: longTerm.decisions,
-        knowledge: longTerm.knowledge,
-      },
-      newMessages: newMessagesForUpdater,
-      latestUserPrompt: userPrompt,
-      signal: abortController.signal,
-    });
+  if (shouldRunMemoryUpdater) {
+    try {
+      const updaterOutput = await updateMemoryViaModel({
+        memoryModel,
+        previousSummary: shortTermEnabled ? shortTerm.rollingSummary : "",
+        working: {
+          goal: workingEnabled ? working.goal : "",
+          constraints: workingEnabled ? working.constraints : "",
+          status: workingEnabled ? working.status : "",
+          nextSteps: workingEnabled ? working.nextSteps : "",
+        },
+        longTerm: {
+          profile: longTermEnabled ? longTerm.profile : "",
+          preferences: longTermEnabled ? longTerm.preferences : "",
+          decisions: longTermEnabled ? longTerm.decisions : "",
+          knowledge: longTermEnabled ? longTerm.knowledge : "",
+        },
+        newMessages: newMessagesForUpdater,
+        latestUserPrompt: userPrompt,
+        shortTermEnabled,
+        workingEnabled,
+        longTermEnabled,
+        signal: abortController.signal,
+      });
 
-    const memoryUpdatedAt = Date.now();
+      const memoryUpdatedAt = Date.now();
+      if (shortTermEnabled) {
+        shortTerm = persistShortMemory({
+          ...shortTerm,
+          rollingSummary: updaterOutput.shortTerm.rollingSummary,
+          lastProcessedMessageCount: persistedMessagesRaw.length,
+          updatedAt: memoryUpdatedAt,
+        });
+      }
+
+      if (workingEnabled) {
+        working = persistWorkingMemory(
+          applyAutoWorkingUpdate(working, updaterOutput.working, memoryUpdatedAt)
+        );
+      }
+
+      if (longTermEnabled) {
+        insertPendingCandidates(chatId, updaterOutput.longTermCandidates, memoryUpdatedAt);
+      }
+    } catch (error) {
+      const formatted = formatUpstreamError(error);
+      memoryUpdaterDiagnostics = {
+        status: "error",
+        message: formatted.message,
+      };
+      app.log.warn({ err: error, chatId, memoryModel }, "failed to update memory layers, using previous snapshot");
+    }
+  }
+
+  if (!shortTermEnabled && shortTerm.lastProcessedMessageCount !== persistedMessagesRaw.length) {
     shortTerm = persistShortMemory({
       ...shortTerm,
-      rollingSummary: updaterOutput.shortTerm.rollingSummary,
       lastProcessedMessageCount: persistedMessagesRaw.length,
-      updatedAt: memoryUpdatedAt,
+      updatedAt: Date.now(),
     });
-
-    working = persistWorkingMemory(
-      applyAutoWorkingUpdate(working, updaterOutput.working, memoryUpdatedAt)
-    );
-
-    insertPendingCandidates(chatId, updaterOutput.longTermCandidates, memoryUpdatedAt);
-  } catch (error) {
-    const formatted = formatUpstreamError(error);
-    memoryUpdaterDiagnostics = {
-      status: "error",
-      message: formatted.message,
-    };
-    app.log.warn({ err: error, chatId, memoryModel }, "failed to update memory layers, using previous snapshot");
   }
 
   const pendingCandidates = listPendingCandidatesByChatStmt.all(chatId) as LongTermCandidateRow[];
@@ -2011,7 +2586,16 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
       decisions: longTerm.decisions,
       knowledge: longTerm.knowledge,
     },
+    shortTermEnabled,
+    workingEnabled,
+    longTermEnabled,
   });
+  const profileSettings = getOrCreateProfileSettings();
+  const activeProfile = profileSettings.activeProfileId
+    ? ((getProfileByIdStmt.get(profileSettings.activeProfileId) as UserProfileRow | undefined) ?? null)
+    : null;
+  const activeProfileId = activeProfile?.id ?? null;
+  const profileBlock = buildProfileBlock(activeProfile);
 
   reply.raw.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -2027,13 +2611,18 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
   sendSse("debug_memory", {
     snapshot: memorySnapshot,
     memoryBlock,
+    profileBlock,
+    activeProfileId,
+    shortTermEnabled,
+    workingEnabled,
+    longTermEnabled,
     updater: memoryUpdaterDiagnostics,
   });
 
   try {
     const openaiRequestBody = buildOpenAiRequestBody({
       model,
-      systemPrompt: mergeSystemPromptWithMemory(systemPrompt, memoryBlock),
+      systemPrompt: mergeSystemPromptWithContext(systemPrompt, profileBlock, memoryBlock),
       inputMessages: persistedMessagesRaw,
       reasoningEffort,
     });

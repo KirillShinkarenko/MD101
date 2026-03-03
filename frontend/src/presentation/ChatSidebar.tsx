@@ -6,16 +6,14 @@ type Props = {
   chats: ChatSummary[];
   activeChatId: string | null;
   isModelSettingsOpen: boolean;
-  isSystemPromptOpen: boolean;
+  isProfilesOpen: boolean;
   activeModelLabel: string;
-  isStreaming: boolean;
-  isBranchAvailable: boolean;
+  activeProfileLabel: string;
   onCreateChat: () => void;
   onSelectChat: (chatId: string) => void;
   onDeleteChat: (chatId: string) => void;
-  onOpenSystemPrompt: () => void;
+  onOpenProfiles: () => void;
   onOpenModelSettings: () => void;
-  onBranchInNewChat: () => void;
 };
 
 export function ChatSidebar(props: Props) {
@@ -23,16 +21,14 @@ export function ChatSidebar(props: Props) {
     chats,
     activeChatId,
     isModelSettingsOpen,
-    isSystemPromptOpen,
+    isProfilesOpen,
     activeModelLabel,
-    isStreaming,
-    isBranchAvailable,
+    activeProfileLabel,
     onCreateChat,
     onSelectChat,
     onDeleteChat,
-    onOpenSystemPrompt,
+    onOpenProfiles,
     onOpenModelSettings,
-    onBranchInNewChat,
   } = props;
 
   return (
@@ -74,29 +70,28 @@ export function ChatSidebar(props: Props) {
       <div className="left-footer">
         <div className="left-footer-buttons">
           <UiButton
-            className="footer-control-button"
+            className="footer-setting-button"
             fullWidth
-            onClick={onOpenSystemPrompt}
-            aria-expanded={isSystemPromptOpen}
+            onClick={onOpenProfiles}
+            aria-expanded={isProfilesOpen}
+            title={`Профиль: ${activeProfileLabel}`}
           >
-            <span>System prompt</span>
+            <span className="footer-setting-text">Профиль: {activeProfileLabel}</span>
+            <span className="footer-setting-icon" aria-hidden="true">
+              ⚙
+            </span>
           </UiButton>
           <UiButton
-            className="footer-control-button"
+            className="footer-setting-button"
             fullWidth
             onClick={onOpenModelSettings}
             aria-expanded={isModelSettingsOpen}
+            title={`Модель: ${activeModelLabel}`}
           >
-            <span>⚙</span>
-            <span>{activeModelLabel}</span>
-          </UiButton>
-          <UiButton
-            className="footer-control-button"
-            fullWidth
-            onClick={onBranchInNewChat}
-            disabled={!isBranchAvailable || isStreaming}
-          >
-            <span>Branch in new chat</span>
+            <span className="footer-setting-text">Модель: {activeModelLabel}</span>
+            <span className="footer-setting-icon" aria-hidden="true">
+              ⚙
+            </span>
           </UiButton>
         </div>
       </div>

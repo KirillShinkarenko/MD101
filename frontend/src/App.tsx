@@ -7,6 +7,7 @@ import { ModelSettingsModal } from "./presentation/ModelSettingsModal";
 import { SystemPromptModal } from "./presentation/SystemPromptModal";
 import { FullScreenJsonModal } from "./presentation/FullScreenJsonModal";
 import { ConversationInfoModal } from "./presentation/ConversationInfoModal";
+import { ProfileManagerModal } from "./presentation/ProfileManagerModal";
 
 function App() {
   const { view, actions } = useChatController();
@@ -17,16 +18,14 @@ function App() {
         chats={view.chats}
         activeChatId={view.activeChatId}
         isModelSettingsOpen={view.isModelSettingsOpen}
-        isSystemPromptOpen={view.isSystemPromptOpen}
+        isProfilesOpen={view.isProfilesOpen}
         activeModelLabel={view.activeModelLabel}
-        isStreaming={view.isStreaming}
-        isBranchAvailable={Boolean(view.activeChatId)}
+        activeProfileLabel={view.activeProfileLabel}
         onCreateChat={() => void actions.createChat()}
         onSelectChat={actions.selectChat}
         onDeleteChat={(chatId) => void actions.deleteChat(chatId)}
-        onOpenSystemPrompt={() => actions.setIsSystemPromptOpen(true)}
+        onOpenProfiles={actions.openProfiles}
         onOpenModelSettings={() => actions.setIsModelSettingsOpen(true)}
-        onBranchInNewChat={() => void actions.branchInNewChat()}
       />
 
       <ChatMainPanel
@@ -53,6 +52,9 @@ function App() {
         requestRaw={view.requestRaw}
         responseRaw={view.responseRaw}
         memory={view.memory}
+        shortTermEnabled={view.shortTermEnabled}
+        workingEnabled={view.workingEnabled}
+        longTermEnabled={view.longTermEnabled}
         effectiveMemoryBlock={view.effectiveMemoryBlock}
         errorText={view.errorText}
         isStreaming={view.isStreaming}
@@ -69,13 +71,20 @@ function App() {
         model={view.model}
         memoryModel={view.memoryModel}
         reasoningEffort={view.reasoningEffort}
+        shortTermEnabled={view.shortTermEnabled}
+        workingEnabled={view.workingEnabled}
+        longTermEnabled={view.longTermEnabled}
         isStreaming={view.isStreaming}
+        isMemorySettingsSaving={view.isMemorySettingsSaving}
         isReasoningSupported={view.isReasoningSupported}
         reasoningOptions={view.reasoningOptions}
         modelOptions={[...MODEL_OPTIONS]}
         onClose={() => actions.setIsModelSettingsOpen(false)}
         onModelChange={(value) => void actions.handleModelChange(value)}
         onMemoryModelChange={actions.handleMemoryModelChange}
+        onShortTermEnabledChange={(value) => void actions.setShortTermEnabled(value)}
+        onWorkingEnabledChange={(value) => void actions.setWorkingEnabled(value)}
+        onLongTermEnabledChange={(value) => void actions.setLongTermEnabled(value)}
         onReasoningEffortChange={actions.setReasoningEffort}
       />
 
@@ -84,6 +93,22 @@ function App() {
         systemPrompt={view.systemPrompt}
         onClose={() => actions.setIsSystemPromptOpen(false)}
         onChange={actions.setSystemPrompt}
+      />
+
+      <ProfileManagerModal
+        isOpen={view.isProfilesOpen}
+        profiles={view.profiles}
+        activeProfileId={view.activeProfileId}
+        selectedProfileId={view.selectedProfileId}
+        draft={view.profileDraft}
+        isSaving={view.isProfilesSaving}
+        onClose={actions.closeProfiles}
+        onCreate={() => void actions.createProfile()}
+        onDelete={(profileId) => void actions.deleteProfile(profileId)}
+        onSelect={actions.selectProfile}
+        onSetActive={(profileId) => void actions.setActiveProfile(profileId)}
+        onChangeDraft={actions.setProfileDraft}
+        onSave={() => void actions.saveProfile()}
       />
 
       <FullScreenJsonModal
