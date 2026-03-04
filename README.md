@@ -140,9 +140,17 @@ npm run dev
   - опциональные поля: `title`, `model`, `systemPrompt`
 - `GET /api/chats/:id/messages` - история сообщений
 - `GET /api/chats/:id/memory` - получить snapshot памяти (`shortTerm`, `working`, `longTerm`, `pendingCandidates`)
+- `GET /api/chats/:id/task-state` - получить состояние task FSM (`planning|execution|validation|done`, шаг, ожидаемое действие, plan/done/artifacts, paused)
 - `PATCH /api/chats/:id` - обновить чат (`title`, `model`, `systemPrompt`)
 - `PATCH /api/chats/:id/memory/working` - вручную обновить `goal`, `constraints`, `status`, `nextSteps`
   - при `workingEnabled=false` возвращает `409` (`working memory is disabled`)
+- `POST /api/chats/:id/task-state/command` - отправить команду FSM
+  - `command`: `pause|resume|approve_plan|complete_step|approve_validation|request_replan|request_rework`
+  - опционально: `artifactText`, `plan: string[]`, `reason`
+  - для `approve_*`:
+    - если `artifactText` не передан, backend использует сохранённый agent draft из `task-state`
+    - если draft stale для текущего `state/step`, возвращается `409`
+    - для `approve_plan`: если `plan[]` не передан, backend сначала пытается взять `plan` из JSON-блока последнего draft-ответа агента, затем fallback `parsePlanFromArtifact(artifactText)`; если план не извлечён - `422`
 - `PATCH /api/memory/long-term` - вручную обновить `profile`, `preferences`, `decisions`, `knowledge`
 - `POST /api/memory/candidates/:id/approve` - принять кандидата в long-term
 - `POST /api/memory/candidates/:id/reject` - отклонить кандидата
@@ -151,6 +159,8 @@ npm run dev
 - `POST /api/chats/:id/stream` - отправить сообщение и получить streaming-ответ
   - обязательное поле: `userPrompt`
   - опциональные поля: `model`, `systemPrompt`, `reasoningEffort`, `memoryModel`
+  - при `task paused` возвращает `409` и текущий `task` без запроса в OpenAI
+  - после `response.completed` backend парсит stage-артефакт из ответа агента и обновляет `task.draftArtifact*`
 
 SSE-события stream endpoint:
 
@@ -162,6 +172,21 @@ SSE-события stream endpoint:
 - `error`
 
 `debug_response_final` содержит usage (`input/output/total tokens`) и оценку стоимости (`input/output/total cost usd`) для поддерживаемых моделей.
+`debug_memory` также содержит `task` (текущее состояние FSM), `taskBlock`, `stagePrompt`, `taskDraftStatus` (`valid|invalid|missing`) и `taskDraftError`.
+
+### Строгий stage-артефакт в ответе агента
+
+На стадиях `planning|execution|validation` агент должен завершать ответ блоком:
+
+```text
+[TASK_ARTIFACT_JSON]
+{"state":"planning|execution|validation","step":N,"artifact":"...","plan":["..."]?}
+[/TASK_ARTIFACT_JSON]
+```
+
+- `planning`: `plan` обязателен.
+- `execution/validation`: `plan` опционален.
+- если блок отсутствует/невалиден, `taskDraftStatus=missing|invalid`, а approve-кнопки в UI блокируются до нового валидного ответа (или ручной команды с `artifactText` через API).
 
 ## Управление вводом
 

@@ -51,6 +51,10 @@ function App() {
       <InspectorPanel
         requestRaw={view.requestRaw}
         responseRaw={view.responseRaw}
+        taskContext={view.taskContext}
+        taskDraftStatus={view.taskDraftStatus}
+        taskDraftError={view.taskDraftError}
+        isTaskCommandPending={view.isTaskCommandPending}
         memory={view.memory}
         shortTermEnabled={view.shortTermEnabled}
         workingEnabled={view.workingEnabled}
@@ -60,6 +64,15 @@ function App() {
         isStreaming={view.isStreaming}
         onOpenFullScreenRequest={() => actions.setFullScreenView("request")}
         onOpenFullScreenResponse={() => actions.setFullScreenView("response")}
+        onPauseTask={() => void actions.pauseTask()}
+        onResumeTask={() => void actions.resumeTask()}
+        onApprovePlan={(artifactText, isEdited) => void actions.approvePlan(artifactText, isEdited)}
+        onCompleteStep={(artifactText, isEdited) => void actions.completeStep(artifactText, isEdited)}
+        onApproveValidation={(artifactText, isEdited) =>
+          void actions.approveValidation(artifactText, isEdited)
+        }
+        onRequestReplan={() => void actions.requestReplan()}
+        onRequestRework={() => void actions.requestRework()}
         onSaveWorking={actions.saveWorkingMemory}
         onSaveLongTerm={actions.saveLongTermMemory}
         onApproveCandidate={actions.approveCandidate}

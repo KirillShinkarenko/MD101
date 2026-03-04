@@ -55,6 +55,62 @@ export type MemorySettings = {
   updatedAt: number;
 };
 
+export type TaskState = "planning" | "execution" | "validation" | "done";
+
+export type TaskExpectedAction =
+  | "approve_plan"
+  | "complete_step"
+  | "approve_validation"
+  | "resume"
+  | "none";
+
+export type TaskArtifactDraftStatus = "valid" | "invalid" | "missing";
+
+export type TaskCommand =
+  | "pause"
+  | "resume"
+  | "approve_plan"
+  | "complete_step"
+  | "approve_validation"
+  | "request_replan"
+  | "request_rework";
+
+export type TaskArtifact = {
+  kind: "plan" | "execution" | "validation";
+  state: TaskState;
+  step: number;
+  text: string;
+  createdAt: number;
+};
+
+export type TaskContext = {
+  task: string;
+  state: TaskState;
+  step: number;
+  total: number;
+  expectedAction: TaskExpectedAction;
+  current: string;
+  plan: string[];
+  done: string[];
+  artifacts: TaskArtifact[];
+  paused: boolean;
+  pausedAt: number | null;
+  pausedReason: string;
+  draftArtifactText: string;
+  draftArtifactState: TaskState | "";
+  draftArtifactStep: number;
+  draftArtifactUpdatedAt: number | null;
+  draftArtifactSourceMessageId: string;
+  updatedAt: number;
+};
+
+export type TaskCommandRequest = {
+  command: TaskCommand;
+  artifactText?: string;
+  plan?: string[];
+  reason?: string;
+};
+
 export type ChatMemorySnapshot = {
   shortTerm: ShortTermMemory;
   working: WorkingMemory;
@@ -158,6 +214,27 @@ export const EMPTY_MEMORY_SNAPSHOT: ChatMemorySnapshot = {
     updatedAt: Date.now(),
   },
   pendingCandidates: [],
+};
+
+export const EMPTY_TASK_CONTEXT: TaskContext = {
+  task: "Task",
+  state: "planning",
+  step: 0,
+  total: 0,
+  expectedAction: "approve_plan",
+  current: "Собираем требования и утверждаем план",
+  plan: [],
+  done: [],
+  artifacts: [],
+  paused: false,
+  pausedAt: null,
+  pausedReason: "",
+  draftArtifactText: "",
+  draftArtifactState: "",
+  draftArtifactStep: 0,
+  draftArtifactUpdatedAt: null,
+  draftArtifactSourceMessageId: "",
+  updatedAt: Date.now(),
 };
 
 export const MODEL_REASONING_OPTIONS: Record<string, ReasoningEffort[]> = {

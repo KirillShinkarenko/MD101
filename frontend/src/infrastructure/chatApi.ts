@@ -1,10 +1,13 @@
 import {
   EMPTY_MEMORY_SNAPSHOT,
+  EMPTY_TASK_CONTEXT,
   type ChatMemorySnapshot,
   type ChatMessage,
   type ChatSummary,
   type LongTermMemory,
   type MemorySettings,
+  type TaskCommandRequest,
+  type TaskContext,
   type UserProfile,
   type WorkingMemory,
 } from "../domain/chat";
@@ -21,11 +24,12 @@ const readJson = async <T>(response: Response): Promise<T | null> => {
   }
 };
 
-const extractError = (payload: unknown, fallback: string): Error => {
+const extractError = (payload: unknown, fallback: string, status?: number): Error => {
   const candidate = payload as { error?: unknown } | null;
   if (candidate && typeof candidate.error === "string") {
     const err = new Error(candidate.error);
-    (err as Error & { payload?: unknown }).payload = payload;
+    (err as Error & { payload?: unknown; status?: number }).payload = payload;
+    (err as Error & { payload?: unknown; status?: number }).status = status;
     return err;
   }
   if (
@@ -35,11 +39,13 @@ const extractError = (payload: unknown, fallback: string): Error => {
     typeof (candidate.error as { message?: unknown }).message === "string"
   ) {
     const err = new Error((candidate.error as { message: string }).message);
-    (err as Error & { payload?: unknown }).payload = payload;
+    (err as Error & { payload?: unknown; status?: number }).payload = payload;
+    (err as Error & { payload?: unknown; status?: number }).status = status;
     return err;
   }
   const err = new Error(fallback);
-  (err as Error & { payload?: unknown }).payload = payload;
+  (err as Error & { payload?: unknown; status?: number }).payload = payload;
+  (err as Error & { payload?: unknown; status?: number }).status = status;
   return err;
 };
 
@@ -127,6 +133,21 @@ export const chatApi = {
     };
   },
 
+  async getTaskState(chatId: string): Promise<{ task: TaskContext; isNotFound: boolean }> {
+    const response = await fetch(`${API_BASE}/api/chats/${chatId}/task-state`);
+    const payload = await readJson<{ task?: TaskContext; error?: string }>(response);
+    if (!response.ok) {
+      if (response.status === 404) {
+        return { task: { ...EMPTY_TASK_CONTEXT }, isNotFound: true };
+      }
+      throw extractError(payload, "Failed to load task state", response.status);
+    }
+    return {
+      task: payload?.task ?? { ...EMPTY_TASK_CONTEXT },
+      isNotFound: false,
+    };
+  },
+
   async updateChat(
     chatId: string,
     body: Partial<{
@@ -161,6 +182,19 @@ export const chatApi = {
       throw extractError(payload, "Failed to update working memory");
     }
     return payload.working;
+  },
+
+  async sendTaskCommand(chatId: string, body: TaskCommandRequest): Promise<TaskContext> {
+    const response = await fetch(`${API_BASE}/api/chats/${chatId}/task-state/command`, {
+      method: "POST",
+      headers: jsonHeaders,
+      body: JSON.stringify(body),
+    });
+    const payload = await readJson<{ task?: TaskContext; error?: string }>(response);
+    if (!response.ok || !payload?.task) {
+      throw extractError(payload, "Failed to send task command", response.status);
+    }
+    return payload.task;
   },
 
   async patchLongTermMemory(
@@ -337,8 +371,8 @@ export const chatApi = {
     });
 
     if (!response.ok || !response.body) {
-      const payload = await readJson<{ error?: string }>(response);
-      throw extractError(payload, `HTTP ${response.status}`);
+      const payload = await readJson<{ error?: string; task?: TaskContext }>(response);
+      throw extractError(payload, `HTTP ${response.status}`, response.status);
     }
 
     return response;

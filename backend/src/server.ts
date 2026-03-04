@@ -4,6 +4,18 @@ import dotenv from "dotenv";
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import {
+  applyTaskCommand,
+  clearTaskDraftArtifact,
+  createDefaultTaskContext,
+  isTaskCommand,
+  normalizeTaskContext,
+  setTaskDraftArtifact,
+  type TaskCommand,
+  type TaskContext,
+} from "./taskFsm.js";
+import { buildTaskStagePrompt, buildTaskStateBlock } from "./taskFsmPrompt.js";
+import { extractTaskArtifactEnvelope, type TaskArtifactDraftStatus } from "./taskArtifactParser.js";
 
 dotenv.config({ path: "../.env" });
 dotenv.config();
@@ -24,6 +36,13 @@ type ChatBody = {
   reasoningEffort?: string;
   systemPrompt?: string;
   memoryModel?: string;
+};
+
+type TaskCommandBody = {
+  command?: TaskCommand;
+  artifactText?: string;
+  plan?: string[];
+  reason?: string;
 };
 
 type CreateChatBody = {
@@ -108,6 +127,28 @@ type WorkingMemoryRow = {
   manualLockStatus: number;
   manualLockNextSteps: number;
   updatedBy: "auto" | "manual";
+  updatedAt: number;
+};
+
+type TaskStateRow = {
+  chatId: string;
+  task: string;
+  state: string;
+  step: number;
+  total: number;
+  expectedAction: string;
+  current: string;
+  planJson: string;
+  doneJson: string;
+  artifactsJson: string;
+  paused: number;
+  pausedAt: number | null;
+  pausedReason: string;
+  draftArtifactText: string;
+  draftArtifactState: string;
+  draftArtifactStep: number;
+  draftArtifactUpdatedAt: number | null;
+  draftArtifactSourceMessageId: string;
   updatedAt: number;
 };
 
@@ -339,6 +380,29 @@ CREATE TABLE IF NOT EXISTS chat_working_memory (
   FOREIGN KEY (chat_id) REFERENCES chats (id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS chat_task_state (
+  chat_id TEXT PRIMARY KEY,
+  task TEXT NOT NULL DEFAULT '',
+  state TEXT NOT NULL DEFAULT 'planning',
+  step INTEGER NOT NULL DEFAULT 0,
+  total INTEGER NOT NULL DEFAULT 0,
+  expected_action TEXT NOT NULL DEFAULT 'approve_plan',
+  current TEXT NOT NULL DEFAULT '',
+  plan_json TEXT NOT NULL DEFAULT '[]',
+  done_json TEXT NOT NULL DEFAULT '[]',
+  artifacts_json TEXT NOT NULL DEFAULT '[]',
+  paused INTEGER NOT NULL DEFAULT 0,
+  paused_at INTEGER,
+  paused_reason TEXT NOT NULL DEFAULT '',
+  draft_artifact_text TEXT NOT NULL DEFAULT '',
+  draft_artifact_state TEXT NOT NULL DEFAULT '',
+  draft_artifact_step INTEGER NOT NULL DEFAULT 0,
+  draft_artifact_updated_at INTEGER,
+  draft_artifact_source_message_id TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY (chat_id) REFERENCES chats (id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS global_long_term_memory (
   scope_id TEXT PRIMARY KEY,
   profile TEXT NOT NULL DEFAULT '',
@@ -416,6 +480,26 @@ if (!memorySettingsColumnNames.has("short_term_enabled")) {
 }
 if (!memorySettingsColumnNames.has("working_enabled")) {
   db.exec("ALTER TABLE memory_settings ADD COLUMN working_enabled INTEGER NOT NULL DEFAULT 1");
+}
+
+const taskStateColumns = db.prepare("PRAGMA table_info(chat_task_state)").all() as Array<{ name: string }>;
+const taskStateColumnNames = new Set(taskStateColumns.map((column) => column.name));
+if (!taskStateColumnNames.has("draft_artifact_text")) {
+  db.exec("ALTER TABLE chat_task_state ADD COLUMN draft_artifact_text TEXT NOT NULL DEFAULT ''");
+}
+if (!taskStateColumnNames.has("draft_artifact_state")) {
+  db.exec("ALTER TABLE chat_task_state ADD COLUMN draft_artifact_state TEXT NOT NULL DEFAULT ''");
+}
+if (!taskStateColumnNames.has("draft_artifact_step")) {
+  db.exec("ALTER TABLE chat_task_state ADD COLUMN draft_artifact_step INTEGER NOT NULL DEFAULT 0");
+}
+if (!taskStateColumnNames.has("draft_artifact_updated_at")) {
+  db.exec("ALTER TABLE chat_task_state ADD COLUMN draft_artifact_updated_at INTEGER");
+}
+if (!taskStateColumnNames.has("draft_artifact_source_message_id")) {
+  db.exec(
+    "ALTER TABLE chat_task_state ADD COLUMN draft_artifact_source_message_id TEXT NOT NULL DEFAULT ''"
+  );
 }
 
 const ensureGlobalLongTermMemoryStmt = db.prepare(`
@@ -1034,12 +1118,21 @@ const buildProfileBlock = (profile: UserProfileRow | null): string => {
   ].join("\n");
 };
 
-const mergeSystemPromptWithContext = (
-  systemPrompt: string,
-  profileBlock: string,
-  memoryBlock: string
-): string => {
-  const chunks = [systemPrompt.trim(), profileBlock.trim(), memoryBlock.trim()].filter(Boolean);
+const mergeSystemPromptWithContext = (params: {
+  stagePrompt: string;
+  systemPrompt: string;
+  profileBlock: string;
+  taskBlock: string;
+  memoryBlock: string;
+}): string => {
+  const { stagePrompt, systemPrompt, profileBlock, taskBlock, memoryBlock } = params;
+  const chunks = [
+    stagePrompt.trim(),
+    systemPrompt.trim(),
+    profileBlock.trim(),
+    taskBlock.trim(),
+    memoryBlock.trim(),
+  ].filter(Boolean);
   return chunks.join("\n\n");
 };
 
@@ -1134,6 +1227,16 @@ const listMessagesForBranchStmt = db.prepare(`
   ORDER BY created_at ASC
 `);
 
+const getMessageByIdForChatStmt = db.prepare(`
+  SELECT
+    id,
+    chat_id AS chatId,
+    content
+  FROM messages
+  WHERE id = ? AND chat_id = ?
+  LIMIT 1
+`);
+
 const insertChatStmt = db.prepare(`
   INSERT INTO chats (
     id, title, model, system_prompt, memory_strategy, sliding_window_size, sticky_window_size,
@@ -1223,6 +1326,75 @@ const upsertWorkingMemoryStmt = db.prepare(`
     manual_lock_status = excluded.manual_lock_status,
     manual_lock_next_steps = excluded.manual_lock_next_steps,
     updated_by = excluded.updated_by,
+    updated_at = excluded.updated_at
+`);
+
+const getTaskStateStmt = db.prepare(`
+  SELECT
+    chat_id AS chatId,
+    task,
+    state,
+    step,
+    total,
+    expected_action AS expectedAction,
+    current,
+    plan_json AS planJson,
+    done_json AS doneJson,
+    artifacts_json AS artifactsJson,
+    paused,
+    paused_at AS pausedAt,
+    paused_reason AS pausedReason,
+    draft_artifact_text AS draftArtifactText,
+    draft_artifact_state AS draftArtifactState,
+    draft_artifact_step AS draftArtifactStep,
+    draft_artifact_updated_at AS draftArtifactUpdatedAt,
+    draft_artifact_source_message_id AS draftArtifactSourceMessageId,
+    updated_at AS updatedAt
+  FROM chat_task_state
+  WHERE chat_id = ?
+`);
+
+const upsertTaskStateStmt = db.prepare(`
+  INSERT INTO chat_task_state (
+    chat_id,
+    task,
+    state,
+    step,
+    total,
+    expected_action,
+    current,
+    plan_json,
+    done_json,
+    artifacts_json,
+    paused,
+    paused_at,
+    paused_reason,
+    draft_artifact_text,
+    draft_artifact_state,
+    draft_artifact_step,
+    draft_artifact_updated_at,
+    draft_artifact_source_message_id,
+    updated_at
+  )
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  ON CONFLICT(chat_id) DO UPDATE SET
+    task = excluded.task,
+    state = excluded.state,
+    step = excluded.step,
+    total = excluded.total,
+    expected_action = excluded.expected_action,
+    current = excluded.current,
+    plan_json = excluded.plan_json,
+    done_json = excluded.done_json,
+    artifacts_json = excluded.artifacts_json,
+    paused = excluded.paused,
+    paused_at = excluded.paused_at,
+    paused_reason = excluded.paused_reason,
+    draft_artifact_text = excluded.draft_artifact_text,
+    draft_artifact_state = excluded.draft_artifact_state,
+    draft_artifact_step = excluded.draft_artifact_step,
+    draft_artifact_updated_at = excluded.draft_artifact_updated_at,
+    draft_artifact_source_message_id = excluded.draft_artifact_source_message_id,
     updated_at = excluded.updated_at
 `);
 
@@ -1449,6 +1621,41 @@ const createDefaultWorkingMemory = (chatId: string, now = Date.now()): WorkingMe
   updatedAt: now,
 });
 
+const parseJsonArray = (value: string): unknown[] => {
+  const parsed = parseJsonSafe(value);
+  return Array.isArray(parsed) ? parsed : [];
+};
+
+const createDefaultTaskState = (taskName: string, now = Date.now()): TaskContext =>
+  createDefaultTaskContext(taskName, now);
+
+const toTaskContext = (row: TaskStateRow): TaskContext => {
+  const planRaw = parseJsonArray(row.planJson);
+  const doneRaw = parseJsonArray(row.doneJson);
+  const artifactsRaw = parseJsonArray(row.artifactsJson);
+
+  return normalizeTaskContext({
+    task: row.task,
+    state: row.state as TaskContext["state"],
+    step: row.step,
+    total: row.total,
+    expectedAction: row.expectedAction as TaskContext["expectedAction"],
+    current: row.current,
+    plan: planRaw.filter((item): item is string => typeof item === "string"),
+    done: doneRaw.filter((item): item is string => typeof item === "string"),
+    artifacts: artifactsRaw as TaskContext["artifacts"],
+    paused: row.paused === 1,
+    pausedAt: row.pausedAt,
+    pausedReason: row.pausedReason,
+    draftArtifactText: row.draftArtifactText,
+    draftArtifactState: row.draftArtifactState as TaskContext["draftArtifactState"],
+    draftArtifactStep: row.draftArtifactStep,
+    draftArtifactUpdatedAt: row.draftArtifactUpdatedAt,
+    draftArtifactSourceMessageId: row.draftArtifactSourceMessageId,
+    updatedAt: row.updatedAt,
+  });
+};
+
 const createDefaultLongTermMemory = (now = Date.now()): LongTermMemoryRow => ({
   scopeId: GLOBAL_LONG_TERM_SCOPE_ID,
   profile: "",
@@ -1495,6 +1702,37 @@ const getOrCreateWorkingMemory = (chatId: string): WorkingMemoryRow => {
     created.manualLockStatus,
     created.manualLockNextSteps,
     created.updatedBy,
+    created.updatedAt
+  );
+  return created;
+};
+
+const getOrCreateTaskState = (chatId: string, fallbackTaskName: string): TaskContext => {
+  const existing = getTaskStateStmt.get(chatId) as TaskStateRow | undefined;
+  if (existing) {
+    return toTaskContext(existing);
+  }
+
+  const created = createDefaultTaskState(fallbackTaskName);
+  upsertTaskStateStmt.run(
+    chatId,
+    created.task,
+    created.state,
+    created.step,
+    created.total,
+    created.expectedAction,
+    created.current,
+    JSON.stringify(created.plan),
+    JSON.stringify(created.done),
+    JSON.stringify(created.artifacts),
+    created.paused ? 1 : 0,
+    created.pausedAt,
+    created.pausedReason,
+    created.draftArtifactText,
+    created.draftArtifactState,
+    created.draftArtifactStep,
+    created.draftArtifactUpdatedAt,
+    created.draftArtifactSourceMessageId,
     created.updatedAt
   );
   return created;
@@ -1583,6 +1821,47 @@ const persistWorkingMemory = (memory: WorkingMemoryRow): WorkingMemoryRow => {
     memory.updatedAt
   );
   return memory;
+};
+
+const persistTaskState = (chatId: string, taskState: TaskContext): TaskContext => {
+  const normalized = normalizeTaskContext(taskState);
+  upsertTaskStateStmt.run(
+    chatId,
+    normalized.task,
+    normalized.state,
+    normalized.step,
+    normalized.total,
+    normalized.expectedAction,
+    normalized.current,
+    JSON.stringify(normalized.plan),
+    JSON.stringify(normalized.done),
+    JSON.stringify(normalized.artifacts),
+    normalized.paused ? 1 : 0,
+    normalized.pausedAt,
+    normalized.pausedReason,
+    normalized.draftArtifactText,
+    normalized.draftArtifactState,
+    normalized.draftArtifactStep,
+    normalized.draftArtifactUpdatedAt,
+    normalized.draftArtifactSourceMessageId,
+    normalized.updatedAt
+  );
+  return normalized;
+};
+
+const deriveDraftDiagnosticsFromTask = (
+  task: TaskContext
+): { taskDraftStatus: TaskArtifactDraftStatus; taskDraftError?: string } => {
+  if (!task.draftArtifactText) {
+    return { taskDraftStatus: "missing" };
+  }
+  if (task.draftArtifactState !== task.state || task.draftArtifactStep !== task.step) {
+    return {
+      taskDraftStatus: "invalid",
+      taskDraftError: "Stored draft artifact does not match current state/step",
+    };
+  }
+  return { taskDraftStatus: "valid" };
 };
 
 const persistLongTermMemory = (memory: LongTermMemoryRow): LongTermMemoryRow => {
@@ -2019,6 +2298,94 @@ app.get<{ Params: { id: string } }>("/api/chats/:id/memory", async (request, rep
   return snapshot;
 });
 
+app.get<{ Params: { id: string } }>("/api/chats/:id/task-state", async (request, reply) => {
+  const chatId = request.params.id;
+  const chat = getChatStmt.get(chatId) as { title: string } | undefined;
+  if (!chat) {
+    reply.code(404);
+    return { error: "chat not found" };
+  }
+
+  const task = getOrCreateTaskState(chatId, chat.title);
+  return { task };
+});
+
+app.post<{ Params: { id: string }; Body: TaskCommandBody }>(
+  "/api/chats/:id/task-state/command",
+  async (request, reply) => {
+    const chatId = request.params.id;
+    const chat = getChatStmt.get(chatId) as { title: string } | undefined;
+    if (!chat) {
+      reply.code(404);
+      return { error: "chat not found" };
+    }
+
+    const body = request.body ?? {};
+    if (!isTaskCommand(body.command)) {
+      reply.code(400);
+      return { error: "command is required and must be a valid task command" };
+    }
+    if (body.artifactText !== undefined && typeof body.artifactText !== "string") {
+      reply.code(400);
+      return { error: "artifactText must be a string" };
+    }
+    if (
+      body.plan !== undefined &&
+      (!Array.isArray(body.plan) || body.plan.some((item) => typeof item !== "string"))
+    ) {
+      reply.code(400);
+      return { error: "plan must be an array of strings" };
+    }
+    if (body.reason !== undefined && typeof body.reason !== "string") {
+      reply.code(400);
+      return { error: "reason must be a string" };
+    }
+
+    const currentTask = getOrCreateTaskState(chatId, chat.title);
+    let resolvedPlan = body.plan;
+    let resolvedArtifactText = body.artifactText;
+    if (
+      body.command === "approve_plan" &&
+      (resolvedPlan === undefined || resolvedPlan.length === 0) &&
+      (!body.artifactText || !body.artifactText.trim()) &&
+      currentTask.draftArtifactSourceMessageId &&
+      currentTask.draftArtifactState === currentTask.state &&
+      currentTask.draftArtifactStep === currentTask.step
+    ) {
+      const sourceMessage = getMessageByIdForChatStmt.get(
+        currentTask.draftArtifactSourceMessageId,
+        chatId
+      ) as { content?: string } | undefined;
+      if (typeof sourceMessage?.content === "string") {
+        const parsedDraft = extractTaskArtifactEnvelope(sourceMessage.content, currentTask);
+        if (parsedDraft.status === "valid" && parsedDraft.plan.length > 0) {
+          resolvedPlan = parsedDraft.plan;
+          resolvedArtifactText = currentTask.draftArtifactText || parsedDraft.artifactText;
+        }
+      }
+    }
+
+    const result = applyTaskCommand(
+      currentTask,
+      {
+        command: body.command,
+        artifactText: resolvedArtifactText,
+        plan: resolvedPlan,
+        reason: body.reason,
+      },
+      Date.now()
+    );
+
+    if (!result.ok) {
+      reply.code(result.status);
+      return { error: result.error, task: currentTask };
+    }
+
+    const task = persistTaskState(chatId, result.task);
+    return { task };
+  }
+);
+
 app.patch<{ Params: { id: string }; Body: PatchChatBody }>("/api/chats/:id", async (request, reply) => {
   const chatId = request.params.id;
   const chat = getChatStmt.get(chatId) as
@@ -2285,6 +2652,7 @@ app.post<{ Params: { id: string } }>("/api/chats/:id/branch", async (request, re
 
   const sourceShort = getOrCreateShortMemory(sourceChatId);
   const sourceWorking = getOrCreateWorkingMemory(sourceChatId);
+  const sourceTask = getOrCreateTaskState(sourceChatId, sourceChat.title);
   const baseTimestamp = Date.now();
   let createdChatId = "";
 
@@ -2335,6 +2703,10 @@ app.post<{ Params: { id: string } }>("/api/chats/:id/branch", async (request, re
       chatId: createdChatId,
       updatedAt: baseTimestamp + sourceMessages.length,
     });
+    persistTaskState(createdChatId, {
+      ...sourceTask,
+      updatedAt: baseTimestamp + sourceMessages.length,
+    });
 
     updateChatUpdatedAtStmt.run(baseTimestamp + sourceMessages.length, createdChatId);
     db.exec("COMMIT");
@@ -2353,11 +2725,6 @@ app.post<{ Params: { id: string } }>("/api/chats/:id/branch", async (request, re
 });
 
 app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", async (request, reply) => {
-  if (!OPENAI_API_KEY) {
-    reply.code(500);
-    return { error: "OPENAI_API_KEY is not configured" };
-  }
-
   const chatId = request.params.id;
   const existingChat = getChatStmt.get(chatId) as
     | {
@@ -2377,6 +2744,19 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
   if (!existingChat) {
     reply.code(404);
     return { error: "chat not found" };
+  }
+  let taskState = getOrCreateTaskState(chatId, existingChat.title);
+  if (taskState.paused) {
+    reply.code(409);
+    return {
+      error: "task is paused",
+      task: taskState,
+    };
+  }
+
+  if (!OPENAI_API_KEY) {
+    reply.code(500);
+    return { error: "OPENAI_API_KEY is not configured" };
   }
 
   const userPrompt = request.body?.userPrompt?.trim() ?? "";
@@ -2596,6 +2976,9 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
     : null;
   const activeProfileId = activeProfile?.id ?? null;
   const profileBlock = buildProfileBlock(activeProfile);
+  const taskBlock = buildTaskStateBlock(taskState);
+  const stagePrompt = buildTaskStagePrompt(taskState.state);
+  const draftDiagnostics = deriveDraftDiagnosticsFromTask(taskState);
 
   reply.raw.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -2612,6 +2995,11 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
     snapshot: memorySnapshot,
     memoryBlock,
     profileBlock,
+    task: taskState,
+    taskBlock,
+    stagePrompt,
+    taskDraftStatus: draftDiagnostics.taskDraftStatus,
+    taskDraftError: draftDiagnostics.taskDraftError,
     activeProfileId,
     shortTermEnabled,
     workingEnabled,
@@ -2622,7 +3010,13 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
   try {
     const openaiRequestBody = buildOpenAiRequestBody({
       model,
-      systemPrompt: mergeSystemPromptWithContext(systemPrompt, profileBlock, memoryBlock),
+      systemPrompt: mergeSystemPromptWithContext({
+        stagePrompt,
+        systemPrompt,
+        profileBlock,
+        taskBlock,
+        memoryBlock,
+      }),
       inputMessages: persistedMessagesRaw,
       reasoningEffort,
     });
@@ -2763,9 +3157,44 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
             finishedAt
           );
           updateChatUpdatedAtStmt.run(finishedAt, chatId);
+          const parsedDraft = extractTaskArtifactEnvelope(assistantText, taskState);
+          let doneTaskDraftStatus: TaskArtifactDraftStatus = parsedDraft.status;
+          let doneTaskDraftError: string | undefined = parsedDraft.error;
+
+          if (parsedDraft.status === "valid") {
+            taskState = persistTaskState(
+              chatId,
+              setTaskDraftArtifact(
+                {
+                  ...taskState,
+                  updatedAt: finishedAt,
+                },
+                {
+                  artifactText: parsedDraft.artifactText,
+                  artifactState: parsedDraft.artifactState as TaskContext["state"],
+                  artifactStep: parsedDraft.artifactStep,
+                  artifactUpdatedAt: finishedAt,
+                  sourceMessageId: assistantMessageId,
+                }
+              )
+            );
+            doneTaskDraftStatus = "valid";
+            doneTaskDraftError = undefined;
+          } else {
+            taskState = persistTaskState(
+              chatId,
+              clearTaskDraftArtifact({
+                ...taskState,
+                updatedAt: finishedAt,
+              })
+            );
+          }
 
           sendSse("done", {
             reason: payload.response?.status ?? "completed",
+            task: taskState,
+            taskDraftStatus: doneTaskDraftStatus,
+            taskDraftError: doneTaskDraftError,
             metrics: {
               model: finalModel,
               latencyMs: finishedAt - startedAt,
