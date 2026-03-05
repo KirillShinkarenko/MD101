@@ -4,6 +4,8 @@ import {
   type ChatMemorySnapshot,
   type ChatMessage,
   type ChatSummary,
+  type Invariant,
+  type InvariantSettings,
   type LongTermMemory,
   type MemorySettings,
   type TaskCommandRequest,
@@ -252,6 +254,91 @@ export const chatApi = {
       longTermEnabled: payload.longTermEnabled,
       updatedAt: typeof payload.updatedAt === "number" ? payload.updatedAt : Date.now(),
     };
+  },
+
+  async getInvariants(): Promise<{ settings: InvariantSettings; invariants: Invariant[] }> {
+    const response = await fetch(`${API_BASE}/api/invariants`);
+    const payload = await readJson<{
+      enabled?: boolean;
+      injectInSystemPrompt?: boolean;
+      updatedAt?: number;
+      invariants?: Invariant[];
+      error?: string;
+    }>(response);
+    if (!response.ok || !payload) {
+      throw extractError(payload, "Failed to load invariants");
+    }
+    return {
+      settings: {
+        enabled: payload.enabled === true,
+        injectInSystemPrompt: payload.injectInSystemPrompt === true,
+        updatedAt: typeof payload.updatedAt === "number" ? payload.updatedAt : Date.now(),
+      },
+      invariants: Array.isArray(payload.invariants) ? payload.invariants : [],
+    };
+  },
+
+  async patchInvariantSettings(
+    body: Partial<Pick<InvariantSettings, "enabled" | "injectInSystemPrompt">>
+  ): Promise<InvariantSettings> {
+    const response = await fetch(`${API_BASE}/api/invariants/settings`, {
+      method: "PATCH",
+      headers: jsonHeaders,
+      body: JSON.stringify(body),
+    });
+    const payload = await readJson<InvariantSettings & { error?: string }>(response);
+    if (
+      !response.ok ||
+      !payload ||
+      typeof payload.enabled !== "boolean" ||
+      typeof payload.injectInSystemPrompt !== "boolean"
+    ) {
+      throw extractError(payload, "Failed to update invariant settings");
+    }
+    return {
+      enabled: payload.enabled,
+      injectInSystemPrompt: payload.injectInSystemPrompt,
+      updatedAt: typeof payload.updatedAt === "number" ? payload.updatedAt : Date.now(),
+    };
+  },
+
+  async createInvariant(body: { name: string; ruleText: string }): Promise<Invariant> {
+    const response = await fetch(`${API_BASE}/api/invariants`, {
+      method: "POST",
+      headers: jsonHeaders,
+      body: JSON.stringify(body),
+    });
+    const payload = await readJson<{ invariant?: Invariant; error?: string }>(response);
+    if (!response.ok || !payload?.invariant) {
+      throw extractError(payload, "Failed to create invariant");
+    }
+    return payload.invariant;
+  },
+
+  async updateInvariant(
+    invariantId: string,
+    body: Partial<Pick<Invariant, "name" | "ruleText">>
+  ): Promise<Invariant> {
+    const response = await fetch(`${API_BASE}/api/invariants/${invariantId}`, {
+      method: "PATCH",
+      headers: jsonHeaders,
+      body: JSON.stringify(body),
+    });
+    const payload = await readJson<{ invariant?: Invariant; error?: string }>(response);
+    if (!response.ok || !payload?.invariant) {
+      throw extractError(payload, "Failed to update invariant");
+    }
+    return payload.invariant;
+  },
+
+  async deleteInvariant(invariantId: string): Promise<void> {
+    const response = await fetch(`${API_BASE}/api/invariants/${invariantId}`, {
+      method: "DELETE",
+    });
+    const payload = await readJson<{ ok?: boolean; error?: string }>(response);
+    if (!response.ok) {
+      throw extractError(payload, "Failed to delete invariant");
+    }
   },
 
   async approveCandidate(candidateId: string): Promise<void> {

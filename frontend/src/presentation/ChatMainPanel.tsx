@@ -1,4 +1,4 @@
-import type { ChatMessage } from "../domain/chat";
+import type { ChatMessage, InvariantViolation } from "../domain/chat";
 import {
   Fragment,
   useEffect,
@@ -25,6 +25,10 @@ type Props = {
   onUserPromptChange: (value: string) => void;
   onPromptKeyDown: (event: ReactKeyboardEvent<HTMLTextAreaElement>) => void;
   onMainAction: () => void;
+  onRegenerateInvariantViolation: (payload: {
+    violations: InvariantViolation[];
+    rejectedResponse: string;
+  }) => void;
   onOpenConversationInfo: () => void;
   onBranchInNewChat: () => void;
   onOpenBranchSource: (chatId: string) => void;
@@ -38,8 +42,24 @@ type ParsedTaskArtifactMessage = {
   isArtifactJsonValid: boolean;
 };
 
+type InvariantViolationPayload = {
+  violations: InvariantViolation[];
+  rejectedResponse: string;
+  sourceModel: string;
+  createdAt: number;
+};
+
+type ParsedInvariantViolationMessage = {
+  isViolation: boolean;
+  payload: InvariantViolationPayload | null;
+  visibleText: string;
+};
+
 const createTaskArtifactBlockRegex = (): RegExp =>
   /\[TASK_ARTIFACT_JSON\]([\s\S]*?)\[\/TASK_ARTIFACT_JSON\]/g;
+
+const createInvariantViolationBlockRegex = (): RegExp =>
+  /\[INVARIANT_VIOLATION_JSON\]([\s\S]*?)\[\/INVARIANT_VIOLATION_JSON\]/g;
 
 const normalizeVisibleText = (value: string): string =>
   value
@@ -83,6 +103,70 @@ const parseTaskArtifactMessage = (content: string): ParsedTaskArtifactMessage =>
   };
 };
 
+const parseInvariantViolationMessage = (content: string): ParsedInvariantViolationMessage => {
+  const blockRegex = createInvariantViolationBlockRegex();
+  const matches = Array.from(content.matchAll(blockRegex));
+  if (matches.length === 0) {
+    return {
+      isViolation: false,
+      payload: null,
+      visibleText: normalizeVisibleText(content),
+    };
+  }
+
+  const rawJson = (matches[matches.length - 1]?.[1] ?? "").trim();
+  const visibleText = normalizeVisibleText(content.replace(createInvariantViolationBlockRegex(), ""));
+
+  try {
+    const parsed = JSON.parse(rawJson) as {
+      violations?: unknown;
+      rejectedResponse?: unknown;
+      sourceModel?: unknown;
+      createdAt?: unknown;
+    };
+    const violations = Array.isArray(parsed.violations)
+      ? parsed.violations
+          .map((item) => {
+            if (!item || typeof item !== "object") {
+              return null;
+            }
+            const candidate = item as { invariantId?: unknown; description?: unknown };
+            if (typeof candidate.invariantId !== "string" || typeof candidate.description !== "string") {
+              return null;
+            }
+            const invariantId = candidate.invariantId.trim();
+            const description = candidate.description.trim();
+            if (!invariantId || !description) {
+              return null;
+            }
+            return {
+              invariantId,
+              description,
+            };
+          })
+          .filter((item): item is InvariantViolation => Boolean(item))
+      : [];
+
+    return {
+      isViolation: true,
+      payload: {
+        violations,
+        rejectedResponse:
+          typeof parsed.rejectedResponse === "string" ? parsed.rejectedResponse : "",
+        sourceModel: typeof parsed.sourceModel === "string" ? parsed.sourceModel : "",
+        createdAt: typeof parsed.createdAt === "number" ? parsed.createdAt : Date.now(),
+      },
+      visibleText: visibleText || "Ответ отклонен: обнаружены нарушения инвариантов.",
+    };
+  } catch {
+    return {
+      isViolation: false,
+      payload: null,
+      visibleText: normalizeVisibleText(content),
+    };
+  }
+};
+
 export function ChatMainPanel(props: Props) {
   const {
     userPrompt,
@@ -99,6 +183,7 @@ export function ChatMainPanel(props: Props) {
     onUserPromptChange,
     onPromptKeyDown,
     onMainAction,
+    onRegenerateInvariantViolation,
     onOpenConversationInfo,
     onBranchInNewChat,
     onOpenBranchSource,
@@ -173,7 +258,7 @@ export function ChatMainPanel(props: Props) {
       <PanelHeader
         as="h1"
         variant="panel"
-        title="День 13. Состояние задачи (Task State Machine)"
+        title="День 14. Инварианты и ограничения состояния"
         titleClassName="day-task-heading"
         actions={
           <>
@@ -223,17 +308,59 @@ export function ChatMainPanel(props: Props) {
         {dividerPlacement === "top" ? renderBranchDivider("branch-divider-top") : null}
         {messages.length === 0 ? <p className="empty">Start a conversation...</p> : null}
         {messages.map((message, index) => {
+          const parsedInvariantViolation = parseInvariantViolationMessage(message.content);
+          const isInvariantViolation =
+            message.role === "assistant" &&
+            parsedInvariantViolation.isViolation &&
+            Boolean(parsedInvariantViolation.payload);
           const parsedMessage = parseTaskArtifactMessage(message.content);
           const shouldShowArtifactInfo = message.role === "assistant" && parsedMessage.hasArtifact;
           const shouldRenderContent = parsedMessage.visibleText.length > 0 || !parsedMessage.hasArtifact;
           const contentText = parsedMessage.hasArtifact ? parsedMessage.visibleText : message.content || "...";
+          const violationPayload = parsedInvariantViolation.payload;
 
           return (
             <Fragment key={message.id}>
               <article className={`message-row role-${message.role}`}>
                 <div className={`message-surface is-${message.role}`}>
-                  {shouldRenderContent ? <p className="content">{contentText}</p> : null}
-                  {shouldShowArtifactInfo ? (
+                  {isInvariantViolation && violationPayload ? (
+                    <div className="invariant-violation-card">
+                      <p className="content">{parsedInvariantViolation.visibleText}</p>
+                      {violationPayload.violations.length > 0 ? (
+                        <ul className="invariant-violation-list">
+                          {violationPayload.violations.map((violation, violationIndex) => (
+                            <li key={`${violation.invariantId}-${violationIndex}`}>
+                              <strong>{violation.invariantId}:</strong> {violation.description}
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="hint">Нарушения не детализированы.</p>
+                      )}
+                      <div className="invariant-violation-actions">
+                        <UiButton
+                          size="sm"
+                          onClick={() =>
+                            onRegenerateInvariantViolation({
+                              violations: violationPayload.violations,
+                              rejectedResponse: violationPayload.rejectedResponse,
+                            })
+                          }
+                          disabled={isStreaming}
+                        >
+                          Regenerate
+                        </UiButton>
+                      </div>
+                      <details className="message-artifact">
+                        <summary className="message-artifact-summary">Показать отклоненный ответ</summary>
+                        <pre className="message-artifact-body">
+                          {violationPayload.rejectedResponse || "(empty)"}
+                        </pre>
+                      </details>
+                    </div>
+                  ) : null}
+                  {!isInvariantViolation && shouldRenderContent ? <p className="content">{contentText}</p> : null}
+                  {!isInvariantViolation && shouldShowArtifactInfo ? (
                     <details className="message-artifact">
                       <summary className="message-artifact-summary">Доп. инфо</summary>
                       <pre className="message-artifact-body">

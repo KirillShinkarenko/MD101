@@ -55,6 +55,26 @@ export type MemorySettings = {
   updatedAt: number;
 };
 
+export type Invariant = {
+  id: string;
+  name: string;
+  ruleText: string;
+  sortOrder: number;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type InvariantSettings = {
+  enabled: boolean;
+  injectInSystemPrompt: boolean;
+  updatedAt: number;
+};
+
+export type InvariantViolation = {
+  invariantId: string;
+  description: string;
+};
+
 export type TaskState = "planning" | "execution" | "validation" | "done";
 
 export type TaskExpectedAction =

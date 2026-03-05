@@ -43,6 +43,7 @@ function App() {
         onUserPromptChange={actions.setUserPrompt}
         onPromptKeyDown={actions.handlePromptKeyDown}
         onMainAction={actions.handleMainAction}
+        onRegenerateInvariantViolation={(payload) => void actions.regenerateFromInvariantViolation(payload)}
         onOpenConversationInfo={() => actions.setIsConversationInfoOpen(true)}
         onBranchInNewChat={() => void actions.branchInNewChat()}
         onOpenBranchSource={actions.openBranchSourceChat}
@@ -59,6 +60,11 @@ function App() {
         shortTermEnabled={view.shortTermEnabled}
         workingEnabled={view.workingEnabled}
         longTermEnabled={view.longTermEnabled}
+        invariants={view.invariants}
+        invariantsEnabled={view.invariantsEnabled}
+        injectInvariantsInSystemPrompt={view.injectInvariantsInSystemPrompt}
+        isInvariantSettingsSaving={view.isInvariantSettingsSaving}
+        isInvariantsSaving={view.isInvariantsSaving}
         effectiveMemoryBlock={view.effectiveMemoryBlock}
         errorText={view.errorText}
         isStreaming={view.isStreaming}
@@ -77,6 +83,11 @@ function App() {
         onSaveLongTerm={actions.saveLongTermMemory}
         onApproveCandidate={actions.approveCandidate}
         onRejectCandidate={actions.rejectCandidate}
+        onInvariantsEnabledChange={actions.setInvariantsEnabled}
+        onInjectInvariantsInSystemPromptChange={actions.setInjectInvariantsInSystemPrompt}
+        onCreateInvariant={actions.createInvariant}
+        onUpdateInvariant={actions.updateInvariant}
+        onDeleteInvariant={actions.deleteInvariant}
       />
 
       <ModelSettingsModal

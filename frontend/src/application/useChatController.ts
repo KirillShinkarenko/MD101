@@ -16,6 +16,8 @@ import {
   type ChatSummary,
   type FullScreenView,
   type HistoryTotals,
+  type Invariant,
+  type InvariantViolation,
   type LongTermMemory,
   type ReasoningEffort,
   type RunMetrics,
@@ -106,6 +108,30 @@ const shouldAutoStartAfterTaskCommand = (command: TaskCommandRequest["command"])
 const buildTaskAutoPrompt = (task: TaskContext): string =>
   `[AUTO] Continue current stage: ${task.state}, step ${task.step}/${task.total}. Follow TASK_STATE and TASK_STAGE_RULES.`;
 
+const buildInvariantRegeneratePrompt = (payload: {
+  violations: InvariantViolation[];
+  rejectedResponse: string;
+}): string => {
+  const violationLines =
+    payload.violations.length > 0
+      ? payload.violations
+          .map((violation, index) => `${index + 1}. ${violation.invariantId}: ${violation.description}`)
+          .join("\n")
+      : "1. unknown: invariant violation";
+
+  return [
+    "Твой предыдущий ответ нарушил инварианты.",
+    "",
+    "Нарушения:",
+    violationLines,
+    "",
+    "Предыдущий отклоненный ответ:",
+    payload.rejectedResponse || "(empty)",
+    "",
+    "Перегенерируй ответ и строго соблюдай все инварианты.",
+  ].join("\n");
+};
+
 export type ChatController = ReturnType<typeof useChatController>;
 
 type ProfileDraft = {
@@ -163,6 +189,11 @@ export function useChatController() {
   const [workingEnabled, setWorkingEnabledState] = useState(true);
   const [longTermEnabled, setLongTermEnabledState] = useState(true);
   const [isMemorySettingsSaving, setIsMemorySettingsSaving] = useState(false);
+  const [invariants, setInvariants] = useState<Invariant[]>([]);
+  const [invariantsEnabled, setInvariantsEnabledState] = useState(true);
+  const [injectInvariantsInSystemPrompt, setInjectInvariantsInSystemPromptState] = useState(true);
+  const [isInvariantSettingsSaving, setIsInvariantSettingsSaving] = useState(false);
+  const [isInvariantsSaving, setIsInvariantsSaving] = useState(false);
 
   const controllerRef = useRef<AbortController | null>(null);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
@@ -355,6 +386,13 @@ export function useChatController() {
     setShortTermEnabledState(settings.shortTermEnabled);
     setWorkingEnabledState(settings.workingEnabled);
     setLongTermEnabledState(settings.longTermEnabled);
+  }, []);
+
+  const loadInvariants = useCallback(async () => {
+    const payload = await chatApi.getInvariants();
+    setInvariants(payload.invariants);
+    setInvariantsEnabledState(payload.settings.enabled);
+    setInjectInvariantsInSystemPromptState(payload.settings.injectInSystemPrompt);
   }, []);
 
   const loadChats = useCallback(async () => {
@@ -551,6 +589,88 @@ export function useChatController() {
   const setLongTermEnabled = useCallback(async (nextValue: boolean) => {
     await updateMemorySettings({ longTermEnabled: nextValue });
   }, [updateMemorySettings]);
+
+  const updateInvariantSettings = useCallback(
+    async (patch: { enabled?: boolean; injectInSystemPrompt?: boolean }) => {
+      setIsInvariantSettingsSaving(true);
+      try {
+        const settings = await chatApi.patchInvariantSettings(patch);
+        setInvariantsEnabledState(settings.enabled);
+        setInjectInvariantsInSystemPromptState(settings.injectInSystemPrompt);
+        setErrorText("");
+        setStatus("idle");
+      } catch (error) {
+        setErrorText(error instanceof Error ? error.message : "Failed to update invariant settings");
+        setStatus("error");
+      } finally {
+        setIsInvariantSettingsSaving(false);
+      }
+    },
+    []
+  );
+
+  const setInvariantsEnabled = useCallback(
+    async (nextValue: boolean) => {
+      await updateInvariantSettings({ enabled: nextValue });
+    },
+    [updateInvariantSettings]
+  );
+
+  const setInjectInvariantsInSystemPrompt = useCallback(
+    async (nextValue: boolean) => {
+      await updateInvariantSettings({ injectInSystemPrompt: nextValue });
+    },
+    [updateInvariantSettings]
+  );
+
+  const createInvariant = useCallback(async (name: string, ruleText: string) => {
+    setIsInvariantsSaving(true);
+    try {
+      const created = await chatApi.createInvariant({ name, ruleText });
+      setInvariants((prev) => [...prev, created].sort((a, b) => a.sortOrder - b.sortOrder));
+      setErrorText("");
+      setStatus("idle");
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : "Failed to create invariant");
+      setStatus("error");
+    } finally {
+      setIsInvariantsSaving(false);
+    }
+  }, []);
+
+  const updateInvariant = useCallback(async (invariantId: string, body: { name?: string; ruleText?: string }) => {
+    setIsInvariantsSaving(true);
+    try {
+      const updated = await chatApi.updateInvariant(invariantId, body);
+      setInvariants((prev) =>
+        prev
+          .map((invariant) => (invariant.id === updated.id ? updated : invariant))
+          .sort((a, b) => a.sortOrder - b.sortOrder)
+      );
+      setErrorText("");
+      setStatus("idle");
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : "Failed to update invariant");
+      setStatus("error");
+    } finally {
+      setIsInvariantsSaving(false);
+    }
+  }, []);
+
+  const deleteInvariant = useCallback(async (invariantId: string) => {
+    setIsInvariantsSaving(true);
+    try {
+      await chatApi.deleteInvariant(invariantId);
+      setInvariants((prev) => prev.filter((invariant) => invariant.id !== invariantId));
+      setErrorText("");
+      setStatus("idle");
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : "Failed to delete invariant");
+      setStatus("error");
+    } finally {
+      setIsInvariantsSaving(false);
+    }
+  }, []);
 
   const approveCandidate = useCallback(
     async (candidateId: string) => {
@@ -1181,6 +1301,14 @@ export function useChatController() {
     await runStreamWithPrompt(userPrompt, { clearComposer: true });
   }, [runStreamWithPrompt, userPrompt]);
 
+  const regenerateFromInvariantViolation = useCallback(
+    async (payload: { violations: InvariantViolation[]; rejectedResponse: string }) => {
+      const prompt = buildInvariantRegeneratePrompt(payload);
+      await runStreamWithPrompt(prompt);
+    },
+    [runStreamWithPrompt]
+  );
+
   useEffect(() => {
     if (!pendingAutoPrompt || isStreaming) {
       return;
@@ -1214,11 +1342,11 @@ export function useChatController() {
   }, [messages]);
 
   useEffect(() => {
-    void Promise.all([loadChats(), loadProfiles(), loadMemorySettings()]).catch((error: unknown) => {
+    void Promise.all([loadChats(), loadProfiles(), loadMemorySettings(), loadInvariants()]).catch((error: unknown) => {
       setErrorText(error instanceof Error ? error.message : "Failed to initialize");
       setStatus("error");
     });
-  }, [loadChats, loadProfiles, loadMemorySettings]);
+  }, [loadChats, loadProfiles, loadMemorySettings, loadInvariants]);
 
   useEffect(() => {
     if (!activeChat) {
@@ -1298,6 +1426,11 @@ export function useChatController() {
       workingEnabled,
       longTermEnabled,
       isMemorySettingsSaving,
+      invariants,
+      invariantsEnabled,
+      injectInvariantsInSystemPrompt,
+      isInvariantSettingsSaving,
+      isInvariantsSaving,
       activeModelLabel,
       activeProfileLabel,
       isStreaming,
@@ -1322,8 +1455,14 @@ export function useChatController() {
       setShortTermEnabled,
       setWorkingEnabled,
       setLongTermEnabled,
+      setInvariantsEnabled,
+      setInjectInvariantsInSystemPrompt,
       saveWorkingMemory,
       saveLongTermMemory,
+      createInvariant,
+      updateInvariant,
+      deleteInvariant,
+      regenerateFromInvariantViolation,
       pauseTask,
       resumeTask,
       approvePlan,

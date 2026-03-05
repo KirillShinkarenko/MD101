@@ -109,7 +109,7 @@ textarea {
 
 .inspector-tabs {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 6px;
 }
 
@@ -696,6 +696,33 @@ button:disabled {
   overflow-wrap: anywhere;
   word-break: break-word;
   max-width: min(90vw, 740px);
+}
+
+.invariant-violation-card {
+  border: 1px solid #5a3840;
+  background: #2a171d;
+  border-radius: 12px;
+  padding: 10px 12px;
+  display: grid;
+  gap: 8px;
+}
+
+.invariant-violation-list {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 4px;
+}
+
+.invariant-violation-list li {
+  color: #f0d8dd;
+  font-size: var(--font-size-sm);
+}
+
+.invariant-violation-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .composer {

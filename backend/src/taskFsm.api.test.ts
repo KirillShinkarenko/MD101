@@ -155,3 +155,98 @@ test("task command returns 422 when approve_plan has no draft, no artifact and n
   assert.equal(approve.status, 422);
   assert.match(approve.payload.error, /artifact|plan/i);
 });
+
+test("invariants settings endpoint supports enabled + injectInSystemPrompt toggles", { skip: !RUN_API_TESTS }, async () => {
+  const initial = await requestJson<{
+    enabled: boolean;
+    injectInSystemPrompt: boolean;
+    updatedAt: number;
+    invariants: unknown[];
+  }>("/api/invariants");
+  assert.equal(initial.status, 200);
+  assert.equal(typeof initial.payload.enabled, "boolean");
+  assert.equal(typeof initial.payload.injectInSystemPrompt, "boolean");
+
+  const patched = await requestJson<{
+    enabled: boolean;
+    injectInSystemPrompt: boolean;
+    updatedAt: number;
+  }>("/api/invariants/settings", {
+    method: "PATCH",
+    body: {
+      enabled: false,
+      injectInSystemPrompt: false,
+    },
+  });
+  assert.equal(patched.status, 200);
+  assert.equal(patched.payload.enabled, false);
+  assert.equal(patched.payload.injectInSystemPrompt, false);
+
+  const after = await requestJson<{
+    enabled: boolean;
+    injectInSystemPrompt: boolean;
+    invariants: unknown[];
+  }>("/api/invariants");
+  assert.equal(after.status, 200);
+  assert.equal(after.payload.enabled, false);
+  assert.equal(after.payload.injectInSystemPrompt, false);
+});
+
+test("invariants CRUD works and validates required fields", { skip: !RUN_API_TESTS }, async () => {
+  const createBad = await requestJson<{ error: string }>("/api/invariants", {
+    method: "POST",
+    body: {
+      name: "",
+      ruleText: "",
+    },
+  });
+  assert.equal(createBad.status, 400);
+  assert.match(createBad.payload.error, /name|ruleText/i);
+
+  const created = await requestJson<{
+    invariant: {
+      id: string;
+      name: string;
+      ruleText: string;
+      sortOrder: number;
+    };
+  }>("/api/invariants", {
+    method: "POST",
+    body: {
+      name: "No RxJava",
+      ruleText: "Запрещено использовать RxJava.",
+    },
+  });
+  assert.equal(created.status, 200);
+  assert.equal(created.payload.invariant.name, "No RxJava");
+  assert.equal(created.payload.invariant.ruleText, "Запрещено использовать RxJava.");
+
+  const updated = await requestJson<{
+    invariant: {
+      id: string;
+      name: string;
+      ruleText: string;
+    };
+  }>(`/api/invariants/${created.payload.invariant.id}`, {
+    method: "PATCH",
+    body: {
+      name: "No RxJava in answers",
+      ruleText: "Запрещено использовать RxJava и любые ссылки на него.",
+    },
+  });
+  assert.equal(updated.status, 200);
+  assert.equal(updated.payload.invariant.name, "No RxJava in answers");
+  assert.match(updated.payload.invariant.ruleText, /RxJava/i);
+
+  const listed = await requestJson<{
+    invariants: Array<{ id: string; name: string }>;
+  }>("/api/invariants");
+  assert.equal(listed.status, 200);
+  assert.ok(listed.payload.invariants.some((item) => item.id === created.payload.invariant.id));
+
+  const deleted = await requestJson<{ ok: boolean }>(`/api/invariants/${created.payload.invariant.id}`, {
+    method: "DELETE",
+  });
+  assert.equal(deleted.status, 200);
+  assert.equal(deleted.payload.ok, true);
+});

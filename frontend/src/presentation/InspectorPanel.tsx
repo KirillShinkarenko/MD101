@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type {
   ChatMemorySnapshot,
+  Invariant,
   LongTermMemory,
   TaskArtifactDraftStatus,
   TaskContext,
@@ -9,7 +10,7 @@ import type {
 import { PanelHeader } from "./ui/PanelHeader";
 import { UiButton } from "./ui/UiButton";
 
-type TabKey = "task" | "request" | "response" | "memory";
+type TabKey = "task" | "request" | "response" | "memory" | "invariants";
 
 type Props = {
   requestRaw: string;
@@ -22,6 +23,11 @@ type Props = {
   shortTermEnabled: boolean;
   workingEnabled: boolean;
   longTermEnabled: boolean;
+  invariants: Invariant[];
+  invariantsEnabled: boolean;
+  injectInvariantsInSystemPrompt: boolean;
+  isInvariantSettingsSaving: boolean;
+  isInvariantsSaving: boolean;
   effectiveMemoryBlock: string;
   errorText: string;
   isStreaming: boolean;
@@ -40,6 +46,11 @@ type Props = {
   ) => Promise<void>;
   onApproveCandidate: (candidateId: string) => Promise<void>;
   onRejectCandidate: (candidateId: string) => Promise<void>;
+  onInvariantsEnabledChange: (value: boolean) => Promise<void>;
+  onInjectInvariantsInSystemPromptChange: (value: boolean) => Promise<void>;
+  onCreateInvariant: (name: string, ruleText: string) => Promise<void>;
+  onUpdateInvariant: (invariantId: string, body: { name?: string; ruleText?: string }) => Promise<void>;
+  onDeleteInvariant: (invariantId: string) => Promise<void>;
 };
 
 const STAGE_LABEL: Record<TaskContext["state"], string> = {
@@ -76,6 +87,11 @@ export function InspectorPanel(props: Props) {
     shortTermEnabled,
     workingEnabled,
     longTermEnabled,
+    invariants,
+    invariantsEnabled,
+    injectInvariantsInSystemPrompt,
+    isInvariantSettingsSaving,
+    isInvariantsSaving,
     effectiveMemoryBlock,
     errorText,
     isStreaming,
@@ -92,6 +108,11 @@ export function InspectorPanel(props: Props) {
     onSaveLongTerm,
     onApproveCandidate,
     onRejectCandidate,
+    onInvariantsEnabledChange,
+    onInjectInvariantsInSystemPromptChange,
+    onCreateInvariant,
+    onUpdateInvariant,
+    onDeleteInvariant,
   } = props;
 
   const [activeTab, setActiveTab] = useState<TabKey>("task");
@@ -101,6 +122,11 @@ export function InspectorPanel(props: Props) {
   const [artifactDraft, setArtifactDraft] = useState("");
   const [artifactDraftEdited, setArtifactDraftEdited] = useState(false);
   const draftIdentityRef = useRef("");
+  const [newInvariantName, setNewInvariantName] = useState("");
+  const [newInvariantRule, setNewInvariantRule] = useState("");
+  const [editingInvariantId, setEditingInvariantId] = useState<string | null>(null);
+  const [editingInvariantName, setEditingInvariantName] = useState("");
+  const [editingInvariantRule, setEditingInvariantRule] = useState("");
 
   const [workingDraft, setWorkingDraft] = useState({
     goal: memory.working.goal,
@@ -162,6 +188,7 @@ export function InspectorPanel(props: Props) {
       request: "Request",
       response: "Response",
       memory: pendingCount > 0 ? `Memory (${pendingCount})` : "Memory",
+      invariants: "Invariants",
     }),
     [pendingCount]
   );
@@ -240,6 +267,35 @@ export function InspectorPanel(props: Props) {
     }
   };
 
+  const handleCreateInvariant = async () => {
+    const name = newInvariantName.trim();
+    const ruleText = newInvariantRule.trim();
+    if (!name || !ruleText) {
+      return;
+    }
+    await onCreateInvariant(name, ruleText);
+    setNewInvariantName("");
+    setNewInvariantRule("");
+  };
+
+  const handleStartEditInvariant = (invariant: Invariant) => {
+    setEditingInvariantId(invariant.id);
+    setEditingInvariantName(invariant.name);
+    setEditingInvariantRule(invariant.ruleText);
+  };
+
+  const handleSaveInvariant = async (invariantId: string) => {
+    const name = editingInvariantName.trim();
+    const ruleText = editingInvariantRule.trim();
+    if (!name || !ruleText) {
+      return;
+    }
+    await onUpdateInvariant(invariantId, { name, ruleText });
+    setEditingInvariantId(null);
+    setEditingInvariantName("");
+    setEditingInvariantRule("");
+  };
+
   return (
     <aside className="sidebar right-col inspector-tabs-layout">
       <section className="inspector-tab-header">
@@ -271,6 +327,13 @@ export function InspectorPanel(props: Props) {
             onClick={() => setActiveTab("memory")}
           >
             {tabLabel.memory}
+          </button>
+          <button
+            className={`inspector-tab-btn ${activeTab === "invariants" ? "is-active" : ""}`}
+            type="button"
+            onClick={() => setActiveTab("invariants")}
+          >
+            {tabLabel.invariants}
           </button>
         </div>
       </section>
@@ -545,6 +608,159 @@ export function InspectorPanel(props: Props) {
           <div className="memory-card">
             <h4>Effective memory block</h4>
             <pre>{effectiveMemoryBlock || "Will appear after send"}</pre>
+          </div>
+        </section>
+      ) : null}
+
+      {activeTab === "invariants" ? (
+        <section className="side-section memory-tab-content">
+          <div className="memory-card">
+            <h4>Invariant settings</h4>
+            <label className="memory-toggle-control" htmlFor="invariants-enabled">
+              <input
+                id="invariants-enabled"
+                className="memory-toggle-input"
+                type="checkbox"
+                checked={invariantsEnabled}
+                disabled={isStreaming || isInvariantSettingsSaving}
+                onChange={(event) => void onInvariantsEnabledChange(event.target.checked)}
+              />
+              <span>{invariantsEnabled ? "Invariants enabled" : "Invariants disabled"}</span>
+            </label>
+            <label className="memory-toggle-control" htmlFor="inject-invariants-in-system-prompt">
+              <input
+                id="inject-invariants-in-system-prompt"
+                className="memory-toggle-input"
+                type="checkbox"
+                checked={injectInvariantsInSystemPrompt}
+                disabled={isStreaming || isInvariantSettingsSaving}
+                onChange={(event) =>
+                  void onInjectInvariantsInSystemPromptChange(event.target.checked)
+                }
+              />
+              <span>
+                {injectInvariantsInSystemPrompt
+                  ? "Inject invariants into system prompt"
+                  : "Do not inject invariants into system prompt"}
+              </span>
+            </label>
+            <p className="hint">
+              Проверка ответа на инварианты выполняется всегда, когда инварианты включены.
+            </p>
+          </div>
+
+          <div className="memory-card">
+            <h4>Add invariant</h4>
+            <label className="memory-field-label" htmlFor="new-invariant-name">name</label>
+            <input
+              id="new-invariant-name"
+              value={newInvariantName}
+              disabled={isStreaming || isInvariantsSaving}
+              onChange={(event) => setNewInvariantName(event.target.value)}
+              placeholder="Например: No RxJava"
+            />
+            <label className="memory-field-label" htmlFor="new-invariant-rule">rule</label>
+            <textarea
+              id="new-invariant-rule"
+              rows={3}
+              value={newInvariantRule}
+              disabled={isStreaming || isInvariantsSaving}
+              onChange={(event) => setNewInvariantRule(event.target.value)}
+              placeholder="Опишите ограничение"
+            />
+            <UiButton
+              size="sm"
+              onClick={() => void handleCreateInvariant()}
+              disabled={
+                isStreaming ||
+                isInvariantsSaving ||
+                !newInvariantName.trim() ||
+                !newInvariantRule.trim()
+              }
+            >
+              {isInvariantsSaving ? "Saving..." : "Add invariant"}
+            </UiButton>
+          </div>
+
+          <div className="memory-card">
+            <h4>Invariant list</h4>
+            {invariants.length === 0 ? <p className="hint">No invariants yet.</p> : null}
+            <div className="candidate-list">
+              {invariants.map((invariant) => {
+                const isEditing = editingInvariantId === invariant.id;
+                return (
+                  <article className="candidate-item" key={invariant.id}>
+                    {isEditing ? (
+                      <>
+                        <label className="memory-field-label" htmlFor={`invariant-name-${invariant.id}`}>
+                          name
+                        </label>
+                        <input
+                          id={`invariant-name-${invariant.id}`}
+                          value={editingInvariantName}
+                          disabled={isStreaming || isInvariantsSaving}
+                          onChange={(event) => setEditingInvariantName(event.target.value)}
+                        />
+                        <label className="memory-field-label" htmlFor={`invariant-rule-${invariant.id}`}>
+                          rule
+                        </label>
+                        <textarea
+                          id={`invariant-rule-${invariant.id}`}
+                          rows={3}
+                          value={editingInvariantRule}
+                          disabled={isStreaming || isInvariantsSaving}
+                          onChange={(event) => setEditingInvariantRule(event.target.value)}
+                        />
+                        <div className="candidate-actions">
+                          <UiButton
+                            size="sm"
+                            onClick={() => void handleSaveInvariant(invariant.id)}
+                            disabled={
+                              isStreaming ||
+                              isInvariantsSaving ||
+                              !editingInvariantName.trim() ||
+                              !editingInvariantRule.trim()
+                            }
+                          >
+                            Save
+                          </UiButton>
+                          <UiButton
+                            size="sm"
+                            variant="subtle"
+                            onClick={() => setEditingInvariantId(null)}
+                            disabled={isStreaming || isInvariantsSaving}
+                          >
+                            Cancel
+                          </UiButton>
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <p><strong>{invariant.name}</strong></p>
+                        <p>{invariant.ruleText}</p>
+                        <div className="candidate-actions">
+                          <UiButton
+                            size="sm"
+                            onClick={() => handleStartEditInvariant(invariant)}
+                            disabled={isStreaming || isInvariantsSaving}
+                          >
+                            Edit
+                          </UiButton>
+                          <UiButton
+                            size="sm"
+                            variant="subtle"
+                            onClick={() => void onDeleteInvariant(invariant.id)}
+                            disabled={isStreaming || isInvariantsSaving}
+                          >
+                            Delete
+                          </UiButton>
+                        </div>
+                      </>
+                    )}
+                  </article>
+                );
+              })}
+            </div>
           </div>
         </section>
       ) : null}

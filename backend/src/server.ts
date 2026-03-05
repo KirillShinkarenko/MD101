@@ -93,6 +93,21 @@ type MemorySettingsPatchBody = {
   longTermEnabled?: boolean;
 };
 
+type InvariantSettingsPatchBody = {
+  enabled?: boolean;
+  injectInSystemPrompt?: boolean;
+};
+
+type CreateInvariantBody = {
+  name?: string;
+  ruleText?: string;
+};
+
+type PatchInvariantBody = {
+  name?: string;
+  ruleText?: string;
+};
+
 type UsageSummary = {
   inputTokens: number;
   outputTokens: number;
@@ -202,6 +217,27 @@ type MemorySettingsRow = {
   updatedAt: number;
 };
 
+type InvariantSettingsRow = {
+  scopeId: "global";
+  enabled: number;
+  injectInSystemPrompt: number;
+  updatedAt: number;
+};
+
+type InvariantRow = {
+  id: string;
+  name: string;
+  ruleText: string;
+  sortOrder: number;
+  createdAt: number;
+  updatedAt: number;
+};
+
+type InvariantViolation = {
+  invariantId: string;
+  description: string;
+};
+
 type ChatMemorySnapshot = {
   shortTerm: {
     rollingSummary: string;
@@ -259,12 +295,17 @@ const BRANCH_CHAT_TITLE_PREFIX = "Ветка - ";
 const GLOBAL_LONG_TERM_SCOPE_ID = "global" as const;
 const GLOBAL_PROFILE_SCOPE_ID = "global" as const;
 const GLOBAL_MEMORY_SETTINGS_SCOPE_ID = "global" as const;
+const GLOBAL_INVARIANT_SETTINGS_SCOPE_ID = "global" as const;
 const SHORT_TERM_MAX_LENGTH = 1800;
 const WORKING_FIELD_MAX_LENGTH = 320;
 const LONG_TERM_FIELD_MAX_LENGTH = 600;
 const CANDIDATE_VALUE_MAX_LENGTH = 320;
 const PROFILE_FIELD_MAX_LENGTH = 600;
 const PROFILE_NAME_MAX_LENGTH = 64;
+const INVARIANT_NAME_MAX_LENGTH = 120;
+const INVARIANT_RULE_MAX_LENGTH = 1500;
+const INVARIANT_VIOLATION_OPEN_TAG = "[INVARIANT_VIOLATION_JSON]";
+const INVARIANT_VIOLATION_CLOSE_TAG = "[/INVARIANT_VIOLATION_JSON]";
 const NETWORK_ERROR_HINTS: Record<string, string> = {
   ENOTFOUND: "DNS lookup failed. Check internet connection or DNS settings.",
   ECONNRESET: "Network connection was reset while calling OpenAI.",
@@ -455,10 +496,27 @@ CREATE TABLE IF NOT EXISTS memory_settings (
   updated_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS invariant_settings (
+  scope_id TEXT PRIMARY KEY,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  inject_in_system_prompt INTEGER NOT NULL DEFAULT 1,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS invariants (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  rule_text TEXT NOT NULL,
+  sort_order INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_chat_id_created_at ON messages (chat_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_long_term_candidates_chat_status_created_at
   ON long_term_candidates (chat_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_user_profiles_updated_at ON user_profiles (updated_at DESC, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_invariants_sort_order_created_at ON invariants (sort_order ASC, created_at ASC);
 `);
 
 const chatsColumns = db.prepare("PRAGMA table_info(chats)").all() as Array<{ name: string }>;
@@ -480,6 +538,14 @@ if (!memorySettingsColumnNames.has("short_term_enabled")) {
 }
 if (!memorySettingsColumnNames.has("working_enabled")) {
   db.exec("ALTER TABLE memory_settings ADD COLUMN working_enabled INTEGER NOT NULL DEFAULT 1");
+}
+
+const invariantSettingsColumns = db.prepare("PRAGMA table_info(invariant_settings)").all() as Array<{
+  name: string;
+}>;
+const invariantSettingsColumnNames = new Set(invariantSettingsColumns.map((column) => column.name));
+if (!invariantSettingsColumnNames.has("inject_in_system_prompt")) {
+  db.exec("ALTER TABLE invariant_settings ADD COLUMN inject_in_system_prompt INTEGER NOT NULL DEFAULT 1");
 }
 
 const taskStateColumns = db.prepare("PRAGMA table_info(chat_task_state)").all() as Array<{ name: string }>;
@@ -541,6 +607,17 @@ const ensureMemorySettingsStmt = db.prepare(`
   ON CONFLICT(scope_id) DO NOTHING
 `);
 ensureMemorySettingsStmt.run(Date.now());
+
+const ensureInvariantSettingsStmt = db.prepare(`
+  INSERT INTO invariant_settings (
+    scope_id,
+    enabled,
+    inject_in_system_prompt,
+    updated_at
+  ) VALUES ('global', 1, 1, ?)
+  ON CONFLICT(scope_id) DO NOTHING
+`);
+ensureInvariantSettingsStmt.run(Date.now());
 
 const parseModel = (value: unknown): string | undefined => {
   if (typeof value !== "string") {
@@ -822,6 +899,7 @@ const normalizeWorkingField = (value: unknown): string => normalizeTextField(val
 const normalizeLongTermField = (value: unknown): string => normalizeTextField(value, LONG_TERM_FIELD_MAX_LENGTH);
 const normalizeCandidateValue = (value: unknown): string => normalizeTextField(value, CANDIDATE_VALUE_MAX_LENGTH);
 const normalizeProfileField = (value: unknown): string => normalizeTextField(value, PROFILE_FIELD_MAX_LENGTH);
+const normalizeInvariantRule = (value: unknown): string => normalizeTextField(value, INVARIANT_RULE_MAX_LENGTH);
 
 const parseProfileName = (value: unknown): string | null => {
   if (typeof value !== "string") {
@@ -829,6 +907,17 @@ const parseProfileName = (value: unknown): string | null => {
   }
   const compact = compactWhitespace(value.trim());
   if (!compact || compact.length > PROFILE_NAME_MAX_LENGTH) {
+    return null;
+  }
+  return compact;
+};
+
+const parseInvariantName = (value: unknown): string | null => {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const compact = compactWhitespace(value.trim());
+  if (!compact || compact.length > INVARIANT_NAME_MAX_LENGTH) {
     return null;
   }
   return compact;
@@ -1118,20 +1207,195 @@ const buildProfileBlock = (profile: UserProfileRow | null): string => {
   ].join("\n");
 };
 
+const buildInvariantBlock = (invariants: InvariantRow[]): string => {
+  if (invariants.length === 0) {
+    return "";
+  }
+  const lines = ["INVARIANTS"];
+  for (let index = 0; index < invariants.length; index += 1) {
+    const invariant = invariants[index];
+    lines.push(`${index + 1}. [${invariant.id}] ${invariant.name}: ${invariant.ruleText}`);
+  }
+  return lines.join("\n");
+};
+
+const buildInvariantCheckRequestBody = (params: {
+  model: string;
+  invariants: InvariantRow[];
+  assistantResponse: string;
+}): Record<string, unknown> => {
+  const { model, invariants, assistantResponse } = params;
+  return {
+    model,
+    stream: false,
+    truncation: "disabled",
+    instructions: [
+      "Проверь ответ ассистента на нарушение инвариантов.",
+      "Верни строго один JSON-объект без markdown и пояснений.",
+      'Формат: {"violations":[{"invariantId":"","description":""}]}',
+      "Если нарушений нет, верни пустой массив violations.",
+      "В invariantId используй id из переданного списка инвариантов.",
+    ].join("\n"),
+    input: [
+      {
+        role: "user",
+        content: JSON.stringify(
+          {
+            invariants: invariants.map((invariant) => ({
+              id: invariant.id,
+              name: invariant.name,
+              ruleText: invariant.ruleText,
+            })),
+            answer: assistantResponse,
+          },
+          null,
+          2
+        ),
+      },
+    ],
+  };
+};
+
+const parseInvariantCheckOutput = (
+  value: string,
+  invariants: InvariantRow[]
+): InvariantViolation[] | null => {
+  const jsonText = extractJsonObject(value);
+  if (!jsonText) {
+    return null;
+  }
+
+  const parsed = parseJsonSafe(jsonText) as
+    | {
+        violations?: unknown;
+      }
+    | null;
+  if (!parsed || typeof parsed !== "object") {
+    return null;
+  }
+
+  if (!Array.isArray(parsed.violations)) {
+    return [];
+  }
+
+  const violations: InvariantViolation[] = [];
+  for (const item of parsed.violations) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const candidate = item as { invariantId?: unknown; invariant_id?: unknown; description?: unknown };
+    const rawId =
+      typeof candidate.invariantId === "string"
+        ? candidate.invariantId
+        : typeof candidate.invariant_id === "string"
+        ? candidate.invariant_id
+        : "";
+    const invariantId = rawId.trim();
+    if (!invariantId) {
+      continue;
+    }
+    const description = normalizeTextField(candidate.description, 320) || "Invariant violation detected.";
+    violations.push({
+      invariantId,
+      description,
+    });
+  }
+
+  const deduped: InvariantViolation[] = [];
+  const seen = new Set<string>();
+  for (const violation of violations) {
+    const key = `${violation.invariantId.toLowerCase()}::${violation.description.toLowerCase()}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push(violation);
+  }
+  return deduped;
+};
+
+const checkInvariantViolationsViaModel = async (params: {
+  model: string;
+  invariants: InvariantRow[];
+  assistantResponse: string;
+  signal: AbortSignal;
+}): Promise<InvariantViolation[]> => {
+  if (params.invariants.length === 0) {
+    return [];
+  }
+
+  const requestBody = buildInvariantCheckRequestBody(params);
+  const upstream = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    signal: params.signal,
+    body: JSON.stringify(requestBody),
+  });
+
+  if (!upstream.ok) {
+    const payloadText = await upstream.text();
+    throw new Error(`invariant checker failed (${upstream.status}): ${payloadText}`);
+  }
+
+  const responseText = await upstream.text();
+  const payload = parseJsonSafe(responseText) as
+    | {
+        output_text?: unknown;
+      }
+    | null;
+  if (!payload || typeof payload !== "object") {
+    throw new Error("invariant checker returned invalid JSON envelope");
+  }
+
+  const completedText =
+    extractCompletedText(payload) ||
+    (typeof payload.output_text === "string" ? payload.output_text : "");
+  const parsed = parseInvariantCheckOutput(completedText, params.invariants);
+  if (!parsed) {
+    throw new Error("invariant checker returned invalid JSON object");
+  }
+  return parsed;
+};
+
+const buildInvariantViolationMessage = (params: {
+  violations: InvariantViolation[];
+  rejectedResponse: string;
+  sourceModel: string;
+  createdAt: number;
+}): string => {
+  const payload = {
+    violations: params.violations,
+    rejectedResponse: params.rejectedResponse,
+    sourceModel: params.sourceModel,
+    createdAt: params.createdAt,
+  };
+  return [
+    "Ответ отклонен: обнаружены нарушения инвариантов.",
+    INVARIANT_VIOLATION_OPEN_TAG,
+    JSON.stringify(payload, null, 2),
+    INVARIANT_VIOLATION_CLOSE_TAG,
+  ].join("\n");
+};
+
 const mergeSystemPromptWithContext = (params: {
   stagePrompt: string;
   systemPrompt: string;
   profileBlock: string;
   taskBlock: string;
   memoryBlock: string;
+  invariantBlock?: string;
 }): string => {
-  const { stagePrompt, systemPrompt, profileBlock, taskBlock, memoryBlock } = params;
+  const { stagePrompt, systemPrompt, profileBlock, taskBlock, memoryBlock, invariantBlock } = params;
   const chunks = [
     stagePrompt.trim(),
     systemPrompt.trim(),
     profileBlock.trim(),
     taskBlock.trim(),
     memoryBlock.trim(),
+    invariantBlock?.trim() ?? "",
   ].filter(Boolean);
   return chunks.join("\n\n");
 };
@@ -1206,6 +1470,7 @@ const listMessagesForMemoryStmt = db.prepare(`
     content
   FROM messages
   WHERE chat_id = ?
+    AND content NOT LIKE '%[INVARIANT_VIOLATION_JSON]%'
   ORDER BY created_at ASC
 `);
 
@@ -1544,6 +1809,82 @@ const upsertMemorySettingsStmt = db.prepare(`
     updated_at = excluded.updated_at
 `);
 
+const getInvariantSettingsStmt = db.prepare(`
+  SELECT
+    scope_id AS scopeId,
+    enabled,
+    inject_in_system_prompt AS injectInSystemPrompt,
+    updated_at AS updatedAt
+  FROM invariant_settings
+  WHERE scope_id = ?
+`);
+
+const upsertInvariantSettingsStmt = db.prepare(`
+  INSERT INTO invariant_settings (
+    scope_id,
+    enabled,
+    inject_in_system_prompt,
+    updated_at
+  )
+  VALUES (?, ?, ?, ?)
+  ON CONFLICT(scope_id) DO UPDATE SET
+    enabled = excluded.enabled,
+    inject_in_system_prompt = excluded.inject_in_system_prompt,
+    updated_at = excluded.updated_at
+`);
+
+const listInvariantsStmt = db.prepare(`
+  SELECT
+    id,
+    name,
+    rule_text AS ruleText,
+    sort_order AS sortOrder,
+    created_at AS createdAt,
+    updated_at AS updatedAt
+  FROM invariants
+  ORDER BY sort_order ASC, created_at ASC
+`);
+
+const getInvariantByIdStmt = db.prepare(`
+  SELECT
+    id,
+    name,
+    rule_text AS ruleText,
+    sort_order AS sortOrder,
+    created_at AS createdAt,
+    updated_at AS updatedAt
+  FROM invariants
+  WHERE id = ?
+`);
+
+const getMaxInvariantSortOrderStmt = db.prepare(`
+  SELECT COALESCE(MAX(sort_order), 0) AS maxSortOrder
+  FROM invariants
+`);
+
+const insertInvariantStmt = db.prepare(`
+  INSERT INTO invariants (
+    id,
+    name,
+    rule_text,
+    sort_order,
+    created_at,
+    updated_at
+  )
+  VALUES (?, ?, ?, ?, ?, ?)
+`);
+
+const updateInvariantStmt = db.prepare(`
+  UPDATE invariants
+  SET name = ?, rule_text = ?, updated_at = ?
+  WHERE id = ?
+`);
+
+const deleteInvariantStmt = db.prepare(`
+  DELETE FROM invariants
+  WHERE id = ?
+`);
+
 const listPendingCandidatesByChatStmt = db.prepare(`
   SELECT
     id,
@@ -1796,6 +2137,28 @@ const getOrCreateMemorySettings = (): MemorySettingsRow => {
   return created;
 };
 
+const getOrCreateInvariantSettings = (): InvariantSettingsRow => {
+  const existing = getInvariantSettingsStmt.get(
+    GLOBAL_INVARIANT_SETTINGS_SCOPE_ID
+  ) as InvariantSettingsRow | undefined;
+  if (existing) {
+    return existing;
+  }
+  const created: InvariantSettingsRow = {
+    scopeId: GLOBAL_INVARIANT_SETTINGS_SCOPE_ID,
+    enabled: 1,
+    injectInSystemPrompt: 1,
+    updatedAt: Date.now(),
+  };
+  upsertInvariantSettingsStmt.run(
+    created.scopeId,
+    created.enabled,
+    created.injectInSystemPrompt,
+    created.updatedAt
+  );
+  return created;
+};
+
 const persistShortMemory = (memory: ShortTermMemoryRow): ShortTermMemoryRow => {
   upsertShortMemoryStmt.run(
     memory.chatId,
@@ -1909,6 +2272,26 @@ const persistMemorySettings = (
     shortTermEnabled: encodedShort,
     workingEnabled: encodedWorking,
     longTermEnabled: encodedLong,
+    updatedAt: now,
+  };
+};
+
+const persistInvariantSettings = (
+  settings: { enabled: boolean; injectInSystemPrompt: boolean },
+  now = Date.now()
+): InvariantSettingsRow => {
+  const encodedEnabled = settings.enabled ? 1 : 0;
+  const encodedInject = settings.injectInSystemPrompt ? 1 : 0;
+  upsertInvariantSettingsStmt.run(
+    GLOBAL_INVARIANT_SETTINGS_SCOPE_ID,
+    encodedEnabled,
+    encodedInject,
+    now
+  );
+  return {
+    scopeId: GLOBAL_INVARIANT_SETTINGS_SCOPE_ID,
+    enabled: encodedEnabled,
+    injectInSystemPrompt: encodedInject,
     updatedAt: now,
   };
 };
@@ -2253,6 +2636,141 @@ app.patch<{ Body: MemorySettingsPatchBody }>("/api/memory/settings", async (requ
     longTermEnabled: next.longTermEnabled === 1,
     updatedAt: next.updatedAt,
   };
+});
+
+app.get("/api/invariants", async () => {
+  const settings = getOrCreateInvariantSettings();
+  const invariants = listInvariantsStmt.all() as InvariantRow[];
+  return {
+    enabled: settings.enabled === 1,
+    injectInSystemPrompt: settings.injectInSystemPrompt === 1,
+    updatedAt: settings.updatedAt,
+    invariants,
+  };
+});
+
+app.patch<{ Body: InvariantSettingsPatchBody }>("/api/invariants/settings", async (request, reply) => {
+  const body = request.body ?? {};
+  const hasEnabled = body.enabled !== undefined;
+  const hasInjectInSystemPrompt = body.injectInSystemPrompt !== undefined;
+  if (!hasEnabled && !hasInjectInSystemPrompt) {
+    reply.code(400);
+    return { error: "At least one invariant setting field is required" };
+  }
+  if (hasEnabled && typeof body.enabled !== "boolean") {
+    reply.code(400);
+    return { error: "enabled must be boolean" };
+  }
+  if (hasInjectInSystemPrompt && typeof body.injectInSystemPrompt !== "boolean") {
+    reply.code(400);
+    return { error: "injectInSystemPrompt must be boolean" };
+  }
+
+  const current = getOrCreateInvariantSettings();
+  const next = persistInvariantSettings(
+    {
+      enabled: hasEnabled ? (body.enabled as boolean) : current.enabled === 1,
+      injectInSystemPrompt: hasInjectInSystemPrompt
+        ? (body.injectInSystemPrompt as boolean)
+        : current.injectInSystemPrompt === 1,
+    },
+    Date.now()
+  );
+
+  return {
+    enabled: next.enabled === 1,
+    injectInSystemPrompt: next.injectInSystemPrompt === 1,
+    updatedAt: next.updatedAt,
+  };
+});
+
+app.post<{ Body: CreateInvariantBody }>("/api/invariants", async (request, reply) => {
+  const name = parseInvariantName(request.body?.name);
+  const ruleText = normalizeInvariantRule(request.body?.ruleText);
+  if (!name) {
+    reply.code(400);
+    return { error: `name is required and must be 1-${INVARIANT_NAME_MAX_LENGTH} characters` };
+  }
+  if (!ruleText) {
+    reply.code(400);
+    return { error: `ruleText is required and must be 1-${INVARIANT_RULE_MAX_LENGTH} characters` };
+  }
+
+  const now = Date.now();
+  const invariantId = createId();
+  const row = getMaxInvariantSortOrderStmt.get() as { maxSortOrder?: number } | undefined;
+  const nextSortOrder = Number.isFinite(row?.maxSortOrder) ? Number(row?.maxSortOrder) + 1 : 1;
+  insertInvariantStmt.run(invariantId, name, ruleText, nextSortOrder, now, now);
+
+  const invariant = getInvariantByIdStmt.get(invariantId) as InvariantRow | undefined;
+  if (!invariant) {
+    reply.code(500);
+    return { error: "failed to create invariant" };
+  }
+  return { invariant };
+});
+
+app.patch<{ Params: { id: string }; Body: PatchInvariantBody }>(
+  "/api/invariants/:id",
+  async (request, reply) => {
+    const invariantId = request.params.id;
+    const existing = getInvariantByIdStmt.get(invariantId) as InvariantRow | undefined;
+    if (!existing) {
+      reply.code(404);
+      return { error: "invariant not found" };
+    }
+
+    const next: InvariantRow = {
+      ...existing,
+      updatedAt: Date.now(),
+    };
+    let hasChanges = false;
+
+    if (request.body?.name !== undefined) {
+      const name = parseInvariantName(request.body.name);
+      if (!name) {
+        reply.code(400);
+        return { error: `name must be 1-${INVARIANT_NAME_MAX_LENGTH} characters` };
+      }
+      next.name = name;
+      hasChanges = true;
+    }
+
+    if (request.body?.ruleText !== undefined) {
+      const ruleText = normalizeInvariantRule(request.body.ruleText);
+      if (!ruleText) {
+        reply.code(400);
+        return { error: `ruleText must be 1-${INVARIANT_RULE_MAX_LENGTH} characters` };
+      }
+      next.ruleText = ruleText;
+      hasChanges = true;
+    }
+
+    if (!hasChanges) {
+      reply.code(400);
+      return { error: "At least one invariant field is required" };
+    }
+
+    updateInvariantStmt.run(next.name, next.ruleText, next.updatedAt, invariantId);
+    const updated = getInvariantByIdStmt.get(invariantId) as InvariantRow | undefined;
+    if (!updated) {
+      reply.code(500);
+      return { error: "failed to update invariant" };
+    }
+    return { invariant: updated };
+  }
+);
+
+app.delete<{ Params: { id: string } }>("/api/invariants/:id", async (request, reply) => {
+  const invariantId = request.params.id;
+  const existing = getInvariantByIdStmt.get(invariantId) as InvariantRow | undefined;
+  if (!existing) {
+    reply.code(404);
+    return { error: "invariant not found" };
+  }
+
+  deleteInvariantStmt.run(invariantId);
+  return { ok: true };
 });
 
 app.get("/api/chats", async () => {
@@ -2979,6 +3497,14 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
   const taskBlock = buildTaskStateBlock(taskState);
   const stagePrompt = buildTaskStagePrompt(taskState.state);
   const draftDiagnostics = deriveDraftDiagnosticsFromTask(taskState);
+  const invariantSettings = getOrCreateInvariantSettings();
+  const invariants = listInvariantsStmt.all() as InvariantRow[];
+  const invariantsEnabled = invariantSettings.enabled === 1;
+  const injectInSystemPrompt = invariantSettings.injectInSystemPrompt === 1;
+  const activeInvariants = invariantsEnabled ? invariants : [];
+  const shouldCheckInvariants = activeInvariants.length > 0;
+  const invariantBlock =
+    injectInSystemPrompt && shouldCheckInvariants ? buildInvariantBlock(activeInvariants) : "";
 
   reply.raw.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -3004,6 +3530,9 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
     shortTermEnabled,
     workingEnabled,
     longTermEnabled,
+    invariantsEnabled,
+    injectInSystemPrompt,
+    invariantCount: activeInvariants.length,
     updater: memoryUpdaterDiagnostics,
   });
 
@@ -3016,6 +3545,7 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
         profileBlock,
         taskBlock,
         memoryBlock,
+        invariantBlock,
       }),
       inputMessages: persistedMessagesRaw,
       reasoningEffort,
@@ -3049,7 +3579,7 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
     const reader = upstream.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
-    let hasSentDelta = false;
+    let hasReceivedDelta = false;
     let assistantText = "";
     let finalDebugResponse: Record<string, unknown> | null = null;
     let finalUsage: UsageSummary | null = null;
@@ -3105,9 +3635,11 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
         }
 
         if (eventType === "response.output_text.delta" && typeof payload.delta === "string") {
-          hasSentDelta = true;
+          hasReceivedDelta = true;
           assistantText += payload.delta;
-          sendSse("delta", { text: payload.delta });
+          if (!shouldCheckInvariants) {
+            sendSse("delta", { text: payload.delta });
+          }
           continue;
         }
 
@@ -3128,9 +3660,11 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
             estimateCostBreakdownUsd(finalModel, finalUsage) ??
             estimateCostBreakdownUsd(model, finalUsage);
 
-          if (!hasSentDelta && finalText) {
+          if (!hasReceivedDelta && finalText) {
             assistantText = finalText;
-            sendSse("delta", { text: finalText });
+            if (!shouldCheckInvariants) {
+              sendSse("delta", { text: finalText });
+            }
           }
 
           finalDebugResponse = extractFinalDebug(payload.response);
@@ -3138,8 +3672,92 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
             body: finalDebugResponse,
           });
 
-          const assistantMessageId = createId();
           const finishedAt = Date.now();
+          let invariantViolations: InvariantViolation[] = [];
+          if (shouldCheckInvariants) {
+            try {
+              invariantViolations = await checkInvariantViolationsViaModel({
+                model: finalModel,
+                invariants: activeInvariants,
+                assistantResponse: assistantText,
+                signal: abortController.signal,
+              });
+            } catch (error) {
+              const formatted = formatUpstreamError(error);
+              app.log.warn(
+                { err: error, chatId, model: finalModel },
+                "failed to run invariant checker, response is blocked"
+              );
+              invariantViolations = [
+                {
+                  invariantId: "invariant_check_failed",
+                  description: `Invariant checker failed: ${formatted.message}`,
+                },
+              ];
+            }
+          }
+
+          if (shouldCheckInvariants && invariantViolations.length > 0) {
+            const assistantMessageId = createId();
+            const violationMessage = buildInvariantViolationMessage({
+              violations: invariantViolations,
+              rejectedResponse: assistantText,
+              sourceModel: finalModel,
+              createdAt: finishedAt,
+            });
+            insertMessageStmt.run(
+              assistantMessageId,
+              chatId,
+              "assistant",
+              violationMessage,
+              JSON.stringify(openaiRequestBody),
+              JSON.stringify({
+                final: finalDebugResponse,
+                invariantViolations,
+              }),
+              finishedAt - startedAt,
+              finalUsage?.inputTokens ?? null,
+              finalUsage?.outputTokens ?? null,
+              finalUsage?.totalTokens ?? null,
+              finalCost?.totalCostUsd ?? null,
+              finalCost?.inputCostUsd ?? null,
+              finalCost?.outputCostUsd ?? null,
+              finishedAt
+            );
+            updateChatUpdatedAtStmt.run(finishedAt, chatId);
+
+            taskState = persistTaskState(
+              chatId,
+              clearTaskDraftArtifact({
+                ...taskState,
+                updatedAt: finishedAt,
+              })
+            );
+
+            sendSse("done", {
+              reason: "invariant_violation",
+              violations: invariantViolations,
+              task: taskState,
+              taskDraftStatus: "missing" as TaskArtifactDraftStatus,
+              taskDraftError: "Assistant response violated invariants.",
+              metrics: {
+                model: finalModel,
+                latencyMs: finishedAt - startedAt,
+                usage: finalUsage,
+                costUsd: finalCost?.totalCostUsd ?? null,
+                inputCostUsd: finalCost?.inputCostUsd ?? null,
+                outputCostUsd: finalCost?.outputCostUsd ?? null,
+              },
+            });
+            reply.raw.end();
+            return;
+          }
+
+          if (shouldCheckInvariants && assistantText) {
+            sendSse("delta", { text: assistantText });
+          }
+
+          const assistantMessageId = createId();
           insertMessageStmt.run(
             assistantMessageId,
             chatId,
@@ -3226,7 +3844,7 @@ app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", as
       isContextOverflow: false,
     });
 
-    if (assistantText) {
+    if (assistantText && !shouldCheckInvariants) {
       const finishedAt = Date.now();
       insertMessageStmt.run(
         createId(),
