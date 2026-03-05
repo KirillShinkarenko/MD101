@@ -15,6 +15,11 @@
   - `Short-term memory` - при выключении short-term не обновляется и не подмешивается в prompt
   - `Working memory` - при выключении working не обновляется, не подмешивается в prompt и недоступно ручное редактирование
   - `Long-term memory` - при выключении long-term не подмешивается в prompt и не генерирует новые кандидаты
+- инварианты ответа (`Invariants`):
+  - CRUD-управление списком правил в отдельной вкладке инспектора
+  - глобальные настройки: `enabled`, `injectInSystemPrompt`
+  - при нарушении инвариантов ответ блокируется и помечается как отклоненный
+  - кнопка `Regenerate` формирует авто-промпт на перегенерацию с учетом найденных нарушений
 - трёхслойная память:
   - `Short-term` (пер-чат): накопительное саммари диалога (`rolling summary`)
   - `Working` (пер-чат): `goal`, `constraints`, `status`, `next_steps` с ручным редактированием
@@ -29,9 +34,10 @@
   - `Conversation total`
   - `Growth by turns`
 - инспектор справа:
-  - вкладки `Request` / `Response` / `Memory`
+  - вкладки `Task` / `Request` / `Response` / `Memory` / `Invariants`
   - просмотр и редактирование memory snapshot
   - `Effective memory block` (какой блок памяти реально был подмешан в `systemPrompt`)
+  - управление инвариантами и их глобальными настройками
   - полноэкранный просмотр JSON
 
 ## Архитектура
@@ -50,6 +56,10 @@
   - отдельный вызов memory-updater модели обновляет только включенные слои (`short-term`, `working`) и формирует кандидаты в `long-term` только если long-term включен
   - из snapshot строится `memory block`
   - `memory block` добавляется в `systemPrompt` основного запроса только для включенных слоев памяти
+- invariant pipeline на backend:
+  - если `invariants.enabled=true` и список инвариантов не пустой, backend запускает пост-проверку финального ответа отдельным вызовом модели
+  - при `injectInSystemPrompt=true` активные инварианты также подмешиваются в `systemPrompt`
+  - если найдены нарушения, в чат пишется служебное сообщение с JSON-блоком нарушений, а стрим завершается с `reason: invariant_violation`
 
 ## Хранение данных
 
@@ -65,6 +75,9 @@
   - `profile_settings`
 - таблица настроек памяти:
   - `memory_settings`
+- таблицы инвариантов:
+  - `invariant_settings`
+  - `invariants`
 
 ## Переменные окружения
 
@@ -136,6 +149,11 @@ npm run dev
 - `PUT /api/profiles/active` - выбрать активный профиль (`profileId` или `null`)
 - `GET /api/memory/settings` - получить глобальные настройки памяти (`shortTermEnabled`, `workingEnabled`, `longTermEnabled`, `updatedAt`)
 - `PATCH /api/memory/settings` - обновить глобальные настройки памяти (partial: `shortTermEnabled?`, `workingEnabled?`, `longTermEnabled?`)
+- `GET /api/invariants` - получить список инвариантов и глобальные настройки (`enabled`, `injectInSystemPrompt`, `updatedAt`, `invariants[]`)
+- `PATCH /api/invariants/settings` - обновить настройки инвариантов (partial: `enabled?`, `injectInSystemPrompt?`)
+- `POST /api/invariants` - создать инвариант (`name`, `ruleText`)
+- `PATCH /api/invariants/:id` - обновить инвариант (`name?`, `ruleText?`)
+- `DELETE /api/invariants/:id` - удалить инвариант
 - `POST /api/chats` - создать чат
   - опциональные поля: `title`, `model`, `systemPrompt`
 - `GET /api/chats/:id/messages` - история сообщений
@@ -172,7 +190,15 @@ SSE-события stream endpoint:
 - `error`
 
 `debug_response_final` содержит usage (`input/output/total tokens`) и оценку стоимости (`input/output/total cost usd`) для поддерживаемых моделей.
-`debug_memory` также содержит `task` (текущее состояние FSM), `taskBlock`, `stagePrompt`, `taskDraftStatus` (`valid|invalid|missing`) и `taskDraftError`.
+`debug_memory` также содержит `task` (текущее состояние FSM), `taskBlock`, `stagePrompt`, `taskDraftStatus` (`valid|invalid|missing`), `taskDraftError`, а также поля по инвариантам: `invariantsEnabled`, `injectInSystemPrompt`, `invariantCount`.
+
+Если ответ отклонен из-за инвариантов, stream завершается `done` с `reason: invariant_violation`, а в сообщение ассистента сохраняется блок:
+
+```text
+[INVARIANT_VIOLATION_JSON]
+{"violations":[{"invariantId":"...","description":"..."}], ...}
+[/INVARIANT_VIOLATION_JSON]
+```
 
 ### Строгий stage-артефакт в ответе агента
 
