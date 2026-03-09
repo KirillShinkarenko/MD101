@@ -1,4 +1,4 @@
-import Fastify from "fastify";
+import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import cors from "@fastify/cors";
 import dotenv from "dotenv";
 import { DatabaseSync } from "node:sqlite";
@@ -43,6 +43,15 @@ type TaskCommandBody = {
   artifactText?: string;
   plan?: string[];
   reason?: string;
+};
+
+type ApprovePlanStreamBody = {
+  artifactText?: string;
+  plan?: string[];
+  model?: string;
+  reasoningEffort?: string;
+  systemPrompt?: string;
+  memoryModel?: string;
 };
 
 type CreateChatBody = {
@@ -118,6 +127,19 @@ type CostBreakdownUsd = {
   inputCostUsd: number;
   outputCostUsd: number;
   totalCostUsd: number;
+};
+
+type ChatRowRecord = {
+  id: string;
+  title: string;
+  model: string;
+  systemPrompt: string;
+  memoryStrategy: string;
+  slidingWindowSize: number;
+  stickyWindowSize: number;
+  branchFromChatId: string | null;
+  branchFromChatTitle: string | null;
+  branchCheckpointMessageCount: number | null;
 };
 
 type ModelApiProfile = {
@@ -1390,12 +1412,12 @@ const mergeSystemPromptWithContext = (params: {
 }): string => {
   const { stagePrompt, systemPrompt, profileBlock, taskBlock, memoryBlock, invariantBlock } = params;
   const chunks = [
-    stagePrompt.trim(),
     systemPrompt.trim(),
     profileBlock.trim(),
     taskBlock.trim(),
     memoryBlock.trim(),
     invariantBlock?.trim() ?? "",
+    stagePrompt.trim(),
   ].filter(Boolean);
   return chunks.join("\n\n");
 };
@@ -2431,6 +2453,756 @@ const createChat = (params?: {
   return getChatStmt.get(id);
 };
 
+const buildTaskExecutionAutoPrompt = (task: TaskContext): string =>
+  `Продолжай задачу на этапе ${task.state} (шаг ${task.step}/${task.total}). Выполни следующее ожидаемое действие и верни обновлённый артефакт этого шага.`;
+
+const resolveApprovePlanPayload = (params: {
+  chatId: string;
+  currentTask: TaskContext;
+  plan?: string[];
+  artifactText?: string;
+}): { plan?: string[]; artifactText?: string } => {
+  let resolvedPlan = params.plan;
+  let resolvedArtifactText = params.artifactText;
+  if (
+    (resolvedPlan === undefined || resolvedPlan.length === 0) &&
+    (!params.artifactText || !params.artifactText.trim()) &&
+    params.currentTask.draftArtifactSourceMessageId &&
+    params.currentTask.draftArtifactState === params.currentTask.state &&
+    params.currentTask.draftArtifactStep === params.currentTask.step
+  ) {
+    const sourceMessage = getMessageByIdForChatStmt.get(
+      params.currentTask.draftArtifactSourceMessageId,
+      params.chatId
+    ) as { content?: string } | undefined;
+    if (typeof sourceMessage?.content === "string") {
+      const parsedDraft = extractTaskArtifactEnvelope(sourceMessage.content, params.currentTask);
+      if (parsedDraft.status === "valid" && parsedDraft.plan.length > 0) {
+        resolvedPlan = parsedDraft.plan;
+        resolvedArtifactText = params.currentTask.draftArtifactText || parsedDraft.artifactText;
+      }
+    }
+  }
+  return {
+    plan: resolvedPlan,
+    artifactText: resolvedArtifactText,
+  };
+};
+
+type ResolvedStreamParams = {
+  model: string;
+  systemPrompt: string;
+  reasoningEffort: ReasoningEffort | undefined;
+  memoryModel: string;
+};
+
+const resolveStreamParams = (params: {
+  model?: string;
+  reasoningEffort?: string;
+  memoryModel?: string;
+  systemPrompt?: string;
+  existingChat: ChatRowRecord;
+}):
+  | { ok: true; value: ResolvedStreamParams }
+  | { ok: false; status: 400; error: string } => {
+  const requestedModelRaw = params.model;
+  const requestedModel = parseAllowedModel(requestedModelRaw);
+  if (requestedModelRaw !== undefined && requestedModel === undefined) {
+    return { ok: false, status: 400, error: MODEL_VALIDATION_ERROR };
+  }
+
+  const model = requestedModel ?? params.existingChat.model;
+  if (!ALLOWED_MODELS.has(model)) {
+    return { ok: false, status: 400, error: MODEL_VALIDATION_ERROR };
+  }
+
+  const requestedReasoningEffortRaw = params.reasoningEffort;
+  const reasoningEffort = parseReasoningEffort(requestedReasoningEffortRaw);
+  if (requestedReasoningEffortRaw !== undefined && reasoningEffort === undefined) {
+    return {
+      ok: false,
+      status: 400,
+      error: "reasoningEffort must be one of: none, minimal, low, medium, high, xhigh",
+    };
+  }
+
+  const modelProfile = MODEL_API_PROFILES[model];
+  if (reasoningEffort !== undefined && !modelProfile.reasoningEfforts.includes(reasoningEffort)) {
+    return {
+      ok: false,
+      status: 400,
+      error: `reasoningEffort for ${model} must be one of: ${modelProfile.reasoningEfforts.join(", ")}`,
+    };
+  }
+
+  const memoryModelRaw = params.memoryModel;
+  const parsedMemoryModel = parseAllowedModel(memoryModelRaw);
+  if (memoryModelRaw !== undefined && parsedMemoryModel === undefined) {
+    return { ok: false, status: 400, error: MODEL_VALIDATION_ERROR };
+  }
+
+  return {
+    ok: true,
+    value: {
+      model,
+      systemPrompt:
+        typeof params.systemPrompt === "string" ? params.systemPrompt : params.existingChat.systemPrompt,
+      reasoningEffort,
+      memoryModel: parsedMemoryModel ?? EFFECTIVE_DEFAULT_MEMORY_MODEL,
+    },
+  };
+};
+
+type StreamExecutionMode =
+  | {
+      kind: "chat";
+      userPrompt: string;
+    }
+  | {
+      kind: "task_auto";
+      userPrompt: string;
+    };
+
+type StreamPipelineParams = {
+  chatId: string;
+  existingChat: ChatRowRecord;
+  request: Pick<FastifyRequest, "raw">;
+  reply: FastifyReply;
+  streamParams: ResolvedStreamParams;
+  mode: StreamExecutionMode;
+};
+
+type StreamPipelineEarlyResult = {
+  status: number;
+  payload: Record<string, unknown>;
+};
+
+const runChatStreamPipeline = async (
+  params: StreamPipelineParams
+): Promise<StreamPipelineEarlyResult | null> => {
+  const { chatId, existingChat, request, reply, streamParams, mode } = params;
+  let taskState = getOrCreateTaskState(chatId, existingChat.title);
+  if (taskState.paused) {
+    return {
+      status: 409,
+      payload: {
+        error: "task is paused",
+        task: taskState,
+      },
+    };
+  }
+
+  if (!OPENAI_API_KEY) {
+    return {
+      status: 500,
+      payload: { error: "OPENAI_API_KEY is not configured" },
+    };
+  }
+
+  const userPrompt = mode.userPrompt.trim();
+  if (!userPrompt) {
+    return {
+      status: 400,
+      payload: { error: "userPrompt is required" },
+    };
+  }
+
+  const abortController = new AbortController();
+  request.raw.on("aborted", () => {
+    abortController.abort();
+  });
+  reply.raw.on("close", () => {
+    if (!reply.raw.writableEnded) {
+      abortController.abort();
+    }
+  });
+  reply.raw.on("error", () => {
+    abortController.abort();
+  });
+
+  const startedAt = Date.now();
+  const now = Date.now();
+
+  updateChatStmt.run(
+    existingChat.title,
+    streamParams.model,
+    streamParams.systemPrompt,
+    existingChat.memoryStrategy,
+    existingChat.slidingWindowSize,
+    existingChat.stickyWindowSize,
+    existingChat.branchFromChatId ?? null,
+    existingChat.branchFromChatTitle ?? null,
+    existingChat.branchCheckpointMessageCount ?? null,
+    now,
+    chatId
+  );
+
+  if (mode.kind === "chat") {
+    const effectiveTitle =
+      existingChat.title === "New chat" ? userPrompt.slice(0, 42).trim() || "New chat" : existingChat.title;
+    if (effectiveTitle !== existingChat.title) {
+      updateChatStmt.run(
+        effectiveTitle,
+        streamParams.model,
+        streamParams.systemPrompt,
+        existingChat.memoryStrategy,
+        existingChat.slidingWindowSize,
+        existingChat.stickyWindowSize,
+        existingChat.branchFromChatId ?? null,
+        existingChat.branchFromChatTitle ?? null,
+        existingChat.branchCheckpointMessageCount ?? null,
+        now,
+        chatId
+      );
+    }
+
+    const userMessageId = createId();
+    insertMessageStmt.run(
+      userMessageId,
+      chatId,
+      "user",
+      userPrompt,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      now
+    );
+    updateChatUpdatedAtStmt.run(now, chatId);
+  }
+
+  const persistedMessagesRaw = listMessagesForMemoryStmt.all(chatId) as Array<{ role: Role; content: string }>;
+
+  let shortTerm = getOrCreateShortMemory(chatId);
+  let working = getOrCreateWorkingMemory(chatId);
+  let longTerm = getOrCreateLongTermMemory();
+  const memorySettings = getOrCreateMemorySettings();
+  const shortTermEnabled = memorySettings.shortTermEnabled === 1;
+  const workingEnabled = memorySettings.workingEnabled === 1;
+  const longTermEnabled = memorySettings.longTermEnabled === 1;
+
+  const shouldRunMemoryUpdater = mode.kind === "chat" && (shortTermEnabled || workingEnabled || longTermEnabled);
+  let memoryUpdaterDiagnostics: { status: "ok" | "error"; message?: string } = { status: "ok" };
+
+  if (shouldRunMemoryUpdater) {
+    const fromIndex = Math.min(
+      Math.max(shortTerm.lastProcessedMessageCount, 0),
+      persistedMessagesRaw.length
+    );
+    const newMessagesForUpdater = persistedMessagesRaw.slice(fromIndex);
+    try {
+      const updaterOutput = await updateMemoryViaModel({
+        memoryModel: streamParams.memoryModel,
+        previousSummary: shortTermEnabled ? shortTerm.rollingSummary : "",
+        working: {
+          goal: workingEnabled ? working.goal : "",
+          constraints: workingEnabled ? working.constraints : "",
+          status: workingEnabled ? working.status : "",
+          nextSteps: workingEnabled ? working.nextSteps : "",
+        },
+        longTerm: {
+          profile: longTermEnabled ? longTerm.profile : "",
+          preferences: longTermEnabled ? longTerm.preferences : "",
+          decisions: longTermEnabled ? longTerm.decisions : "",
+          knowledge: longTermEnabled ? longTerm.knowledge : "",
+        },
+        newMessages: newMessagesForUpdater,
+        latestUserPrompt: userPrompt,
+        shortTermEnabled,
+        workingEnabled,
+        longTermEnabled,
+        signal: abortController.signal,
+      });
+
+      const memoryUpdatedAt = Date.now();
+      if (shortTermEnabled) {
+        shortTerm = persistShortMemory({
+          ...shortTerm,
+          rollingSummary: updaterOutput.shortTerm.rollingSummary,
+          lastProcessedMessageCount: persistedMessagesRaw.length,
+          updatedAt: memoryUpdatedAt,
+        });
+      }
+
+      if (workingEnabled) {
+        working = persistWorkingMemory(
+          applyAutoWorkingUpdate(working, updaterOutput.working, memoryUpdatedAt)
+        );
+      }
+
+      if (longTermEnabled) {
+        insertPendingCandidates(chatId, updaterOutput.longTermCandidates, memoryUpdatedAt);
+      }
+    } catch (error) {
+      const formatted = formatUpstreamError(error);
+      memoryUpdaterDiagnostics = {
+        status: "error",
+        message: formatted.message,
+      };
+      app.log.warn(
+        { err: error, chatId, memoryModel: streamParams.memoryModel },
+        "failed to update memory layers, using previous snapshot"
+      );
+    }
+  }
+
+  if (!shortTermEnabled && shortTerm.lastProcessedMessageCount !== persistedMessagesRaw.length) {
+    shortTerm = persistShortMemory({
+      ...shortTerm,
+      lastProcessedMessageCount: persistedMessagesRaw.length,
+      updatedAt: Date.now(),
+    });
+  }
+
+  const pendingCandidates = listPendingCandidatesByChatStmt.all(chatId) as LongTermCandidateRow[];
+  const memorySnapshot = toSnapshot(shortTerm, working, longTerm, pendingCandidates);
+  const memoryBlock = buildMemoryBlock({
+    shortTerm: { rollingSummary: shortTerm.rollingSummary },
+    working: {
+      goal: working.goal,
+      constraints: working.constraints,
+      status: working.status,
+      nextSteps: working.nextSteps,
+    },
+    longTerm: {
+      profile: longTerm.profile,
+      preferences: longTerm.preferences,
+      decisions: longTerm.decisions,
+      knowledge: longTerm.knowledge,
+    },
+    shortTermEnabled,
+    workingEnabled,
+    longTermEnabled,
+  });
+  const profileSettings = getOrCreateProfileSettings();
+  const activeProfile = profileSettings.activeProfileId
+    ? ((getProfileByIdStmt.get(profileSettings.activeProfileId) as UserProfileRow | undefined) ?? null)
+    : null;
+  const activeProfileId = activeProfile?.id ?? null;
+  const profileBlock = buildProfileBlock(activeProfile);
+  const taskBlock = buildTaskStateBlock(taskState);
+  const stagePrompt = buildTaskStagePrompt(taskState.state);
+  const draftDiagnostics = deriveDraftDiagnosticsFromTask(taskState);
+  const invariantSettings = getOrCreateInvariantSettings();
+  const invariants = listInvariantsStmt.all() as InvariantRow[];
+  const invariantsEnabled = invariantSettings.enabled === 1;
+  const injectInSystemPrompt = invariantSettings.injectInSystemPrompt === 1;
+  const activeInvariants = invariantsEnabled ? invariants : [];
+  const shouldCheckInvariants = activeInvariants.length > 0;
+  const invariantBlock =
+    injectInSystemPrompt && shouldCheckInvariants ? buildInvariantBlock(activeInvariants) : "";
+
+  reply.raw.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+  });
+
+  const sendSse = (event: string, data: unknown): void => {
+    reply.raw.write(`event: ${event}\n`);
+    reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
+  sendSse("debug_memory", {
+    snapshot: memorySnapshot,
+    memoryBlock,
+    profileBlock,
+    task: taskState,
+    taskBlock,
+    stagePrompt,
+    taskDraftStatus: draftDiagnostics.taskDraftStatus,
+    taskDraftError: draftDiagnostics.taskDraftError,
+    activeProfileId,
+    shortTermEnabled,
+    workingEnabled,
+    longTermEnabled,
+    invariantsEnabled,
+    injectInSystemPrompt,
+    invariantCount: activeInvariants.length,
+    updater: memoryUpdaterDiagnostics,
+  });
+
+  try {
+    const inputMessagesForModel: Array<{ role: Role; content: string }> =
+      mode.kind === "chat"
+        ? persistedMessagesRaw
+        : [...persistedMessagesRaw, { role: "user", content: userPrompt }];
+    const openaiRequestBody = buildOpenAiRequestBody({
+      model: streamParams.model,
+      systemPrompt: mergeSystemPromptWithContext({
+        stagePrompt,
+        systemPrompt: streamParams.systemPrompt,
+        profileBlock,
+        taskBlock,
+        memoryBlock,
+        invariantBlock,
+      }),
+      inputMessages: inputMessagesForModel,
+      reasoningEffort: streamParams.reasoningEffort,
+    });
+    const modelProfile = MODEL_API_PROFILES[streamParams.model];
+
+    sendSse("debug_request", {
+      target: "openai.responses.create",
+      modelProfile,
+      body: openaiRequestBody,
+    });
+
+    const upstream = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      signal: abortController.signal,
+      body: JSON.stringify(openaiRequestBody),
+    });
+
+    if (!upstream.ok || !upstream.body) {
+      const payloadText = await upstream.text();
+      const payload = parseJsonSafe(payloadText) as { error?: unknown } | null;
+      const fallbackMessage = `OpenAI error (${upstream.status}): ${payloadText}`;
+      sendSse("error", buildOpenAiErrorPayload(payload?.error ?? payload, fallbackMessage, upstream.status));
+      reply.raw.end();
+      return null;
+    }
+
+    const reader = upstream.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let hasReceivedDelta = false;
+    let assistantText = "";
+    let finalDebugResponse: Record<string, unknown> | null = null;
+    let finalUsage: UsageSummary | null = null;
+    let finalModel = streamParams.model;
+    let finalCost: CostBreakdownUsd | null = null;
+    let lastUpstreamEventType: string | null = null;
+    let lastUpstreamPayload: Record<string, unknown> | null = null;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+
+      buffer += decoder.decode(value, { stream: true }).replace(/\r/g, "");
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop() ?? "";
+
+      for (const block of parts) {
+        const lines = block.split("\n").map((line) => line.trim());
+        let upstreamEvent = "";
+        const dataLines: string[] = [];
+
+        for (const line of lines) {
+          if (line.startsWith("event:")) {
+            upstreamEvent = line.slice(6).trim();
+          }
+          if (line.startsWith("data:")) {
+            dataLines.push(line.slice(5).trim());
+          }
+        }
+
+        if (dataLines.length === 0) {
+          continue;
+        }
+
+        const data = dataLines.join("\n");
+        if (data === "[DONE]") {
+          continue;
+        }
+
+        let payload: any;
+        try {
+          payload = JSON.parse(data);
+        } catch {
+          continue;
+        }
+
+        const eventType = upstreamEvent || payload.type;
+        lastUpstreamEventType = typeof eventType === "string" ? eventType : null;
+        if (eventType !== "response.output_text.delta" && payload && typeof payload === "object") {
+          lastUpstreamPayload = payload as Record<string, unknown>;
+        }
+
+        if (eventType === "response.output_text.delta" && typeof payload.delta === "string") {
+          hasReceivedDelta = true;
+          assistantText += payload.delta;
+          if (!shouldCheckInvariants) {
+            sendSse("delta", { text: payload.delta });
+          }
+          continue;
+        }
+
+        if (eventType === "response.error") {
+          sendSse(
+            "error",
+            buildOpenAiErrorPayload(payload.error, payload.error?.message ?? "Unknown response error")
+          );
+          reply.raw.end();
+          return null;
+        }
+
+        if (eventType === "response.completed") {
+          const finalText = extractCompletedText(payload.response);
+          finalModel = typeof payload.response?.model === "string" ? payload.response.model : streamParams.model;
+          finalUsage = extractUsageSummary(payload.response?.usage);
+          finalCost =
+            estimateCostBreakdownUsd(finalModel, finalUsage) ??
+            estimateCostBreakdownUsd(streamParams.model, finalUsage);
+
+          if (!hasReceivedDelta && finalText) {
+            assistantText = finalText;
+            if (!shouldCheckInvariants) {
+              sendSse("delta", { text: finalText });
+            }
+          }
+
+          finalDebugResponse = extractFinalDebug(payload.response);
+          sendSse("debug_response_final", {
+            body: finalDebugResponse,
+          });
+
+          const finishedAt = Date.now();
+          let invariantViolations: InvariantViolation[] = [];
+          if (shouldCheckInvariants) {
+            try {
+              invariantViolations = await checkInvariantViolationsViaModel({
+                model: finalModel,
+                invariants: activeInvariants,
+                assistantResponse: assistantText,
+                signal: abortController.signal,
+              });
+            } catch (error) {
+              const formatted = formatUpstreamError(error);
+              app.log.warn(
+                { err: error, chatId, model: finalModel },
+                "failed to run invariant checker, response is blocked"
+              );
+              invariantViolations = [
+                {
+                  invariantId: "invariant_check_failed",
+                  description: `Invariant checker failed: ${formatted.message}`,
+                },
+              ];
+            }
+          }
+
+          if (shouldCheckInvariants && invariantViolations.length > 0) {
+            const assistantMessageId = createId();
+            const violationMessage = buildInvariantViolationMessage({
+              violations: invariantViolations,
+              rejectedResponse: assistantText,
+              sourceModel: finalModel,
+              createdAt: finishedAt,
+            });
+            insertMessageStmt.run(
+              assistantMessageId,
+              chatId,
+              "assistant",
+              violationMessage,
+              JSON.stringify(openaiRequestBody),
+              JSON.stringify({
+                final: finalDebugResponse,
+                invariantViolations,
+              }),
+              finishedAt - startedAt,
+              finalUsage?.inputTokens ?? null,
+              finalUsage?.outputTokens ?? null,
+              finalUsage?.totalTokens ?? null,
+              finalCost?.totalCostUsd ?? null,
+              finalCost?.inputCostUsd ?? null,
+              finalCost?.outputCostUsd ?? null,
+              finishedAt
+            );
+            updateChatUpdatedAtStmt.run(finishedAt, chatId);
+
+            taskState = persistTaskState(
+              chatId,
+              clearTaskDraftArtifact({
+                ...taskState,
+                updatedAt: finishedAt,
+              })
+            );
+
+            sendSse("done", {
+              reason: "invariant_violation",
+              violations: invariantViolations,
+              task: taskState,
+              taskDraftStatus: "missing" as TaskArtifactDraftStatus,
+              taskDraftError: "Assistant response violated invariants.",
+              metrics: {
+                model: finalModel,
+                latencyMs: finishedAt - startedAt,
+                usage: finalUsage,
+                costUsd: finalCost?.totalCostUsd ?? null,
+                inputCostUsd: finalCost?.inputCostUsd ?? null,
+                outputCostUsd: finalCost?.outputCostUsd ?? null,
+              },
+            });
+            reply.raw.end();
+            return null;
+          }
+
+          if (shouldCheckInvariants && assistantText) {
+            sendSse("delta", { text: assistantText });
+          }
+
+          const assistantMessageId = createId();
+          insertMessageStmt.run(
+            assistantMessageId,
+            chatId,
+            "assistant",
+            assistantText,
+            JSON.stringify(openaiRequestBody),
+            JSON.stringify(finalDebugResponse),
+            finishedAt - startedAt,
+            finalUsage?.inputTokens ?? null,
+            finalUsage?.outputTokens ?? null,
+            finalUsage?.totalTokens ?? null,
+            finalCost?.totalCostUsd ?? null,
+            finalCost?.inputCostUsd ?? null,
+            finalCost?.outputCostUsd ?? null,
+            finishedAt
+          );
+          updateChatUpdatedAtStmt.run(finishedAt, chatId);
+          const parsedDraft = extractTaskArtifactEnvelope(assistantText, taskState);
+          let doneTaskDraftStatus: TaskArtifactDraftStatus = parsedDraft.status;
+          let doneTaskDraftError: string | undefined = parsedDraft.error;
+
+          if (parsedDraft.status === "valid") {
+            taskState = persistTaskState(
+              chatId,
+              setTaskDraftArtifact(
+                {
+                  ...taskState,
+                  updatedAt: finishedAt,
+                },
+                {
+                  artifactText: parsedDraft.artifactText,
+                  artifactState: parsedDraft.artifactState as TaskContext["state"],
+                  artifactStep: parsedDraft.artifactStep,
+                  artifactUpdatedAt: finishedAt,
+                  sourceMessageId: assistantMessageId,
+                }
+              )
+            );
+            doneTaskDraftStatus = "valid";
+            doneTaskDraftError = undefined;
+          } else {
+            taskState = persistTaskState(
+              chatId,
+              clearTaskDraftArtifact({
+                ...taskState,
+                updatedAt: finishedAt,
+              })
+            );
+          }
+
+          sendSse("done", {
+            reason: payload.response?.status ?? "completed",
+            task: taskState,
+            taskDraftStatus: doneTaskDraftStatus,
+            taskDraftError: doneTaskDraftError,
+            metrics: {
+              model: finalModel,
+              latencyMs: finishedAt - startedAt,
+              usage: finalUsage,
+              costUsd: finalCost?.totalCostUsd ?? null,
+              inputCostUsd: finalCost?.inputCostUsd ?? null,
+              outputCostUsd: finalCost?.outputCostUsd ?? null,
+            },
+          });
+          reply.raw.end();
+          return null;
+        }
+      }
+    }
+
+    const fallbackInputTokens = null;
+    const fallbackOutputTokens = null;
+    const fallbackTotalTokens = null;
+    const fallbackTotalCostUsd = null;
+    const fallbackInputCostUsd = null;
+    const fallbackOutputCostUsd = null;
+
+    sendSse("error", {
+      message: "OpenAI stream closed before response.completed",
+      code: "upstream_stream_closed",
+      type: "upstream_stream_closed",
+      upstreamLastEventType: lastUpstreamEventType,
+      upstreamLastPayload: lastUpstreamPayload,
+      isContextOverflow: false,
+    });
+
+    if (assistantText && !shouldCheckInvariants) {
+      const finishedAt = Date.now();
+      insertMessageStmt.run(
+        createId(),
+        chatId,
+        "assistant",
+        assistantText,
+        null,
+        finalDebugResponse ? JSON.stringify(finalDebugResponse) : null,
+        finishedAt - startedAt,
+        fallbackInputTokens,
+        fallbackOutputTokens,
+        fallbackTotalTokens,
+        fallbackTotalCostUsd,
+        fallbackInputCostUsd,
+        fallbackOutputCostUsd,
+        finishedAt
+      );
+      updateChatUpdatedAtStmt.run(finishedAt, chatId);
+    }
+
+    sendSse("done", {
+      reason: "stream_closed",
+      diagnostics: {
+        upstreamLastEventType: lastUpstreamEventType,
+        upstreamLastPayload: lastUpstreamPayload,
+      },
+      metrics: {
+        model: streamParams.model,
+        latencyMs: Date.now() - startedAt,
+        usage: finalUsage,
+        costUsd: fallbackTotalCostUsd,
+        inputCostUsd: fallbackInputCostUsd,
+        outputCostUsd: fallbackOutputCostUsd,
+      },
+    });
+    reply.raw.end();
+  } catch (error) {
+    if (abortController.signal.aborted) {
+      sendSse("done", {
+        reason: "aborted",
+        metrics: {
+          model: streamParams.model,
+          latencyMs: Date.now() - startedAt,
+          usage: null,
+          costUsd: null,
+          inputCostUsd: null,
+          outputCostUsd: null,
+        },
+      });
+      reply.raw.end();
+      return null;
+    }
+
+    const formattedError = formatUpstreamError(error);
+    app.log.error({ err: error, ...formattedError }, "OpenAI upstream request failed");
+    sendSse("error", formattedError);
+    reply.raw.end();
+  }
+
+  return null;
+};
+
 app.get("/health", async () => ({ ok: true }));
 
 app.get("/api/profiles", async () => {
@@ -2862,25 +3634,15 @@ app.post<{ Params: { id: string }; Body: TaskCommandBody }>(
     const currentTask = getOrCreateTaskState(chatId, chat.title);
     let resolvedPlan = body.plan;
     let resolvedArtifactText = body.artifactText;
-    if (
-      body.command === "approve_plan" &&
-      (resolvedPlan === undefined || resolvedPlan.length === 0) &&
-      (!body.artifactText || !body.artifactText.trim()) &&
-      currentTask.draftArtifactSourceMessageId &&
-      currentTask.draftArtifactState === currentTask.state &&
-      currentTask.draftArtifactStep === currentTask.step
-    ) {
-      const sourceMessage = getMessageByIdForChatStmt.get(
-        currentTask.draftArtifactSourceMessageId,
-        chatId
-      ) as { content?: string } | undefined;
-      if (typeof sourceMessage?.content === "string") {
-        const parsedDraft = extractTaskArtifactEnvelope(sourceMessage.content, currentTask);
-        if (parsedDraft.status === "valid" && parsedDraft.plan.length > 0) {
-          resolvedPlan = parsedDraft.plan;
-          resolvedArtifactText = currentTask.draftArtifactText || parsedDraft.artifactText;
-        }
-      }
+    if (body.command === "approve_plan") {
+      const resolved = resolveApprovePlanPayload({
+        chatId,
+        currentTask,
+        plan: body.plan,
+        artifactText: body.artifactText,
+      });
+      resolvedPlan = resolved.plan;
+      resolvedArtifactText = resolved.artifactText;
     }
 
     const result = applyTaskCommand(
@@ -3242,667 +4004,130 @@ app.post<{ Params: { id: string } }>("/api/chats/:id/branch", async (request, re
   return { chat: getChatStmt.get(createdChatId) };
 });
 
+app.post<{ Params: { id: string }; Body: ApprovePlanStreamBody }>(
+  "/api/chats/:id/task-state/approve-plan/stream",
+  async (request, reply) => {
+    const chatId = request.params.id;
+    const existingChat = getChatStmt.get(chatId) as ChatRowRecord | undefined;
+    if (!existingChat) {
+      reply.code(404);
+      return { error: "chat not found" };
+    }
+
+    const body = request.body ?? {};
+    if (body.artifactText !== undefined && typeof body.artifactText !== "string") {
+      reply.code(400);
+      return { error: "artifactText must be a string" };
+    }
+    if (
+      body.plan !== undefined &&
+      (!Array.isArray(body.plan) || body.plan.some((item) => typeof item !== "string"))
+    ) {
+      reply.code(400);
+      return { error: "plan must be an array of strings" };
+    }
+
+    const streamParamsResult = resolveStreamParams({
+      model: body.model,
+      reasoningEffort: body.reasoningEffort,
+      memoryModel: body.memoryModel,
+      systemPrompt: body.systemPrompt,
+      existingChat,
+    });
+    if (!streamParamsResult.ok) {
+      reply.code(streamParamsResult.status);
+      return { error: streamParamsResult.error };
+    }
+    if (!OPENAI_API_KEY) {
+      reply.code(500);
+      return { error: "OPENAI_API_KEY is not configured" };
+    }
+
+    const currentTask = getOrCreateTaskState(chatId, existingChat.title);
+    const approveInputs = resolveApprovePlanPayload({
+      chatId,
+      currentTask,
+      plan: body.plan,
+      artifactText: body.artifactText,
+    });
+    const approveResult = applyTaskCommand(
+      currentTask,
+      {
+        command: "approve_plan",
+        artifactText: approveInputs.artifactText,
+        plan: approveInputs.plan,
+      },
+      Date.now()
+    );
+
+    if (!approveResult.ok) {
+      reply.code(approveResult.status);
+      return { error: approveResult.error, task: currentTask };
+    }
+
+    const approvedTask = persistTaskState(chatId, approveResult.task);
+    const autoPrompt = buildTaskExecutionAutoPrompt(approvedTask);
+    const streamStart = await runChatStreamPipeline({
+      chatId,
+      existingChat,
+      request,
+      reply,
+      streamParams: streamParamsResult.value,
+      mode: {
+        kind: "task_auto",
+        userPrompt: autoPrompt,
+      },
+    });
+    if (streamStart) {
+      reply.code(streamStart.status);
+      return streamStart.payload;
+    }
+    return;
+  }
+);
+
 app.post<{ Params: { id: string }; Body: ChatBody }>("/api/chats/:id/stream", async (request, reply) => {
   const chatId = request.params.id;
-  const existingChat = getChatStmt.get(chatId) as
-    | {
-        id: string;
-        title: string;
-        model: string;
-        systemPrompt: string;
-        memoryStrategy: string;
-        slidingWindowSize: number;
-        stickyWindowSize: number;
-        branchFromChatId: string | null;
-        branchFromChatTitle: string | null;
-        branchCheckpointMessageCount: number | null;
-      }
-    | undefined;
-
+  const existingChat = getChatStmt.get(chatId) as ChatRowRecord | undefined;
   if (!existingChat) {
     reply.code(404);
     return { error: "chat not found" };
   }
-  let taskState = getOrCreateTaskState(chatId, existingChat.title);
-  if (taskState.paused) {
-    reply.code(409);
-    return {
-      error: "task is paused",
-      task: taskState,
-    };
-  }
 
-  if (!OPENAI_API_KEY) {
-    reply.code(500);
-    return { error: "OPENAI_API_KEY is not configured" };
-  }
-
-  const userPrompt = request.body?.userPrompt?.trim() ?? "";
-  const requestedModelRaw = request.body?.model;
-  const requestedModel = parseAllowedModel(requestedModelRaw);
-  if (requestedModelRaw !== undefined && requestedModel === undefined) {
-    reply.code(400);
-    return { error: MODEL_VALIDATION_ERROR };
-  }
-
-  const model = requestedModel ?? existingChat.model;
-  if (!ALLOWED_MODELS.has(model)) {
-    reply.code(400);
-    return { error: MODEL_VALIDATION_ERROR };
-  }
-
-  const requestedReasoningEffortRaw = request.body?.reasoningEffort;
-  const reasoningEffort = parseReasoningEffort(requestedReasoningEffortRaw);
-  if (requestedReasoningEffortRaw !== undefined && reasoningEffort === undefined) {
-    reply.code(400);
-    return { error: "reasoningEffort must be one of: none, minimal, low, medium, high, xhigh" };
-  }
-
-  const modelProfile = MODEL_API_PROFILES[model];
-  if (reasoningEffort !== undefined && !modelProfile.reasoningEfforts.includes(reasoningEffort)) {
-    reply.code(400);
-    return {
-      error: `reasoningEffort for ${model} must be one of: ${modelProfile.reasoningEfforts.join(", ")}`,
-    };
-  }
-
-  const memoryModelRaw = request.body?.memoryModel;
-  const memoryModel = parseAllowedModel(memoryModelRaw) ?? EFFECTIVE_DEFAULT_MEMORY_MODEL;
-  if (memoryModelRaw !== undefined && parseAllowedModel(memoryModelRaw) === undefined) {
-    reply.code(400);
-    return { error: MODEL_VALIDATION_ERROR };
-  }
-
-  const systemPrompt =
-    typeof request.body?.systemPrompt === "string" ? request.body.systemPrompt : existingChat.systemPrompt;
-
+  const userPrompt = typeof request.body?.userPrompt === "string" ? request.body.userPrompt.trim() : "";
   if (!userPrompt) {
     reply.code(400);
     return { error: "userPrompt is required" };
   }
 
-  const abortController = new AbortController();
-  request.raw.on("aborted", () => {
-    abortController.abort();
+  const streamParamsResult = resolveStreamParams({
+    model: request.body?.model,
+    reasoningEffort: request.body?.reasoningEffort,
+    memoryModel: request.body?.memoryModel,
+    systemPrompt: request.body?.systemPrompt,
+    existingChat,
   });
-  reply.raw.on("close", () => {
-    if (!reply.raw.writableEnded) {
-      abortController.abort();
-    }
-  });
-  reply.raw.on("error", () => {
-    abortController.abort();
-  });
-
-  const startedAt = Date.now();
-  const now = Date.now();
-
-  updateChatStmt.run(
-    existingChat.title,
-    model,
-    systemPrompt,
-    existingChat.memoryStrategy,
-    existingChat.slidingWindowSize,
-    existingChat.stickyWindowSize,
-    existingChat.branchFromChatId ?? null,
-    existingChat.branchFromChatTitle ?? null,
-    existingChat.branchCheckpointMessageCount ?? null,
-    now,
-    chatId
-  );
-
-  const effectiveTitle = existingChat.title === "New chat" ? userPrompt.slice(0, 42).trim() || "New chat" : existingChat.title;
-  if (effectiveTitle !== existingChat.title) {
-    updateChatStmt.run(
-      effectiveTitle,
-      model,
-      systemPrompt,
-      existingChat.memoryStrategy,
-      existingChat.slidingWindowSize,
-      existingChat.stickyWindowSize,
-      existingChat.branchFromChatId ?? null,
-      existingChat.branchFromChatTitle ?? null,
-      existingChat.branchCheckpointMessageCount ?? null,
-      now,
-      chatId
-    );
+  if (!streamParamsResult.ok) {
+    reply.code(streamParamsResult.status);
+    return { error: streamParamsResult.error };
   }
 
-  const userMessageId = createId();
-  insertMessageStmt.run(
-    userMessageId,
+  const streamStart = await runChatStreamPipeline({
     chatId,
-    "user",
-    userPrompt,
-    null,
-    null,
-    null,
-    null,
-    null,
-    null,
-    null,
-    null,
-    null,
-    now
-  );
-  updateChatUpdatedAtStmt.run(now, chatId);
-
-  const persistedMessagesRaw = listMessagesForMemoryStmt.all(chatId) as Array<{ role: Role; content: string }>;
-
-  let shortTerm = getOrCreateShortMemory(chatId);
-  let working = getOrCreateWorkingMemory(chatId);
-  let longTerm = getOrCreateLongTermMemory();
-  const memorySettings = getOrCreateMemorySettings();
-  const shortTermEnabled = memorySettings.shortTermEnabled === 1;
-  const workingEnabled = memorySettings.workingEnabled === 1;
-  const longTermEnabled = memorySettings.longTermEnabled === 1;
-
-  const fromIndex = Math.min(
-    Math.max(shortTerm.lastProcessedMessageCount, 0),
-    persistedMessagesRaw.length
-  );
-  const newMessagesForUpdater = persistedMessagesRaw.slice(fromIndex);
-  const shouldRunMemoryUpdater = shortTermEnabled || workingEnabled || longTermEnabled;
-
-  let memoryUpdaterDiagnostics: { status: "ok" | "error"; message?: string } = { status: "ok" };
-
-  if (shouldRunMemoryUpdater) {
-    try {
-      const updaterOutput = await updateMemoryViaModel({
-        memoryModel,
-        previousSummary: shortTermEnabled ? shortTerm.rollingSummary : "",
-        working: {
-          goal: workingEnabled ? working.goal : "",
-          constraints: workingEnabled ? working.constraints : "",
-          status: workingEnabled ? working.status : "",
-          nextSteps: workingEnabled ? working.nextSteps : "",
-        },
-        longTerm: {
-          profile: longTermEnabled ? longTerm.profile : "",
-          preferences: longTermEnabled ? longTerm.preferences : "",
-          decisions: longTermEnabled ? longTerm.decisions : "",
-          knowledge: longTermEnabled ? longTerm.knowledge : "",
-        },
-        newMessages: newMessagesForUpdater,
-        latestUserPrompt: userPrompt,
-        shortTermEnabled,
-        workingEnabled,
-        longTermEnabled,
-        signal: abortController.signal,
-      });
-
-      const memoryUpdatedAt = Date.now();
-      if (shortTermEnabled) {
-        shortTerm = persistShortMemory({
-          ...shortTerm,
-          rollingSummary: updaterOutput.shortTerm.rollingSummary,
-          lastProcessedMessageCount: persistedMessagesRaw.length,
-          updatedAt: memoryUpdatedAt,
-        });
-      }
-
-      if (workingEnabled) {
-        working = persistWorkingMemory(
-          applyAutoWorkingUpdate(working, updaterOutput.working, memoryUpdatedAt)
-        );
-      }
-
-      if (longTermEnabled) {
-        insertPendingCandidates(chatId, updaterOutput.longTermCandidates, memoryUpdatedAt);
-      }
-    } catch (error) {
-      const formatted = formatUpstreamError(error);
-      memoryUpdaterDiagnostics = {
-        status: "error",
-        message: formatted.message,
-      };
-      app.log.warn({ err: error, chatId, memoryModel }, "failed to update memory layers, using previous snapshot");
-    }
-  }
-
-  if (!shortTermEnabled && shortTerm.lastProcessedMessageCount !== persistedMessagesRaw.length) {
-    shortTerm = persistShortMemory({
-      ...shortTerm,
-      lastProcessedMessageCount: persistedMessagesRaw.length,
-      updatedAt: Date.now(),
-    });
-  }
-
-  const pendingCandidates = listPendingCandidatesByChatStmt.all(chatId) as LongTermCandidateRow[];
-  const memorySnapshot = toSnapshot(shortTerm, working, longTerm, pendingCandidates);
-  const memoryBlock = buildMemoryBlock({
-    shortTerm: { rollingSummary: shortTerm.rollingSummary },
-    working: {
-      goal: working.goal,
-      constraints: working.constraints,
-      status: working.status,
-      nextSteps: working.nextSteps,
+    existingChat,
+    request,
+    reply,
+    streamParams: streamParamsResult.value,
+    mode: {
+      kind: "chat",
+      userPrompt,
     },
-    longTerm: {
-      profile: longTerm.profile,
-      preferences: longTerm.preferences,
-      decisions: longTerm.decisions,
-      knowledge: longTerm.knowledge,
-    },
-    shortTermEnabled,
-    workingEnabled,
-    longTermEnabled,
   });
-  const profileSettings = getOrCreateProfileSettings();
-  const activeProfile = profileSettings.activeProfileId
-    ? ((getProfileByIdStmt.get(profileSettings.activeProfileId) as UserProfileRow | undefined) ?? null)
-    : null;
-  const activeProfileId = activeProfile?.id ?? null;
-  const profileBlock = buildProfileBlock(activeProfile);
-  const taskBlock = buildTaskStateBlock(taskState);
-  const stagePrompt = buildTaskStagePrompt(taskState.state);
-  const draftDiagnostics = deriveDraftDiagnosticsFromTask(taskState);
-  const invariantSettings = getOrCreateInvariantSettings();
-  const invariants = listInvariantsStmt.all() as InvariantRow[];
-  const invariantsEnabled = invariantSettings.enabled === 1;
-  const injectInSystemPrompt = invariantSettings.injectInSystemPrompt === 1;
-  const activeInvariants = invariantsEnabled ? invariants : [];
-  const shouldCheckInvariants = activeInvariants.length > 0;
-  const invariantBlock =
-    injectInSystemPrompt && shouldCheckInvariants ? buildInvariantBlock(activeInvariants) : "";
-
-  reply.raw.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache, no-transform",
-    Connection: "keep-alive",
-  });
-
-  const sendSse = (event: string, data: unknown): void => {
-    reply.raw.write(`event: ${event}\n`);
-    reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
-  };
-
-  sendSse("debug_memory", {
-    snapshot: memorySnapshot,
-    memoryBlock,
-    profileBlock,
-    task: taskState,
-    taskBlock,
-    stagePrompt,
-    taskDraftStatus: draftDiagnostics.taskDraftStatus,
-    taskDraftError: draftDiagnostics.taskDraftError,
-    activeProfileId,
-    shortTermEnabled,
-    workingEnabled,
-    longTermEnabled,
-    invariantsEnabled,
-    injectInSystemPrompt,
-    invariantCount: activeInvariants.length,
-    updater: memoryUpdaterDiagnostics,
-  });
-
-  try {
-    const openaiRequestBody = buildOpenAiRequestBody({
-      model,
-      systemPrompt: mergeSystemPromptWithContext({
-        stagePrompt,
-        systemPrompt,
-        profileBlock,
-        taskBlock,
-        memoryBlock,
-        invariantBlock,
-      }),
-      inputMessages: persistedMessagesRaw,
-      reasoningEffort,
-    });
-
-    sendSse("debug_request", {
-      target: "openai.responses.create",
-      modelProfile,
-      body: openaiRequestBody,
-    });
-
-    const upstream = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      signal: abortController.signal,
-      body: JSON.stringify(openaiRequestBody),
-    });
-
-    if (!upstream.ok || !upstream.body) {
-      const payloadText = await upstream.text();
-      const payload = parseJsonSafe(payloadText) as { error?: unknown } | null;
-      const fallbackMessage = `OpenAI error (${upstream.status}): ${payloadText}`;
-      sendSse("error", buildOpenAiErrorPayload(payload?.error ?? payload, fallbackMessage, upstream.status));
-      reply.raw.end();
-      return;
-    }
-
-    const reader = upstream.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    let hasReceivedDelta = false;
-    let assistantText = "";
-    let finalDebugResponse: Record<string, unknown> | null = null;
-    let finalUsage: UsageSummary | null = null;
-    let finalModel = model;
-    let finalCost: CostBreakdownUsd | null = null;
-    let lastUpstreamEventType: string | null = null;
-    let lastUpstreamPayload: Record<string, unknown> | null = null;
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
-      }
-
-      buffer += decoder.decode(value, { stream: true }).replace(/\r/g, "");
-      const parts = buffer.split("\n\n");
-      buffer = parts.pop() ?? "";
-
-      for (const block of parts) {
-        const lines = block.split("\n").map((line) => line.trim());
-        let upstreamEvent = "";
-        const dataLines: string[] = [];
-
-        for (const line of lines) {
-          if (line.startsWith("event:")) {
-            upstreamEvent = line.slice(6).trim();
-          }
-          if (line.startsWith("data:")) {
-            dataLines.push(line.slice(5).trim());
-          }
-        }
-
-        if (dataLines.length === 0) {
-          continue;
-        }
-
-        const data = dataLines.join("\n");
-        if (data === "[DONE]") {
-          continue;
-        }
-
-        let payload: any;
-        try {
-          payload = JSON.parse(data);
-        } catch {
-          continue;
-        }
-
-        const eventType = upstreamEvent || payload.type;
-        lastUpstreamEventType = typeof eventType === "string" ? eventType : null;
-        if (eventType !== "response.output_text.delta" && payload && typeof payload === "object") {
-          lastUpstreamPayload = payload as Record<string, unknown>;
-        }
-
-        if (eventType === "response.output_text.delta" && typeof payload.delta === "string") {
-          hasReceivedDelta = true;
-          assistantText += payload.delta;
-          if (!shouldCheckInvariants) {
-            sendSse("delta", { text: payload.delta });
-          }
-          continue;
-        }
-
-        if (eventType === "response.error") {
-          sendSse(
-            "error",
-            buildOpenAiErrorPayload(payload.error, payload.error?.message ?? "Unknown response error")
-          );
-          reply.raw.end();
-          return;
-        }
-
-        if (eventType === "response.completed") {
-          const finalText = extractCompletedText(payload.response);
-          finalModel = typeof payload.response?.model === "string" ? payload.response.model : model;
-          finalUsage = extractUsageSummary(payload.response?.usage);
-          finalCost =
-            estimateCostBreakdownUsd(finalModel, finalUsage) ??
-            estimateCostBreakdownUsd(model, finalUsage);
-
-          if (!hasReceivedDelta && finalText) {
-            assistantText = finalText;
-            if (!shouldCheckInvariants) {
-              sendSse("delta", { text: finalText });
-            }
-          }
-
-          finalDebugResponse = extractFinalDebug(payload.response);
-          sendSse("debug_response_final", {
-            body: finalDebugResponse,
-          });
-
-          const finishedAt = Date.now();
-          let invariantViolations: InvariantViolation[] = [];
-          if (shouldCheckInvariants) {
-            try {
-              invariantViolations = await checkInvariantViolationsViaModel({
-                model: finalModel,
-                invariants: activeInvariants,
-                assistantResponse: assistantText,
-                signal: abortController.signal,
-              });
-            } catch (error) {
-              const formatted = formatUpstreamError(error);
-              app.log.warn(
-                { err: error, chatId, model: finalModel },
-                "failed to run invariant checker, response is blocked"
-              );
-              invariantViolations = [
-                {
-                  invariantId: "invariant_check_failed",
-                  description: `Invariant checker failed: ${formatted.message}`,
-                },
-              ];
-            }
-          }
-
-          if (shouldCheckInvariants && invariantViolations.length > 0) {
-            const assistantMessageId = createId();
-            const violationMessage = buildInvariantViolationMessage({
-              violations: invariantViolations,
-              rejectedResponse: assistantText,
-              sourceModel: finalModel,
-              createdAt: finishedAt,
-            });
-            insertMessageStmt.run(
-              assistantMessageId,
-              chatId,
-              "assistant",
-              violationMessage,
-              JSON.stringify(openaiRequestBody),
-              JSON.stringify({
-                final: finalDebugResponse,
-                invariantViolations,
-              }),
-              finishedAt - startedAt,
-              finalUsage?.inputTokens ?? null,
-              finalUsage?.outputTokens ?? null,
-              finalUsage?.totalTokens ?? null,
-              finalCost?.totalCostUsd ?? null,
-              finalCost?.inputCostUsd ?? null,
-              finalCost?.outputCostUsd ?? null,
-              finishedAt
-            );
-            updateChatUpdatedAtStmt.run(finishedAt, chatId);
-
-            taskState = persistTaskState(
-              chatId,
-              clearTaskDraftArtifact({
-                ...taskState,
-                updatedAt: finishedAt,
-              })
-            );
-
-            sendSse("done", {
-              reason: "invariant_violation",
-              violations: invariantViolations,
-              task: taskState,
-              taskDraftStatus: "missing" as TaskArtifactDraftStatus,
-              taskDraftError: "Assistant response violated invariants.",
-              metrics: {
-                model: finalModel,
-                latencyMs: finishedAt - startedAt,
-                usage: finalUsage,
-                costUsd: finalCost?.totalCostUsd ?? null,
-                inputCostUsd: finalCost?.inputCostUsd ?? null,
-                outputCostUsd: finalCost?.outputCostUsd ?? null,
-              },
-            });
-            reply.raw.end();
-            return;
-          }
-
-          if (shouldCheckInvariants && assistantText) {
-            sendSse("delta", { text: assistantText });
-          }
-
-          const assistantMessageId = createId();
-          insertMessageStmt.run(
-            assistantMessageId,
-            chatId,
-            "assistant",
-            assistantText,
-            JSON.stringify(openaiRequestBody),
-            JSON.stringify(finalDebugResponse),
-            finishedAt - startedAt,
-            finalUsage?.inputTokens ?? null,
-            finalUsage?.outputTokens ?? null,
-            finalUsage?.totalTokens ?? null,
-            finalCost?.totalCostUsd ?? null,
-            finalCost?.inputCostUsd ?? null,
-            finalCost?.outputCostUsd ?? null,
-            finishedAt
-          );
-          updateChatUpdatedAtStmt.run(finishedAt, chatId);
-          const parsedDraft = extractTaskArtifactEnvelope(assistantText, taskState);
-          let doneTaskDraftStatus: TaskArtifactDraftStatus = parsedDraft.status;
-          let doneTaskDraftError: string | undefined = parsedDraft.error;
-
-          if (parsedDraft.status === "valid") {
-            taskState = persistTaskState(
-              chatId,
-              setTaskDraftArtifact(
-                {
-                  ...taskState,
-                  updatedAt: finishedAt,
-                },
-                {
-                  artifactText: parsedDraft.artifactText,
-                  artifactState: parsedDraft.artifactState as TaskContext["state"],
-                  artifactStep: parsedDraft.artifactStep,
-                  artifactUpdatedAt: finishedAt,
-                  sourceMessageId: assistantMessageId,
-                }
-              )
-            );
-            doneTaskDraftStatus = "valid";
-            doneTaskDraftError = undefined;
-          } else {
-            taskState = persistTaskState(
-              chatId,
-              clearTaskDraftArtifact({
-                ...taskState,
-                updatedAt: finishedAt,
-              })
-            );
-          }
-
-          sendSse("done", {
-            reason: payload.response?.status ?? "completed",
-            task: taskState,
-            taskDraftStatus: doneTaskDraftStatus,
-            taskDraftError: doneTaskDraftError,
-            metrics: {
-              model: finalModel,
-              latencyMs: finishedAt - startedAt,
-              usage: finalUsage,
-              costUsd: finalCost?.totalCostUsd ?? null,
-              inputCostUsd: finalCost?.inputCostUsd ?? null,
-              outputCostUsd: finalCost?.outputCostUsd ?? null,
-            },
-          });
-          reply.raw.end();
-          return;
-        }
-      }
-    }
-
-    const fallbackInputTokens = null;
-    const fallbackOutputTokens = null;
-    const fallbackTotalTokens = null;
-    const fallbackTotalCostUsd = null;
-    const fallbackInputCostUsd = null;
-    const fallbackOutputCostUsd = null;
-
-    sendSse("error", {
-      message: "OpenAI stream closed before response.completed",
-      code: "upstream_stream_closed",
-      type: "upstream_stream_closed",
-      upstreamLastEventType: lastUpstreamEventType,
-      upstreamLastPayload: lastUpstreamPayload,
-      isContextOverflow: false,
-    });
-
-    if (assistantText && !shouldCheckInvariants) {
-      const finishedAt = Date.now();
-      insertMessageStmt.run(
-        createId(),
-        chatId,
-        "assistant",
-        assistantText,
-        null,
-        finalDebugResponse ? JSON.stringify(finalDebugResponse) : null,
-        finishedAt - startedAt,
-        fallbackInputTokens,
-        fallbackOutputTokens,
-        fallbackTotalTokens,
-        fallbackTotalCostUsd,
-        fallbackInputCostUsd,
-        fallbackOutputCostUsd,
-        finishedAt
-      );
-      updateChatUpdatedAtStmt.run(finishedAt, chatId);
-    }
-
-    sendSse("done", {
-      reason: "stream_closed",
-      diagnostics: {
-        upstreamLastEventType: lastUpstreamEventType,
-        upstreamLastPayload: lastUpstreamPayload,
-      },
-      metrics: {
-        model,
-        latencyMs: Date.now() - startedAt,
-        usage: finalUsage,
-        costUsd: fallbackTotalCostUsd,
-        inputCostUsd: fallbackInputCostUsd,
-        outputCostUsd: fallbackOutputCostUsd,
-      },
-    });
-    reply.raw.end();
-  } catch (error) {
-    if (abortController.signal.aborted) {
-      sendSse("done", {
-        reason: "aborted",
-        metrics: {
-          model,
-          latencyMs: Date.now() - startedAt,
-          usage: null,
-          costUsd: null,
-          inputCostUsd: null,
-          outputCostUsd: null,
-        },
-      });
-      reply.raw.end();
-      return;
-    }
-
-    const formattedError = formatUpstreamError(error);
-    app.log.error({ err: error, ...formattedError }, "OpenAI upstream request failed");
-    sendSse("error", formattedError);
-    reply.raw.end();
+  if (streamStart) {
+    reply.code(streamStart.status);
+    return streamStart.payload;
   }
+  return;
 });
 
 const port = Number(process.env.PORT ?? 8787);

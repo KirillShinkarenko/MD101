@@ -138,6 +138,46 @@ test("task command endpoint transitions and stream returns 409 when paused", { s
   assert.equal(stream.payload.task.paused, true);
 });
 
+test("task command endpoint accepts complete_execution and moves to validation", { skip: !RUN_API_TESTS }, async () => {
+  const created = await requestJson<{ chat: { id: string } }>("/api/chats", {
+    method: "POST",
+    body: {},
+  });
+  assert.equal(created.status, 200);
+  const chatId = created.payload.chat.id;
+
+  const approved = await requestJson<{ task: { state: string; expectedAction: string } }>(
+    `/api/chats/${chatId}/task-state/command`,
+    {
+      method: "POST",
+      body: {
+        command: "approve_plan",
+        plan: ["step one", "step two", "step three"],
+      },
+    }
+  );
+  assert.equal(approved.status, 200);
+  assert.equal(approved.payload.task.state, "execution");
+  assert.equal(approved.payload.task.expectedAction, "complete_execution");
+
+  const completed = await requestJson<{ task: { state: string; step: number; total: number; done: string[] } }>(
+    `/api/chats/${chatId}/task-state/command`,
+    {
+      method: "POST",
+      body: {
+        command: "complete_execution",
+        artifactText: "Execution complete in one pass",
+      },
+    }
+  );
+
+  assert.equal(completed.status, 200);
+  assert.equal(completed.payload.task.state, "validation");
+  assert.equal(completed.payload.task.step, 3);
+  assert.equal(completed.payload.task.total, 3);
+  assert.deepEqual(completed.payload.task.done, ["step one", "step two", "step three"]);
+});
+
 test("task command returns 422 when approve_plan has no draft, no artifact and no plan", { skip: !RUN_API_TESTS }, async () => {
   const created = await requestJson<{ chat: { id: string } }>("/api/chats", {
     method: "POST",
@@ -154,6 +194,54 @@ test("task command returns 422 when approve_plan has no draft, no artifact and n
 
   assert.equal(approve.status, 422);
   assert.match(approve.payload.error, /artifact|plan/i);
+});
+
+test("approve-plan stream endpoint returns 422 when plan cannot be resolved", { skip: !RUN_API_TESTS }, async () => {
+  const created = await requestJson<{ chat: { id: string } }>("/api/chats", {
+    method: "POST",
+    body: {},
+  });
+  assert.equal(created.status, 200);
+
+  const approve = await requestJson<{ error: string }>(
+    `/api/chats/${created.payload.chat.id}/task-state/approve-plan/stream`,
+    {
+      method: "POST",
+      body: {},
+    }
+  );
+
+  assert.equal(approve.status, 422);
+  assert.match(approve.payload.error, /artifact|plan/i);
+});
+
+test("approve-plan stream endpoint returns 409 when task is not in planning", { skip: !RUN_API_TESTS }, async () => {
+  const created = await requestJson<{ chat: { id: string } }>("/api/chats", {
+    method: "POST",
+    body: {},
+  });
+  assert.equal(created.status, 200);
+  const chatId = created.payload.chat.id;
+
+  const approved = await requestJson<{ task: { state: string } }>(`/api/chats/${chatId}/task-state/command`, {
+    method: "POST",
+    body: {
+      command: "approve_plan",
+      plan: ["step one"],
+    },
+  });
+  assert.equal(approved.status, 200);
+  assert.equal(approved.payload.task.state, "execution");
+
+  const approveAgain = await requestJson<{ error: string }>(`/api/chats/${chatId}/task-state/approve-plan/stream`, {
+    method: "POST",
+    body: {
+      plan: ["step one"],
+    },
+  });
+
+  assert.equal(approveAgain.status, 409);
+  assert.match(approveAgain.payload.error, /not allowed/i);
 });
 
 test("invariants settings endpoint supports enabled + injectInSystemPrompt toggles", { skip: !RUN_API_TESTS }, async () => {

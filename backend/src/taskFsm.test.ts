@@ -29,18 +29,79 @@ test("approve_plan moves planning -> execution with step 1", () => {
   assert.equal(next.step, 1);
   assert.equal(next.total, 2);
   assert.equal(next.current, "JWT module");
-  assert.equal(next.expectedAction, "complete_step");
+  assert.equal(next.expectedAction, "complete_execution");
 });
 
-test("complete_step increments execution step and then enters validation", () => {
+test("complete_execution completes remaining plan and enters validation", () => {
   const planned = mustOk(
     applyTaskCommand(
       createDefaultTaskContext("FSM"),
       {
         command: "approve_plan",
-        plan: ["step A", "step B"],
+        plan: ["step A", "step B", "step C"],
       },
       2000
+    )
+  );
+
+  const afterExecution = mustOk(
+    applyTaskCommand(
+      planned,
+      {
+        command: "complete_execution",
+        artifactText: "All execution work completed",
+      },
+      2020
+    )
+  );
+  assert.equal(afterExecution.state, "validation");
+  assert.equal(afterExecution.step, 3);
+  assert.deepEqual(afterExecution.done, ["step A", "step B", "step C"]);
+  assert.equal(afterExecution.expectedAction, "approve_validation");
+});
+
+test("complete_execution from mid-progress marks only remaining steps as done", () => {
+  const execution = normalizeTaskContext({
+    task: "Mid-progress",
+    state: "execution",
+    step: 2,
+    total: 3,
+    plan: ["step A", "step B", "step C"],
+    done: ["step A"],
+    current: "step B",
+    paused: false,
+    pausedAt: null,
+    pausedReason: "",
+    artifacts: [],
+    updatedAt: 2500,
+  });
+
+  const next = mustOk(
+    applyTaskCommand(
+      execution,
+      {
+        command: "complete_execution",
+        artifactText: "Finished remaining execution steps",
+      },
+      2510
+    )
+  );
+
+  assert.equal(next.state, "validation");
+  assert.equal(next.step, 3);
+  assert.deepEqual(next.done, ["step A", "step B", "step C"]);
+  assert.equal(next.expectedAction, "approve_validation");
+});
+
+test("legacy complete_step still increments execution step and enters validation", () => {
+  const planned = mustOk(
+    applyTaskCommand(
+      createDefaultTaskContext("Legacy FSM"),
+      {
+        command: "approve_plan",
+        plan: ["step A", "step B"],
+      },
+      2600
     )
   );
 
@@ -51,7 +112,7 @@ test("complete_step increments execution step and then enters validation", () =>
         command: "complete_step",
         artifactText: "A completed",
       },
-      2010
+      2610
     )
   );
   assert.equal(afterFirst.state, "execution");
@@ -65,7 +126,7 @@ test("complete_step increments execution step and then enters validation", () =>
         command: "complete_step",
         artifactText: "B completed",
       },
-      2020
+      2620
     )
   );
   assert.equal(afterSecond.state, "validation");
@@ -95,7 +156,7 @@ test("pause and resume preserve state and step", () => {
   assert.equal(resumed.paused, false);
   assert.equal(resumed.state, "execution");
   assert.equal(resumed.step, 1);
-  assert.equal(resumed.expectedAction, "complete_step");
+  assert.equal(resumed.expectedAction, "complete_execution");
 });
 
 test("approve_validation moves validation -> done", () => {
@@ -186,7 +247,7 @@ test("approve commands reject stale persisted draft artifact", () => {
         total: 2,
         plan: ["A", "B"],
         current: "B",
-        expectedAction: "complete_step",
+        expectedAction: "complete_execution",
       },
       {
         artifactText: "Old step draft",
@@ -222,7 +283,7 @@ test("draft is cleared after complete_step transition", () => {
         total: 1,
         plan: ["A"],
         current: "A",
-        expectedAction: "complete_step",
+        expectedAction: "complete_execution",
       },
       {
         artifactText: "Step A done",

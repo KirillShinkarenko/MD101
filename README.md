@@ -163,12 +163,19 @@ npm run dev
 - `PATCH /api/chats/:id/memory/working` - вручную обновить `goal`, `constraints`, `status`, `nextSteps`
   - при `workingEnabled=false` возвращает `409` (`working memory is disabled`)
 - `POST /api/chats/:id/task-state/command` - отправить команду FSM
-  - `command`: `pause|resume|approve_plan|complete_step|approve_validation|request_replan|request_rework`
+  - `command`: `pause|resume|approve_plan|complete_execution|complete_step|approve_validation|request_replan|request_rework`
   - опционально: `artifactText`, `plan: string[]`, `reason`
   - для `approve_*`:
     - если `artifactText` не передан, backend использует сохранённый agent draft из `task-state`
     - если draft stale для текущего `state/step`, возвращается `409`
     - для `approve_plan`: если `plan[]` не передан, backend сначала пытается взять `plan` из JSON-блока последнего draft-ответа агента, затем fallback `parsePlanFromArtifact(artifactText)`; если план не извлечён - `422`
+  - основной flow: `approve_plan -> (1 execution stream) -> complete_execution -> (validation stream)`
+  - после `approve_plan` execution-stream запускается сразу (без дополнительной команды)
+  - `complete_step` сохранён только для legacy-совместимости, основной UI его не использует
+- `POST /api/chats/:id/task-state/approve-plan/stream` - атомарный flow `approve_plan + execution stream` (SSE)
+  - принимает: `artifactText?`, `plan?`, и stream-поля `model?`, `systemPrompt?`, `reasoningEffort?`, `memoryModel?`
+  - выполняет те же правила извлечения плана, что и `task-state/command` для `approve_plan`
+  - при ошибке approve возвращает JSON-ошибку (`409/422/400`) и не стартует stream
 - `PATCH /api/memory/long-term` - вручную обновить `profile`, `preferences`, `decisions`, `knowledge`
 - `POST /api/memory/candidates/:id/approve` - принять кандидата в long-term
 - `POST /api/memory/candidates/:id/reject` - отклонить кандидата
@@ -212,6 +219,7 @@ SSE-события stream endpoint:
 
 - `planning`: `plan` обязателен.
 - `execution/validation`: `plan` опционален.
+- на `execution` агент не задаёт уточняющих вопросов по реализации; при нехватке деталей использует разумные допущения и продолжает выполнение.
 - если блок отсутствует/невалиден, `taskDraftStatus=missing|invalid`, а approve-кнопки в UI блокируются до нового валидного ответа (или ручной команды с `artifactText` через API).
 
 ## Управление вводом

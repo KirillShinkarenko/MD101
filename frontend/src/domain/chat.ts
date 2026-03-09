@@ -79,7 +79,7 @@ export type TaskState = "planning" | "execution" | "validation" | "done";
 
 export type TaskExpectedAction =
   | "approve_plan"
-  | "complete_step"
+  | "complete_execution"
   | "approve_validation"
   | "resume"
   | "none";
@@ -90,6 +90,7 @@ export type TaskCommand =
   | "pause"
   | "resume"
   | "approve_plan"
+  | "complete_execution"
   | "complete_step"
   | "approve_validation"
   | "request_replan"
@@ -129,6 +130,15 @@ export type TaskCommandRequest = {
   artifactText?: string;
   plan?: string[];
   reason?: string;
+};
+
+export type ApprovePlanStreamRequest = {
+  artifactText?: string;
+  plan?: string[];
+  model?: string;
+  systemPrompt?: string;
+  reasoningEffort?: ReasoningEffort;
+  memoryModel?: string;
 };
 
 export type ChatMemorySnapshot = {

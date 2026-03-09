@@ -30,6 +30,7 @@ function App() {
 
       <ChatMainPanel
         userPrompt={view.userPrompt}
+        errorText={view.errorText}
         isStreaming={view.isStreaming}
         isBranchAvailable={Boolean(view.activeChatId)}
         branchFromChatId={view.branchFromChatId}
@@ -50,44 +51,7 @@ function App() {
       />
 
       <InspectorPanel
-        requestRaw={view.requestRaw}
-        responseRaw={view.responseRaw}
         taskContext={view.taskContext}
-        taskDraftStatus={view.taskDraftStatus}
-        taskDraftError={view.taskDraftError}
-        isTaskCommandPending={view.isTaskCommandPending}
-        memory={view.memory}
-        shortTermEnabled={view.shortTermEnabled}
-        workingEnabled={view.workingEnabled}
-        longTermEnabled={view.longTermEnabled}
-        invariants={view.invariants}
-        invariantsEnabled={view.invariantsEnabled}
-        injectInvariantsInSystemPrompt={view.injectInvariantsInSystemPrompt}
-        isInvariantSettingsSaving={view.isInvariantSettingsSaving}
-        isInvariantsSaving={view.isInvariantsSaving}
-        effectiveMemoryBlock={view.effectiveMemoryBlock}
-        errorText={view.errorText}
-        isStreaming={view.isStreaming}
-        onOpenFullScreenRequest={() => actions.setFullScreenView("request")}
-        onOpenFullScreenResponse={() => actions.setFullScreenView("response")}
-        onPauseTask={() => void actions.pauseTask()}
-        onResumeTask={() => void actions.resumeTask()}
-        onApprovePlan={(artifactText, isEdited) => void actions.approvePlan(artifactText, isEdited)}
-        onCompleteStep={(artifactText, isEdited) => void actions.completeStep(artifactText, isEdited)}
-        onApproveValidation={(artifactText, isEdited) =>
-          void actions.approveValidation(artifactText, isEdited)
-        }
-        onRequestReplan={() => void actions.requestReplan()}
-        onRequestRework={() => void actions.requestRework()}
-        onSaveWorking={actions.saveWorkingMemory}
-        onSaveLongTerm={actions.saveLongTermMemory}
-        onApproveCandidate={actions.approveCandidate}
-        onRejectCandidate={actions.rejectCandidate}
-        onInvariantsEnabledChange={actions.setInvariantsEnabled}
-        onInjectInvariantsInSystemPromptChange={actions.setInjectInvariantsInSystemPrompt}
-        onCreateInvariant={actions.createInvariant}
-        onUpdateInvariant={actions.updateInvariant}
-        onDeleteInvariant={actions.deleteInvariant}
       />
 
       <ModelSettingsModal

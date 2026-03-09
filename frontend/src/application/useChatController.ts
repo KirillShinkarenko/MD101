@@ -103,10 +103,10 @@ const deriveTaskDraftMeta = (
 };
 
 const shouldAutoStartAfterTaskCommand = (command: TaskCommandRequest["command"]): boolean =>
-  command === "approve_plan" || command === "complete_step" || command === "request_rework";
+  command === "complete_execution" || command === "request_rework";
 
 const buildTaskAutoPrompt = (task: TaskContext): string =>
-  `[AUTO] Continue current stage: ${task.state}, step ${task.step}/${task.total}. Follow TASK_STATE and TASK_STAGE_RULES.`;
+  `Продолжай задачу на этапе ${task.state} (шаг ${task.step}/${task.total}). Выполни следующее ожидаемое действие и верни обновлённый артефакт этого шага.`;
 
 const buildInvariantRegeneratePrompt = (payload: {
   violations: InvariantViolation[];
@@ -149,6 +149,83 @@ const EMPTY_PROFILE_DRAFT: ProfileDraft = {
   constraints: "",
   notes: "",
 };
+
+type StreamRunOptions = {
+  clearComposer?: boolean;
+  appendUserMessage?: boolean;
+  streamRequest?: (chatId: string, signal: AbortSignal) => Promise<Response>;
+};
+
+type ParsedTaskCommand = {
+  command: TaskCommandRequest["command"];
+  reason?: string;
+};
+
+const REASON_TASK_COMMANDS: ReadonlySet<TaskCommandRequest["command"]> = new Set([
+  "pause",
+  "request_replan",
+  "request_rework",
+]);
+
+const parseTaskCommandName = (value: string): TaskCommandRequest["command"] | null => {
+  switch (value) {
+    case "approve_plan":
+      return "approve_plan";
+    case "complete_execution":
+      return "complete_execution";
+    case "complete_step":
+      return "complete_step";
+    case "approve_validation":
+      return "approve_validation";
+    case "pause":
+      return "pause";
+    case "resume":
+      return "resume";
+    case "request_replan":
+      return "request_replan";
+    case "request_rework":
+      return "request_rework";
+    default:
+      return null;
+  }
+};
+
+const parseTaskCommand = (promptRaw: string): ParsedTaskCommand | null => {
+  const prompt = promptRaw.trim();
+  if (!prompt) {
+    return null;
+  }
+
+  const hasSlashPrefix = prompt.startsWith("/");
+  const commandSource = hasSlashPrefix ? prompt.slice(1).trim() : prompt;
+  if (!commandSource) {
+    return null;
+  }
+
+  const [commandRaw = "", ...rest] = commandSource.split(/\s+/);
+  const command = parseTaskCommandName(commandRaw.toLowerCase());
+  if (!command) {
+    return null;
+  }
+
+  if (!hasSlashPrefix && rest.length > 0 && !REASON_TASK_COMMANDS.has(command)) {
+    return null;
+  }
+
+  const reason = rest.join(" ").trim() || undefined;
+  if (REASON_TASK_COMMANDS.has(command)) {
+    return { command, reason };
+  }
+
+  return { command };
+};
+
+const MISSING_DRAFT_ARTIFACT_ERROR = "artifactText is required because task draft artifact is missing";
+const EXECUTION_DRAFT_RECOVERY_FAILED_MESSAGE =
+  "Не удалось автоматически восстановить execution-артефакт. Запустите ещё один ответ агента и повторите complete_execution.";
+
+const isMissingExecutionDraftTask = (task: TaskContext | undefined): boolean =>
+  Boolean(task && task.state === "execution" && !task.draftArtifactText);
 
 export function useChatController() {
   const [chats, setChats] = useState<ChatSummary[]>([]);
@@ -198,6 +275,9 @@ export function useChatController() {
   const controllerRef = useRef<AbortController | null>(null);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
   const modelRef = useRef(model);
+  const runStreamWithPromptRef = useRef<(promptTextRaw: string, options?: StreamRunOptions) => Promise<void>>(
+    async () => {}
+  );
 
   useEffect(() => {
     modelRef.current = model;
@@ -711,75 +791,102 @@ export function useChatController() {
       if (!activeChatId || isTaskCommandPending) {
         return;
       }
-      setPendingAutoPrompt(null);
-      setIsTaskCommandPending(true);
-      try {
-        const nextTask = await chatApi.sendTaskCommand(activeChatId, body);
-        setTaskContext(nextTask);
-        const draftMeta = deriveTaskDraftMeta(nextTask);
-        setTaskDraftStatus(draftMeta.status);
-        setTaskDraftError(draftMeta.error);
-        const shouldAutoStart =
-          !isStreaming &&
-          shouldAutoStartAfterTaskCommand(body.command) &&
-          !nextTask.paused &&
-          nextTask.expectedAction !== "none" &&
-          nextTask.expectedAction !== "resume";
-        if (shouldAutoStart) {
-          setPendingAutoPrompt(buildTaskAutoPrompt(nextTask));
-        }
-        setErrorText("");
-        setStatus("idle");
-      } catch (error) {
-        const payload = (error as { payload?: unknown } | null)?.payload;
-        const nextTask =
-          payload && typeof payload === "object" && payload !== null
-            ? (payload as { task?: TaskContext }).task
-            : undefined;
-        if (nextTask && typeof nextTask === "object") {
+      const sendTaskCommandInternal = async (
+        request: TaskCommandRequest,
+        options: { allowRecovery: boolean }
+      ): Promise<void> => {
+        setPendingAutoPrompt(null);
+        try {
+          const nextTask = await chatApi.sendTaskCommand(activeChatId, request);
           setTaskContext(nextTask);
           const draftMeta = deriveTaskDraftMeta(nextTask);
           setTaskDraftStatus(draftMeta.status);
           setTaskDraftError(draftMeta.error);
+          const shouldAutoStart =
+            !isStreaming &&
+            shouldAutoStartAfterTaskCommand(request.command) &&
+            !nextTask.paused &&
+            nextTask.expectedAction !== "none" &&
+            nextTask.expectedAction !== "resume";
+          if (shouldAutoStart) {
+            setPendingAutoPrompt(buildTaskAutoPrompt(nextTask));
+          }
+          setErrorText("");
+          setStatus("idle");
+        } catch (error) {
+          const payload = (error as { payload?: unknown; status?: number } | null)?.payload;
+          const statusCode = (error as { payload?: unknown; status?: number } | null)?.status;
+          const nextTask =
+            payload && typeof payload === "object" && payload !== null
+              ? (payload as { task?: TaskContext }).task
+              : undefined;
+          const payloadTask =
+            nextTask && typeof nextTask === "object" ? nextTask : undefined;
+
+          if (payloadTask) {
+            setTaskContext(payloadTask);
+            const draftMeta = deriveTaskDraftMeta(payloadTask);
+            setTaskDraftStatus(draftMeta.status);
+            setTaskDraftError(draftMeta.error);
+          }
+
+          const errorMessage = error instanceof Error ? error.message : "Failed to update task state";
+          const shouldRecoverMissingDraft =
+            options.allowRecovery &&
+            request.command === "complete_execution" &&
+            statusCode === 422 &&
+            (errorMessage.includes(MISSING_DRAFT_ARTIFACT_ERROR) || isMissingExecutionDraftTask(payloadTask));
+
+          if (shouldRecoverMissingDraft) {
+            try {
+              const taskForRecovery = payloadTask ?? taskContext;
+              if (taskForRecovery.state === "execution") {
+                setErrorText("");
+                await runStreamWithPromptRef.current(buildTaskAutoPrompt(taskForRecovery), { appendUserMessage: false });
+                const refreshedTaskState = await chatApi.getTaskState(activeChatId);
+                const refreshedTask = refreshedTaskState.task;
+                setTaskContext(refreshedTask);
+                const refreshedDraftMeta = deriveTaskDraftMeta(refreshedTask);
+                setTaskDraftStatus(refreshedDraftMeta.status);
+                setTaskDraftError(refreshedDraftMeta.error);
+
+                if (
+                  refreshedDraftMeta.status === "valid" &&
+                  refreshedTask.state === "execution" &&
+                  refreshedTask.step > 0
+                ) {
+                  await sendTaskCommandInternal(request, { allowRecovery: false });
+                  return;
+                }
+              }
+            } catch {
+              // Ignore recovery internals errors and show a unified actionable message below.
+            }
+
+            setErrorText(EXECUTION_DRAFT_RECOVERY_FAILED_MESSAGE);
+            setStatus("error");
+            return;
+          }
+
+          setErrorText(errorMessage);
+          setStatus("error");
         }
-        setErrorText(error instanceof Error ? error.message : "Failed to update task state");
-        setStatus("error");
+      };
+
+      setIsTaskCommandPending(true);
+      try {
+        await sendTaskCommandInternal(body, { allowRecovery: true });
       } finally {
         setIsTaskCommandPending(false);
       }
     },
-    [activeChatId, isStreaming, isTaskCommandPending]
+    [activeChatId, isStreaming, isTaskCommandPending, taskContext]
   );
 
-  const pauseTask = useCallback(
-    async (reason?: string) => {
-      await sendTaskCommand({ command: "pause", reason });
-    },
-    [sendTaskCommand]
-  );
-
-  const resumeTask = useCallback(async () => {
-    await sendTaskCommand({ command: "resume" });
-  }, [sendTaskCommand]);
-
-  const approvePlan = useCallback(
-    async (artifactText: string, isEdited: boolean, plan?: string[]) => {
-      const payload: TaskCommandRequest = {
-        command: "approve_plan",
-        plan,
-      };
-      if (isEdited) {
-        payload.artifactText = artifactText;
-      }
-      await sendTaskCommand(payload);
-    },
-    [sendTaskCommand]
-  );
-
-  const completeStep = useCallback(
+  const completeExecution = useCallback(
     async (artifactText: string, isEdited: boolean) => {
       const payload: TaskCommandRequest = {
-        command: "complete_step",
+        command: "complete_execution",
       };
       if (isEdited) {
         payload.artifactText = artifactText;
@@ -918,31 +1025,15 @@ export function useChatController() {
   }, []);
 
   const runStreamWithPrompt = useCallback(
-    async (promptTextRaw: string, options?: { clearComposer?: boolean }) => {
+    async (promptTextRaw: string, options?: StreamRunOptions) => {
       const promptText = promptTextRaw.trim();
-      if (!activeChatId || isStreaming || !promptText) {
+      const appendUserMessage = options?.appendUserMessage ?? true;
+      if (!activeChatId || isStreaming || (!promptText && !options?.streamRequest)) {
         return;
       }
 
       setStatus("streaming");
       setErrorText("");
-
-      const userMessage: ChatMessage = {
-        id: createId(),
-        chatId: activeChatId,
-        role: "user",
-        content: promptText,
-        requestJson: null,
-        responseJson: null,
-        latencyMs: null,
-        inputTokens: null,
-        outputTokens: null,
-        totalTokens: null,
-        costUsd: null,
-        inputCostUsd: null,
-        outputCostUsd: null,
-        createdAt: Date.now(),
-      };
 
       const assistantMessageId = createId();
       const assistantMessage: ChatMessage = {
@@ -962,8 +1053,28 @@ export function useChatController() {
         createdAt: Date.now(),
       };
 
-      setMessages((prev) => [...prev, userMessage, assistantMessage]);
-      if (options?.clearComposer) {
+      if (appendUserMessage) {
+        const userMessage: ChatMessage = {
+          id: createId(),
+          chatId: activeChatId,
+          role: "user",
+          content: promptText,
+          requestJson: null,
+          responseJson: null,
+          latencyMs: null,
+          inputTokens: null,
+          outputTokens: null,
+          totalTokens: null,
+          costUsd: null,
+          inputCostUsd: null,
+          outputCostUsd: null,
+          createdAt: Date.now(),
+        };
+        setMessages((prev) => [...prev, userMessage, assistantMessage]);
+      } else {
+        setMessages((prev) => [...prev, assistantMessage]);
+      }
+      if (options?.clearComposer && appendUserMessage) {
         setUserPrompt("");
       }
 
@@ -971,17 +1082,19 @@ export function useChatController() {
       controllerRef.current = controller;
 
       try {
-        const response = await chatApi.streamChat(
-          activeChatId,
-          {
-            userPrompt: promptText,
-            model,
-            systemPrompt,
-            reasoningEffort: isReasoningSupported ? reasoningEffort : undefined,
-            memoryModel,
-          },
-          controller.signal
-        );
+        const response = options?.streamRequest
+          ? await options.streamRequest(activeChatId, controller.signal)
+          : await chatApi.streamChat(
+              activeChatId,
+              {
+                userPrompt: promptText,
+                model,
+                systemPrompt,
+                reasoningEffort: isReasoningSupported ? reasoningEffort : undefined,
+                memoryModel,
+              },
+              controller.signal
+            );
 
         const reader = response.body?.getReader();
         if (!reader) {
@@ -1236,13 +1349,13 @@ export function useChatController() {
 
           if (statusCode === 409 && payloadTask?.paused) {
             setOverflowErrorRaw("");
-            setErrorText(message || "Task is paused. Resume it to continue.");
+            setErrorText(message || "Task is paused on backend state.");
             setMessages((prev) =>
               prev.map((chatMessage) =>
                 chatMessage.id === assistantMessageId
                   ? {
                       ...chatMessage,
-                      content: chatMessage.content || "[Task paused] Resume the task and try again.",
+                      content: chatMessage.content || "[Task paused] Continue the task state and try again.",
                     }
                   : chatMessage
               )
@@ -1297,9 +1410,52 @@ export function useChatController() {
     ]
   );
 
+  useEffect(() => {
+    runStreamWithPromptRef.current = runStreamWithPrompt;
+  }, [runStreamWithPrompt]);
+
+  const approvePlan = useCallback(
+    async (artifactText: string, isEdited: boolean, plan?: string[]) => {
+      await runStreamWithPrompt("", {
+        appendUserMessage: false,
+        streamRequest: (chatId, signal) => {
+          const payload = {
+            plan,
+            model,
+            systemPrompt,
+            reasoningEffort: isReasoningSupported ? reasoningEffort : undefined,
+            memoryModel,
+            artifactText: isEdited ? artifactText : undefined,
+          };
+          return chatApi.streamApprovePlan(chatId, payload, signal);
+        },
+      });
+    },
+    [isReasoningSupported, memoryModel, model, reasoningEffort, runStreamWithPrompt, systemPrompt]
+  );
+
   const sendMessage = useCallback(async () => {
-    await runStreamWithPrompt(userPrompt, { clearComposer: true });
-  }, [runStreamWithPrompt, userPrompt]);
+    const promptText = userPrompt.trim();
+    if (!promptText) {
+      return;
+    }
+
+    const taskCommand = parseTaskCommand(promptText);
+    if (taskCommand) {
+      setUserPrompt("");
+      if (taskCommand.command === "approve_plan") {
+        await approvePlan("", false);
+        return;
+      }
+      await sendTaskCommand({
+        command: taskCommand.command,
+        reason: taskCommand.reason,
+      });
+      return;
+    }
+
+    await runStreamWithPrompt(promptText, { clearComposer: true });
+  }, [approvePlan, runStreamWithPrompt, sendTaskCommand, userPrompt]);
 
   const regenerateFromInvariantViolation = useCallback(
     async (payload: { violations: InvariantViolation[]; rejectedResponse: string }) => {
@@ -1463,10 +1619,8 @@ export function useChatController() {
       updateInvariant,
       deleteInvariant,
       regenerateFromInvariantViolation,
-      pauseTask,
-      resumeTask,
       approvePlan,
-      completeStep,
+      completeExecution,
       approveValidation,
       requestReplan,
       requestRework,

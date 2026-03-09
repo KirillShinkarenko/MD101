@@ -2,7 +2,7 @@ export type TaskState = "planning" | "execution" | "validation" | "done";
 
 export type TaskExpectedAction =
   | "approve_plan"
-  | "complete_step"
+  | "complete_execution"
   | "approve_validation"
   | "resume"
   | "none";
@@ -11,6 +11,7 @@ export type TaskCommand =
   | "pause"
   | "resume"
   | "approve_plan"
+  | "complete_execution"
   | "complete_step"
   | "approve_validation"
   | "request_replan"
@@ -69,6 +70,7 @@ export const TASK_COMMANDS: TaskCommand[] = [
   "pause",
   "resume",
   "approve_plan",
+  "complete_execution",
   "complete_step",
   "approve_validation",
   "request_replan",
@@ -132,7 +134,7 @@ const expectedActionByState = (state: TaskState): TaskExpectedAction => {
     case "planning":
       return "approve_plan";
     case "execution":
-      return "complete_step";
+      return "complete_execution";
     case "validation":
       return "approve_validation";
     case "done":
@@ -326,6 +328,8 @@ const isCommandAllowed = (task: TaskContext, command: TaskCommand): boolean => {
       return false;
     case "approve_plan":
       return task.state === "planning";
+    case "complete_execution":
+      return task.state === "execution" && task.total > 0;
     case "complete_step":
       return task.state === "execution" && task.total > 0;
     case "approve_validation":
@@ -464,6 +468,41 @@ export const applyTaskCommand = (
               state: "planning",
               step: 0,
               text: artifactTextFromPlan,
+            },
+            now
+          ),
+          updatedAt: now,
+        }),
+      };
+    }
+
+    case "complete_execution": {
+      const artifactResolved = resolveArtifactTextForApprove(task, input.artifactText);
+      if (!artifactResolved.ok) {
+        return artifactResolved;
+      }
+      const artifactText = artifactResolved.artifactText;
+      const currentIndex = Math.max(0, Math.min(task.step - 1, Math.max(0, task.plan.length - 1)));
+      const remainingPlan = task.plan.slice(currentIndex);
+      const completedItems = remainingPlan.length > 0 ? remainingPlan : [`Step ${Math.max(1, task.step)}`];
+      const done = normalizeList([...task.done, ...completedItems]);
+
+      return {
+        ok: true,
+        task: withExpectedAction({
+          ...clearDraftArtifactFields(task),
+          state: "validation",
+          step: task.total,
+          total: task.total,
+          current: "Проверяем результат и подтверждаем завершение",
+          done,
+          artifacts: pushArtifact(
+            task,
+            {
+              kind: "execution",
+              state: "execution",
+              step: task.step,
+              text: artifactText,
             },
             now
           ),

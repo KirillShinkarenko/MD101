@@ -1,4 +1,5 @@
 import {
+  type ApprovePlanStreamRequest,
   EMPTY_MEMORY_SNAPSHOT,
   EMPTY_TASK_CONTEXT,
   type ChatMemorySnapshot,
@@ -197,6 +198,20 @@ export const chatApi = {
       throw extractError(payload, "Failed to send task command", response.status);
     }
     return payload.task;
+  },
+
+  async streamApprovePlan(chatId: string, body: ApprovePlanStreamRequest, signal?: AbortSignal): Promise<Response> {
+    const response = await fetch(`${API_BASE}/api/chats/${chatId}/task-state/approve-plan/stream`, {
+      method: "POST",
+      headers: jsonHeaders,
+      body: JSON.stringify(body),
+      signal,
+    });
+    if (!response.ok) {
+      const payload = await readJson<{ error?: string }>(response);
+      throw extractError(payload, "Failed to start approve-plan execution stream", response.status);
+    }
+    return response;
   },
 
   async patchLongTermMemory(

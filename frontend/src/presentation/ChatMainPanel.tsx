@@ -2,6 +2,7 @@ import type { ChatMessage, InvariantViolation } from "../domain/chat";
 import {
   Fragment,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
@@ -12,6 +13,7 @@ import { UiButton } from "./ui/UiButton";
 
 type Props = {
   userPrompt: string;
+  errorText: string;
   isStreaming: boolean;
   isBranchAvailable: boolean;
   branchFromChatId: string | null;
@@ -57,6 +59,8 @@ type ParsedInvariantViolationMessage = {
 
 const createTaskArtifactBlockRegex = (): RegExp =>
   /\[TASK_ARTIFACT_JSON\]([\s\S]*?)\[\/TASK_ARTIFACT_JSON\]/g;
+const TASK_ARTIFACT_OPEN_TAG = "[TASK_ARTIFACT_JSON]";
+const TASK_ARTIFACT_CLOSE_TAG = "[/TASK_ARTIFACT_JSON]";
 
 const createInvariantViolationBlockRegex = (): RegExp =>
   /\[INVARIANT_VIOLATION_JSON\]([\s\S]*?)\[\/INVARIANT_VIOLATION_JSON\]/g;
@@ -68,12 +72,30 @@ const normalizeVisibleText = (value: string): string =>
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 
-const parseTaskArtifactMessage = (content: string): ParsedTaskArtifactMessage => {
+const stripUnclosedTaskArtifactBlock = (content: string): string => {
+  const openIndex = content.lastIndexOf(TASK_ARTIFACT_OPEN_TAG);
+  if (openIndex === -1) {
+    return content;
+  }
+
+  const closeIndex = content.indexOf(TASK_ARTIFACT_CLOSE_TAG, openIndex + TASK_ARTIFACT_OPEN_TAG.length);
+  if (closeIndex !== -1) {
+    return content;
+  }
+
+  return content.slice(0, openIndex);
+};
+
+const parseTaskArtifactMessage = (
+  content: string,
+  options?: { hideUnclosedArtifactBlock?: boolean }
+): ParsedTaskArtifactMessage => {
   const blockRegex = createTaskArtifactBlockRegex();
   const matches = Array.from(content.matchAll(blockRegex));
   if (matches.length === 0) {
+    const visibleSource = options?.hideUnclosedArtifactBlock ? stripUnclosedTaskArtifactBlock(content) : content;
     return {
-      visibleText: normalizeVisibleText(content),
+      visibleText: normalizeVisibleText(visibleSource),
       hasArtifact: false,
       artifactPrettyText: "",
       artifactRawText: "",
@@ -92,7 +114,11 @@ const parseTaskArtifactMessage = (content: string): ParsedTaskArtifactMessage =>
     isArtifactJsonValid = false;
   }
 
-  const visibleText = normalizeVisibleText(content.replace(createTaskArtifactBlockRegex(), ""));
+  let visibleSource = content.replace(createTaskArtifactBlockRegex(), "");
+  if (options?.hideUnclosedArtifactBlock) {
+    visibleSource = stripUnclosedTaskArtifactBlock(visibleSource);
+  }
+  const visibleText = normalizeVisibleText(visibleSource);
 
   return {
     visibleText,
@@ -170,6 +196,7 @@ const parseInvariantViolationMessage = (content: string): ParsedInvariantViolati
 export function ChatMainPanel(props: Props) {
   const {
     userPrompt,
+    errorText,
     isStreaming,
     isBranchAvailable,
     branchFromChatId,
@@ -190,6 +217,20 @@ export function ChatMainPanel(props: Props) {
   } = props;
   const [isActionsOpen, setIsActionsOpen] = useState(false);
   const actionsMenuRef = useRef<HTMLDivElement | null>(null);
+  const streamingAssistantMessageId = useMemo(() => {
+    if (!isStreaming) {
+      return null;
+    }
+
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role === "assistant") {
+        return message.id;
+      }
+    }
+
+    return null;
+  }, [isStreaming, messages]);
 
   const hasBranchDivider = Boolean(branchFromChatId && branchFromChatTitle);
   let dividerPlacement: "none" | "top" | "between" | "bottom" = "none";
@@ -258,7 +299,7 @@ export function ChatMainPanel(props: Props) {
       <PanelHeader
         as="h1"
         variant="panel"
-        title="День 14. Инварианты и ограничения состояния"
+        title="День 15. Контролируемые переходы состояний"
         titleClassName="day-task-heading"
         actions={
           <>
@@ -313,10 +354,17 @@ export function ChatMainPanel(props: Props) {
             message.role === "assistant" &&
             parsedInvariantViolation.isViolation &&
             Boolean(parsedInvariantViolation.payload);
-          const parsedMessage = parseTaskArtifactMessage(message.content);
-          const shouldShowArtifactInfo = message.role === "assistant" && parsedMessage.hasArtifact;
-          const shouldRenderContent = parsedMessage.visibleText.length > 0 || !parsedMessage.hasArtifact;
-          const contentText = parsedMessage.hasArtifact ? parsedMessage.visibleText : message.content || "...";
+          const isLiveAssistantMessage =
+            message.role === "assistant" && Boolean(streamingAssistantMessageId) && message.id === streamingAssistantMessageId;
+          const parsedMessage = parseTaskArtifactMessage(message.content, {
+            hideUnclosedArtifactBlock: isLiveAssistantMessage,
+          });
+          const shouldShowArtifactInfo =
+            message.role === "assistant" && parsedMessage.hasArtifact && !isLiveAssistantMessage;
+          const shouldRenderContent = parsedMessage.visibleText.length > 0;
+          const shouldShowThinkingIndicator =
+            isLiveAssistantMessage && parsedMessage.visibleText.length === 0 && !isInvariantViolation;
+          const contentText = parsedMessage.visibleText;
           const violationPayload = parsedInvariantViolation.payload;
 
           return (
@@ -360,6 +408,16 @@ export function ChatMainPanel(props: Props) {
                     </div>
                   ) : null}
                   {!isInvariantViolation && shouldRenderContent ? <p className="content">{contentText}</p> : null}
+                  {!isInvariantViolation && shouldShowThinkingIndicator ? (
+                    <div className="agent-thinking" aria-live="polite" aria-label="Агент думает">
+                      <span>Агент думает</span>
+                      <span className="agent-thinking-dots" aria-hidden="true">
+                        <i />
+                        <i />
+                        <i />
+                      </span>
+                    </div>
+                  ) : null}
                   {!isInvariantViolation && shouldShowArtifactInfo ? (
                     <details className="message-artifact">
                       <summary className="message-artifact-summary">Доп. инфо</summary>
@@ -390,6 +448,7 @@ export function ChatMainPanel(props: Props) {
           rows={3}
           placeholder="Ask anything..."
         />
+        {errorText ? <p className="error">{errorText}</p> : null}
 
         <div className="composer-bottom">
           <p className="context-indicator">
